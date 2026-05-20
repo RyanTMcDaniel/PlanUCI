@@ -1,0 +1,2 @@
+*.safetensors !text !filter !merge !diff
+*.bin !text !filter !merge !diff
