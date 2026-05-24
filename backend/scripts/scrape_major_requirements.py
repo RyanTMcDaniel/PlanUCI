@@ -217,22 +217,6 @@ async def get_page_html() -> str:
         return html
 
 
-def filter_valid_course_ids(rows: list[dict], client) -> list[dict]:
-    """Remove rows whose course_id doesn't exist in the courses table (FK guard)."""
-    ids_to_check = list({r["course_id"] for r in rows})
-    valid: set[str] = set()
-    page_size = 500
-    for i in range(0, len(ids_to_check), page_size):
-        batch = ids_to_check[i : i + page_size]
-        result = client.table("courses").select("id").in_("id", batch).execute()
-        for row in result.data:
-            valid.add(row["id"])
-    skipped = sorted(r["course_id"] for r in rows if r["course_id"] not in valid)
-    if skipped:
-        print(f"  Skipping {len(skipped)} course IDs not found in courses table: {skipped}")
-    return [r for r in rows if r["course_id"] in valid]
-
-
 def extract_requirements(html: str) -> list[dict]:
     soup = BeautifulSoup(html, "html.parser")
 
@@ -372,10 +356,6 @@ def upsert_requirements(rows: list[dict]) -> None:
         print("No rows to upsert.")
         return
     client = get_client()
-    rows = filter_valid_course_ids(rows, client)
-    if not rows:
-        print("No valid rows to insert after FK filtering.")
-        return
     # Delete existing rows for this major, then insert fresh — avoids needing a
     # unique constraint and handles structural changes to the requirements page.
     client.table("major_requirements").delete().eq("major_code", MAJOR_CODE).execute()
