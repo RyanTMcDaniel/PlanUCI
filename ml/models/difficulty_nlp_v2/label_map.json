@@ -1,0 +1,12 @@
+{
+  "labels": [
+    "easy",
+    "medium",
+    "hard"
+  ],
+  "label2idx": {
+    "easy": 0,
+    "medium": 1,
+    "hard": 2
+  }
+}
