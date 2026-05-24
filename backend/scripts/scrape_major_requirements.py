@@ -1,11 +1,17 @@
 #!/usr/bin/env python3
 """
-Scrape CS B.S. major requirements from the UCI catalogue and upsert into Supabase.
+Scrape major requirements from the UCI catalogue and upsert into Supabase.
+
+Usage:
+    python scrape_major_requirements.py                        # default CS_BS
+    python scrape_major_requirements.py --major-code INF_BS \
+        --major-name "Informatics B.S." --url <catalogue_url>
 
 Install deps before running:
     pip install playwright beautifulsoup4
     playwright install chromium
 """
+import argparse
 import asyncio
 import os
 import re
@@ -18,12 +24,26 @@ from supabase import create_client
 
 load_dotenv()
 
-MAJOR_CODE = "CS_BS"
-MAJOR_NAME = "Computer Science B.S."
-CATALOGUE_URL = (
-    "https://catalogue.uci.edu/donaldbrenschoolofinformationandcomputersciences"
-    "/departmentofcomputerscience/computerscience_bs/#requirementstext"
-)
+_DEFAULTS = {
+    "major_code": "CS_BS",
+    "major_name": "Computer Science B.S.",
+    "url": (
+        "https://catalogue.uci.edu/donaldbrenschoolofinformationandcomputersciences"
+        "/departmentofcomputerscience/computerscience_bs/#requirementstext"
+    ),
+}
+
+def _parse_args():
+    p = argparse.ArgumentParser()
+    p.add_argument("--major-code", default=_DEFAULTS["major_code"])
+    p.add_argument("--major-name", default=_DEFAULTS["major_name"])
+    p.add_argument("--url", default=_DEFAULTS["url"])
+    return p.parse_args()
+
+_args = _parse_args()
+MAJOR_CODE = _args.major_code
+MAJOR_NAME = _args.major_name
+CATALOGUE_URL = _args.url
 
 # Matches dept + number, including compound dash ranges like "31-32-33" or "H32-33" or "2A-2B".
 COMPOUND_COURSE_RE = re.compile(
@@ -64,24 +84,15 @@ def normalize_course_id(dept: str, num: str) -> str:
     return dept.replace(" ", "") + num
 
 
-def expand_course_code(raw_code: str) -> list[tuple[str, str]]:
-    """
-    Parse and expand compound codes.
-      'I&C SCI 31-32-33' -> [('I&C SCI','31'), ('I&C SCI','32'), ('I&C SCI','33')]
-      'I&C SCI H32-33'   -> [('I&C SCI','H32'), ('I&C SCI','H33')]
-      'MATH 2A-2B'       -> [('MATH','2A'), ('MATH','2B')]
-      'COMPSCI 161'      -> [('COMPSCI','161')]
-    """
-    raw_code = raw_code.replace("\xa0", " ")
-    m = COMPOUND_COURSE_RE.match(raw_code)
+def _parse_one_code(raw: str) -> list[tuple[str, str]]:
+    """Parse a single course code or dash-range into (dept, num) pairs."""
+    m = COMPOUND_COURSE_RE.match(raw.strip())
     if not m:
         return []
     dept = m.group(1).strip()
     num_range = m.group(2)
-
     if "-" not in num_range:
         return [(dept, num_range)]
-
     parts = num_range.split("-")
     result = []
     prefix = re.match(r"^([A-Z]*)", parts[0]).group(1)
@@ -92,6 +103,30 @@ def expand_course_code(raw_code: str) -> list[tuple[str, str]]:
             result.append((dept, part))
             prefix = re.match(r"^([A-Z]*)", part).group(1)
     return result
+
+
+def expand_course_code(raw_code: str) -> list[tuple[str, str]]:
+    """
+    Parse and expand compound/alternative codes.
+      'I&C SCI 31-32-33'       -> [('I&C SCI','31'), ('I&C SCI','32'), ('I&C SCI','33')]
+      'I&C SCI H32-33'         -> [('I&C SCI','H32'), ('I&C SCI','H33')]
+      'MATH 2A-2B'             -> [('MATH','2A'), ('MATH','2B')]
+      'IN4MATX 101/COMPSCI 141'-> [('IN4MATX','101'), ('COMPSCI','141')]
+      'COMPSCI 161'            -> [('COMPSCI','161')]
+    """
+    raw_code = raw_code.replace("\xa0", " ").strip()
+
+    # Handle slash-separated alternatives: "IN4MATX 101/COMPSCI 141"
+    # Split only where a course number (digit) is immediately before "/" and an
+    # uppercase letter (new dept) follows — avoids splitting dept names like "CHC/LAT".
+    slash_parts = re.split(r"(?<=\d)/(?=[A-Z])", raw_code)
+    if len(slash_parts) > 1:
+        result = []
+        for part in slash_parts:
+            result.extend(_parse_one_code(part))
+        return result
+
+    return _parse_one_code(raw_code)
 
 
 def word_to_int(word: str) -> Optional[int]:
