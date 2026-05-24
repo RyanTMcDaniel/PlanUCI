@@ -1,0 +1,23 @@
+{
+  "model_name": "sentiment_v1",
+  "architecture": "all-MiniLM-L6-v2 encoder (fine-tuned) + nn.Linear(384, 4)",
+  "professors_labeled": 1291,
+  "val_macro_f1": 0.8313,
+  "test_macro_f1": 0.8093,
+  "classes": [
+    "teaches_well",
+    "easy_grade",
+    "harsh_grader",
+    "avoid"
+  ],
+  "weak_supervision_rules": {
+    "teaches_well": "overall >= 4.0 AND difficulty >= 3.0 AND would_take_again_pct >= 75",
+    "easy_grade": "overall >= 3.8 AND difficulty <= 2.5 AND would_take_again_pct >= 70",
+    "harsh_grader": "difficulty >= 3.8 AND would_take_again_pct <= 50",
+    "avoid": "overall <= 2.5 AND would_take_again_pct <= 40",
+    "priority": "avoid > harsh_grader > teaches_well > easy_grade"
+  },
+  "input_format": "raw professor review text (concatenated reviews per professor)",
+  "output_format": "softmax probabilities over [teaches_well, easy_grade, harsh_grader, avoid]; argmax \u2192 label",
+  "created_at": "2026-05-24T22:59:02Z"
+}

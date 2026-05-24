@@ -1,0 +1,16 @@
+{
+  "model_name": "difficulty_nlp_v2",
+  "architecture": "all-MiniLM-L6-v2 encoder (fine-tuned) + nn.Linear(384, 3)",
+  "training_courses": 1171,
+  "val_macro_f1": 0.61,
+  "test_macro_f1": 0.6188,
+  "test_accuracy": 0.6587,
+  "classes": [
+    "easy",
+    "medium",
+    "hard"
+  ],
+  "input_format": "Department: {dept}. Course: {course_id}. {description}",
+  "output_format": "softmax probabilities over [easy, medium, hard]; argmax \u2192 tier label",
+  "created_at": "2026-05-24T22:59:02Z"
+}
