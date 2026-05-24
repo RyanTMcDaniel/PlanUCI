@@ -1,0 +1,14 @@
+{
+  "labels": [
+    "teaches_well",
+    "easy_grade",
+    "harsh_grader",
+    "avoid"
+  ],
+  "label2idx": {
+    "teaches_well": 0,
+    "easy_grade": 1,
+    "harsh_grader": 2,
+    "avoid": 3
+  }
+}
