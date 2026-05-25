@@ -1,7 +1,7 @@
 """
 Course plan generator combining hard and soft constraints.
 
-generate(major_id, completed_courses, graduation_year, units_per_quarter=16,
+generate(major_id, completed_courses, graduation_quarter, units_per_quarter=16,
          waived_ges=[])
 → GenerationResult  (variants sorted best-first, feasibility metadata)
 
@@ -34,6 +34,7 @@ from .hard_constraints import (
     _qkey,
 )
 from .optimizer import OptimizationResult, optimize
+from .offering_patterns import is_likely_offered
 
 _ENV = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", ".env")
 load_dotenv(_ENV)
@@ -72,45 +73,54 @@ class GenerationResult:
 
 # ── Quarter helpers ───────────────────────────────────────────────────────────
 
-def _next_quarter() -> tuple[int, str]:
-    """Return (year, quarter_name) for the next UCI quarter after today."""
+def _current_quarter() -> str:
+    """Return the active UCI quarter as 'YYYY_quarter' (winter/spring/fall)."""
     today = datetime.date.today()
     m, y = today.month, today.year
     if m <= 3:
-        return y, "spring"    # currently winter → next is spring
+        return f"{y}_winter"
     if m <= 6:
-        return y, "fall"      # currently spring → next is fall
-    if m <= 8:
-        return y, "fall"      # currently summer → next is fall
-    return y + 1, "winter"   # currently fall  → next is winter
+        return f"{y}_spring"
+    return f"{y}_fall"
 
 
-def _generate_quarters(graduation_year: int) -> list[str]:
-    """Quarters from next quarter through spring of graduation_year.
+def _generate_quarters(graduation_quarter: str) -> list[str]:
+    """Quarters from the current quarter through graduation_quarter inclusive.
 
     Uses the standard UCI sequence (winter, spring, fall) and skips summer.
+    graduation_quarter must be in 'YYYY_quarter' format, e.g. '2029_spring'.
     """
-    start_year, start_q = _next_quarter()
     seq = ["winter", "spring", "fall"]
+    current    = _current_quarter()
+    start_year = int(current.split("_")[0])
+    start_q    = current.split("_")[1]
+    grad_q     = graduation_quarter.split("_")[1]
+
+    if grad_q not in seq:
+        raise ValueError(
+            f"graduation_quarter must end in winter/spring/fall, got {graduation_quarter!r}"
+        )
 
     try:
         idx = seq.index(start_q)
     except ValueError:
-        idx = 2  # default to fall
+        idx = 2
 
     quarters: list[str] = []
     year = start_year
+    grad_year = int(graduation_quarter.split("_")[0])
 
     while True:
-        q = seq[idx]
-        quarters.append(f"{year}_{q}")
-        if year == graduation_year and q == "spring":
-            break
-        if year > graduation_year:
+        q    = seq[idx]
+        qstr = f"{year}_{q}"
+        quarters.append(qstr)
+        if qstr == graduation_quarter:
             break
         idx = (idx + 1) % len(seq)
         if idx == 0:
             year += 1
+        if year > grad_year + 1:   # safety: stop if we've overshot
+            break
 
     return quarters
 
@@ -193,6 +203,7 @@ def _check_feasibility(
     total_courses: int,
     quarters: list[str],
     units_per_quarter: int,
+    graduation_quarter: str,
 ) -> tuple[bool, int, int]:
     """Return (tight_timeline, quarters_available, quarters_needed).
 
@@ -204,11 +215,12 @@ def _check_feasibility(
     quarters_needed    = math.ceil(total_courses / max_per_q) if max_per_q else 0
 
     if quarters_needed > quarters_available:
-        excess_q           = quarters_needed - quarters_available
+        excess_q            = quarters_needed - quarters_available
         courses_to_complete = excess_q * max_per_q
-        years_to_extend    = math.ceil(excess_q / 3)
+        years_to_extend     = math.ceil(excess_q / 3)
         raise FeasibilityError(
-            f"Cannot complete major in {quarters_available} quarters available. "
+            f"Cannot fit {total_courses} course(s) in {quarters_available} quarters "
+            f"before {graduation_quarter}. "
             f"Minimum {quarters_needed} quarters needed. "
             f"Complete {courses_to_complete} more courses first "
             f"or extend graduation by {years_to_extend} year(s).",
@@ -307,7 +319,7 @@ def _perturb(plan: CoursePlan, rng: random.Random, n_swaps: int) -> CoursePlan:
 def generate(
     major_id: str,
     completed_courses: list[str],
-    graduation_year: int,
+    graduation_quarter: str,
     units_per_quarter: int = 16,
     waived_ges: list[str] | None = None,
 ) -> GenerationResult:
@@ -338,13 +350,13 @@ def generate(
         return GenerationResult(variants=[])
 
     # 2. Quarters available before graduation
-    quarters = _generate_quarters(graduation_year)
+    quarters = _generate_quarters(graduation_quarter)
     if not quarters:
         return GenerationResult(variants=[])
 
     # 3. Feasibility check — raises FeasibilityError if impossible
     tight, q_available, q_needed = _check_feasibility(
-        len(courses_to_plan), quarters, units_per_quarter
+        len(courses_to_plan), quarters, units_per_quarter, graduation_quarter
     )
 
     # 4. Load prereq trees and run ASAP schedule
@@ -356,14 +368,15 @@ def generate(
     if overflow:
         print(
             f"  Warning: {len(overflow)} course(s) could not fit before "
-            f"{graduation_year} — omitted from plan."
+            f"{graduation_quarter} — omitted from plan."
         )
 
+    grad_year = int(graduation_quarter.split("_")[0])
     base_plan = CoursePlan(
         major_id=major_id,
         completed_courses=completed_courses,
         planned_courses={q: cs for q, cs in plan_dict.items() if cs},
-        graduation_year=graduation_year,
+        graduation_year=grad_year,
         units_per_quarter=units_per_quarter,
     )
 
@@ -384,8 +397,23 @@ def generate(
         variants.append(result)
 
     variants.sort(key=lambda r: r.soft_score)
+    best_variants = variants[:3]
+
+    # Annotate each variant with offering-pattern warnings (soft, not hard).
+    # A course scheduled in a quarter it historically isn't offered gets a
+    # warning appended to violations — plan is not invalidated.
+    for variant in best_variants:
+        for quarter, courses in variant.plan.planned_courses.items():
+            q_name = quarter.split("_", 1)[1]  # "2026_fall" → "fall"
+            for course in courses:
+                likely, reason = is_likely_offered(course, q_name)
+                if not likely:
+                    variant.violations.append(
+                        f"[offering] {course} in {quarter}: {reason}"
+                    )
+
     return GenerationResult(
-        variants=variants[:3],
+        variants=best_variants,
         tight_timeline=tight,
         overflow_count=len(overflow),
         quarters_available=q_available,
@@ -399,31 +427,39 @@ def generate(
 if __name__ == "__main__":
     MAJOR_ID = "BS-201G"   # CS major at UCI
 
-    # ── Step 1: feasibility check with graduation=2028 ────────────────────────
+    # ── Step 1: feasibility check with graduation=2028_spring ─────────────────
+    FIRST_GRAD = "2028_spring"
     print("=" * 60)
-    print(f"Feasibility check  major={MAJOR_ID}  completed=[]  grad=2028")
+    print(f"Feasibility check  major={MAJOR_ID}  completed=[]  grad={FIRST_GRAD}")
     print("=" * 60)
     try:
-        generate(major_id=MAJOR_ID, completed_courses=[], graduation_year=2028)
+        generate(major_id=MAJOR_ID, completed_courses=[], graduation_quarter=FIRST_GRAD)
         print("  Feasibility: PASS")
-        GRAD_YEAR = 2028
+        GRAD_QUARTER = FIRST_GRAD
     except FeasibilityError as e:
         print(f"  Feasibility: FAIL")
         print(f"  {e}")
         print(f"  quarters_available={e.quarters_available}  "
               f"quarters_needed={e.quarters_needed}")
-        GRAD_YEAR = 2028 + e.years_to_extend
-        print(f"\n  Extending to graduation_year={GRAD_YEAR} and retrying...\n")
+        base_year    = int(FIRST_GRAD.split("_")[0])
+        GRAD_QUARTER = f"{base_year + e.years_to_extend}_spring"
+        print(f"\n  Extending to graduation_quarter={GRAD_QUARTER} and retrying...\n")
 
-    # ── Step 2: generate with extended (or same) graduation year ──────────────
+    quarters_preview = _generate_quarters(GRAD_QUARTER)
+    print(f"  Exact quarters available ({len(quarters_preview)}):")
+    for q in quarters_preview:
+        print(f"    {q}")
+    print()
+
+    # ── Step 2: generate with extended (or same) graduation quarter ───────────
     print("=" * 60)
-    print(f"Generating plan  major={MAJOR_ID}  completed=[]  grad={GRAD_YEAR}")
+    print(f"Generating plan  major={MAJOR_ID}  completed=[]  grad={GRAD_QUARTER}")
     print("=" * 60)
     try:
         result = generate(
             major_id=MAJOR_ID,
             completed_courses=[],
-            graduation_year=GRAD_YEAR,
+            graduation_quarter=GRAD_QUARTER,
             units_per_quarter=16,
         )
     except FeasibilityError as e:
@@ -487,3 +523,12 @@ if __name__ == "__main__":
     passed = result.variants[0].soft_score <= result.variants[2].soft_score
     spread = result.variants[2].soft_score - result.variants[0].soft_score
     print(f"Variant 1 ≤ Variant 3 (spread={spread:.4f}): [{'PASS' if passed else 'FAIL'}]")
+
+    # ── Offering warnings (variant 1) ─────────────────────────────────────────
+    offering_viols = [v for v in result.variants[0].violations if v.startswith("[offering]")]
+    print()
+    print(f"Offering-pattern warnings (variant 1): {len(offering_viols)}")
+    for w in offering_viols[:8]:
+        print(f"  {w}")
+    if len(offering_viols) > 8:
+        print(f"  … and {len(offering_viols) - 8} more")
