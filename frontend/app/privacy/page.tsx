@@ -55,10 +55,10 @@ export default function PrivacyPage() {
             You can request deletion of your account and all associated data at
             any time by emailing{" "}
             <a
-              href="mailto:ryan.t.mcdaniel@icloud.com"
+              href="mailto:rtmcdani@uci.edu"
               className="text-blue-600 underline hover:text-blue-700"
             >
-              ryan.t.mcdaniel@icloud.com
+              rtmcdani@uci.edu
             </a>
             . We will process your request within 30 days.
           </p>
@@ -76,10 +76,10 @@ export default function PrivacyPage() {
           <p>
             Questions about this policy? Reach us at{" "}
             <a
-              href="mailto:ryan.t.mcdaniel@icloud.com"
+              href="mailto:rtmcdani@uci.edu"
               className="text-blue-600 underline hover:text-blue-700"
             >
-              ryan.t.mcdaniel@icloud.com
+              rtmcdani@uci.edu
             </a>
             .
           </p>
