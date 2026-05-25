@@ -127,32 +127,3 @@ def set(client, cache_key: str, result: dict) -> None:
     except Exception:
         pass
 
-
-# ── CLI helper ────────────────────────────────────────────────────────────────
-
-if __name__ == "__main__":
-    print("optimizer_cache migration SQL:\n")
-    print(MIGRATION_SQL)
-
-    client = create_client(os.getenv("SUPABASE_URL"), os.getenv("SUPABASE_SERVICE_KEY"))
-
-    # Smoke: write, read back, verify TTL logic
-    TEST_KEY = "__cache_smoke_test__"
-    TEST_VAL = {"variants": [], "cached": False, "smoke": True}
-
-    print("Writing test entry...")
-    set(client, TEST_KEY, TEST_VAL)
-
-    print("Reading back...")
-    result = get(client, TEST_KEY)
-    if result and result.get("smoke"):
-        print("  Cache round-trip: PASS")
-    else:
-        print("  Cache round-trip: FAIL (table may not exist — run migration SQL above)")
-
-    # Cleanup
-    try:
-        client.table(_TABLE).delete().eq("cache_key", TEST_KEY).execute()
-        print("  Cleanup: OK")
-    except Exception:
-        pass
