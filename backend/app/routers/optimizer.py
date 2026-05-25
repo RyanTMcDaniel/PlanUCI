@@ -16,13 +16,24 @@ _BACKEND = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__fil
 if _BACKEND not in sys.path:
     sys.path.insert(0, _BACKEND)
 
+import os
+
+from dotenv import load_dotenv
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
+from supabase import create_client
 
 from scripts.optimizer.hard_constraints import CoursePlan
 from scripts.optimizer.plan_generator import generate, FeasibilityError
 from scripts.optimizer.swap_suggester import suggest_swaps, suggest_move
 from scripts.optimizer.whatif import validate_locks, run_whatif
+from scripts.optimizer import cache as optimizer_cache
+
+_ENV = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", ".env")
+load_dotenv(_ENV)
+
+def _supabase_client():
+    return create_client(os.getenv("SUPABASE_URL"), os.getenv("SUPABASE_SERVICE_KEY"))
 
 router = APIRouter()
 
@@ -90,6 +101,19 @@ class GenerateRequest(BaseModel):
 
 @router.post("/generate")
 def optimizer_generate(req: GenerateRequest):
+    cache_key = optimizer_cache.make_key(
+        major_id           = req.major_id,
+        completed_courses  = req.completed_courses,
+        graduation_quarter = req.graduation_quarter,
+        units_per_quarter  = req.units_per_quarter,
+        waived_ges         = req.waived_ges,
+    )
+    client = _supabase_client()
+    cached = optimizer_cache.get(client, cache_key)
+    if cached is not None:
+        cached["cached"] = True
+        return cached
+
     try:
         result = generate(
             major_id           = req.major_id,
@@ -113,14 +137,17 @@ def optimizer_generate(req: GenerateRequest):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-    return {
+    response = {
         "variants":           [_variant_dict(v) for v in result.variants],
         "tight_timeline":     result.tight_timeline,
         "quarters_available": result.quarters_available,
         "quarters_needed":    result.quarters_needed,
         "overflow_count":     result.overflow_count,
         "group_map":          result.group_map,
+        "cached":             False,
     }
+    optimizer_cache.set(client, cache_key, response)
+    return response
 
 
 # ── /optimizer/whatif ─────────────────────────────────────────────────────────
