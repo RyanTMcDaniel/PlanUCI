@@ -105,9 +105,10 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="PlanUCI ML API", lifespan=lifespan)
 
-from .routers import difficulty, sentiment  # noqa: E402
+from .routers import difficulty, sentiment, optimizer  # noqa: E402
 app.include_router(difficulty.router, prefix="/difficulty", tags=["difficulty"])
 app.include_router(sentiment.router, prefix="/sentiment", tags=["sentiment"])
+app.include_router(optimizer.router, prefix="/optimizer", tags=["optimizer"])
 
 
 @app.get("/health")
