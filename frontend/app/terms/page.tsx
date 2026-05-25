@@ -85,10 +85,10 @@ export default function TermsPage() {
           <p>
             Questions about these terms? Email us at{" "}
             <a
-              href="mailto:ryan.t.mcdaniel@icloud.com"
+              href="mailto:rtmcdani@uci.edu"
               className="text-blue-600 underline hover:text-blue-700"
             >
-              ryan.t.mcdaniel@icloud.com
+              rtmcdani@uci.edu
             </a>
             .
           </p>
