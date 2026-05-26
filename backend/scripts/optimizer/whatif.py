@@ -88,7 +88,14 @@ def _eval_locked_tree(node: dict, avail: set[str], locked_norm: set[str]) -> boo
         if key == "OR":
             return any(_eval_locked_item(i, avail, locked_norm) for i in items)
         if key == "NOT":
-            return not any(_eval_locked_item(i, avail, locked_norm) for i in items)
+            # Only fail if an anti-coreq course is explicitly locked to an earlier slot.
+            # Non-locked courses are unknown — assume they don't conflict.
+            return not any(
+                i.get("prereqType") == "course"
+                and _norm(i.get("courseId", "")) in locked_norm
+                and _norm(i.get("courseId", "")) in avail
+                for i in items
+            )
     return True
 
 

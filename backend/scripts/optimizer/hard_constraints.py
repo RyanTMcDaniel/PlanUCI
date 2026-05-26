@@ -27,8 +27,11 @@ def _qkey(qstr: str) -> tuple[int, int]:
 
 
 def _norm(course_id: str) -> str:
-    """Normalize course ID for comparison: remove spaces, uppercase."""
-    return course_id.replace(" ", "").upper()
+    """Normalize course ID for comparison: remove spaces, uppercase, resolve UCI dept aliases."""
+    s = course_id.replace(" ", "").upper()
+    # prereq_edges stores raw catalog text like "I&C SCI 46"; courses table uses "ICS46"
+    s = s.replace("I&CSCI", "ICS")
+    return s
 
 
 @dataclass

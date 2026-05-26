@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useEffect, useMemo, useCallback } from "react";
+import { useState, useEffect, useMemo, useCallback, useRef } from "react";
 import {
   DndContext,
   DragEndEvent,
@@ -21,7 +21,6 @@ import {
   fetchCourseDetails,
   fetchGERequirements,
 } from "@/lib/api/courses";
-
 // ── Types ─────────────────────────────────────────────────────────────────────
 
 type PlannedCourses = Record<string, string[]>;
@@ -30,6 +29,19 @@ interface DragData {
   type: "sidebar" | "placed";
   courseId: string;
   quarterKey?: string;
+}
+
+interface CourseStats {
+  professor: {
+    name: string;
+    overall_rating: number;
+    difficulty_rating: number;
+    num_ratings: number;
+    sentiment_label: string | null;
+  } | null;
+  difficulty_score: number | null;
+  avg_gpa: number | null;
+  prof_gpa: number | null;
 }
 
 // ── Constants ─────────────────────────────────────────────────────────────────
@@ -41,6 +53,7 @@ const BASE_QUARTERS = [
   { key: "winter", label: "Winter" },
   { key: "spring", label: "Spring" },
 ];
+const TIP_YEARS = [2021, 2022, 2023, 2024, 2025];
 
 function qkey(year: number, q: string) {
   return `${START_YEAR + year - 1}_${q}`;
@@ -50,8 +63,7 @@ function generateGradOptions() {
   const out: { value: string; label: string }[] = [];
   const seq = ["winter", "spring", "fall"];
   let year = 2026;
-  let qi = 1; // start at spring
-
+  let qi = 1;
   while (true) {
     const q = seq[qi];
     out.push({ value: `${year}_${q}`, label: `${q[0].toUpperCase() + q.slice(1)} ${year}` });
@@ -64,12 +76,27 @@ function generateGradOptions() {
 
 const GRAD_OPTIONS = generateGradOptions();
 
+function diffColor(level: string | null | undefined): string {
+  if (!level) return "#3a3a3a";
+  if (level.includes("Lower")) return "#22c55e";
+  if (level.includes("Upper")) return "#eab308";
+  if (level.includes("Graduate")) return "#ef4444";
+  return "#3a3a3a";
+}
+
+function diffScoreColor(score: number): string {
+  if (score <= 3) return "#22c55e";
+  if (score <= 6) return "#eab308";
+  if (score <= 8) return "#f97316";
+  return "#ef4444";
+}
+
 // ── Icons ─────────────────────────────────────────────────────────────────────
 
 function LockIcon({ locked }: { locked: boolean }) {
   return (
     <svg viewBox="0 0 14 14" fill="none"
-      className={`w-2.5 h-2.5 transition-colors ${locked ? "text-amber-400" : "text-zinc-700 group-hover/card:text-zinc-500"}`}>
+      className={`w-3 h-3 transition-colors ${locked ? "text-amber-400" : "text-[#555] group-hover/card:text-[#e8e8e8]"}`}>
       <rect x="3" y="6" width="8" height="6" rx="1.2" stroke="currentColor" strokeWidth="1.3"/>
       <path d="M5 6V4.5a2 2 0 014 0V6" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round"/>
     </svg>
@@ -79,172 +106,532 @@ function LockIcon({ locked }: { locked: boolean }) {
 function ChevronIcon({ open }: { open: boolean }) {
   return (
     <svg viewBox="0 0 12 12" fill="none"
-      className={`w-2.5 h-2.5 text-zinc-600 transition-transform shrink-0 ${open ? "rotate-180" : ""}`}>
+      className={`w-3 h-3 text-[#444] transition-transform shrink-0 ${open ? "rotate-180" : ""}`}>
       <path d="M2 4l4 4 4-4" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round"/>
     </svg>
   );
 }
 
+// ── Error banner ───────────────────────────────────────────────────────────────
+
 function ErrorBanner({ message, onRetry }: { message: string; onRetry: () => void }) {
   return (
-    <div className="flex items-center justify-between gap-2 px-2 py-1.5 rounded border border-red-900/40 bg-red-950/20 mx-1">
+    <div className="flex items-center justify-between gap-2 px-2 py-1.5 rounded border border-red-900/40 bg-red-950/20 mx-1 my-1">
       <span className="text-[10px] text-red-400 truncate">{message}</span>
-      <button
-        onClick={onRetry}
-        className="text-[9px] text-red-300 underline shrink-0 hover:text-red-200"
-      >
+      <button onClick={onRetry} className="text-[9px] text-red-300 underline shrink-0 hover:text-red-200">
         Retry
       </button>
     </div>
   );
 }
 
-// ── Placed course card (compact single-line) ───────────────────────────────────
+// ── Major combobox ────────────────────────────────────────────────────────────
+
+function MajorCombobox({
+  options, selectedDisplayName, programNames, onSelect, loading,
+}: {
+  options: MajorOption[];
+  selectedDisplayName: string;
+  programNames: Map<string, string>;
+  onSelect: (dbDisplayName: string) => void;
+  loading: boolean;
+}) {
+  const [query, setQuery] = useState("");
+  const [open, setOpen] = useState(false);
+  const containerRef = useRef<HTMLDivElement>(null);
+  const inputRef = useRef<HTMLInputElement>(null);
+
+  const selectedLabel = useMemo(() => {
+    if (!selectedDisplayName) return "";
+    const match = options.find((o) => o.display_name === selectedDisplayName);
+    return (match ? programNames.get(match.major_id) : undefined) || selectedDisplayName;
+  }, [selectedDisplayName, options, programNames]);
+
+  useEffect(() => {
+    if (!open) setQuery(selectedLabel);
+  }, [selectedLabel, open]);
+
+  useEffect(() => {
+    function onMouseDown(e: MouseEvent) {
+      if (containerRef.current && !containerRef.current.contains(e.target as Node)) {
+        setOpen(false);
+        setQuery(selectedLabel);
+      }
+    }
+    document.addEventListener("mousedown", onMouseDown);
+    return () => document.removeEventListener("mousedown", onMouseDown);
+  }, [selectedLabel]);
+
+  const filtered = useMemo(() => {
+    const seen = new Set<string>();
+    const q = query.trim().toLowerCase();
+    return options
+      .filter((o) => {
+        if (seen.has(o.display_name)) return false;
+        seen.add(o.display_name);
+        if (!q) return true;
+        const dbName = o.display_name.toLowerCase();
+        const apiName = (programNames.get(o.major_id) ?? "").toLowerCase();
+        return dbName.includes(q) || apiName.includes(q);
+      })
+      .slice(0, 40);
+  }, [options, query, programNames]);
+
+  function getOptionLabel(opt: MajorOption): string {
+    return programNames.get(opt.major_id) || opt.display_name;
+  }
+
+  function handleSelect(opt: MajorOption) {
+    onSelect(opt.display_name);
+    setQuery(getOptionLabel(opt));
+    setOpen(false);
+  }
+
+  function handleKeyDown(e: React.KeyboardEvent) {
+    if (e.key === "Escape") {
+      setOpen(false);
+      setQuery(selectedLabel);
+      inputRef.current?.blur();
+    }
+    if (e.key === "Enter" && filtered.length > 0) handleSelect(filtered[0]);
+  }
+
+  return (
+    <div ref={containerRef} className="relative">
+      <div className="relative">
+        <input
+          ref={inputRef}
+          type="text"
+          value={query}
+          onChange={(e) => { setQuery(e.target.value); setOpen(true); }}
+          onFocus={() => setOpen(true)}
+          onKeyDown={handleKeyDown}
+          placeholder={loading ? "Loading majors…" : "Search for your major..."}
+          disabled={loading && options.length === 0}
+          className="w-full bg-[#111] border border-[#2a2a2a] rounded px-2.5 py-1.5 text-[11px] text-[#f0f0f0] placeholder-[#444] focus:outline-none focus:border-[#3b82f6]/60 disabled:opacity-50 pr-6"
+        />
+        <svg className="absolute right-2 top-1/2 -translate-y-1/2 w-3 h-3 text-[#444] pointer-events-none" viewBox="0 0 12 12" fill="none">
+          <path d="M2 4l4 4 4-4" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round"/>
+        </svg>
+      </div>
+      {open && filtered.length > 0 && (
+        <div className="absolute z-50 top-full left-0 right-0 mt-px bg-[#1a1a1a] border border-[#2a2a2a] rounded max-h-52 overflow-y-auto shadow-xl">
+          {filtered.map((opt) => (
+            <button
+              key={opt.major_id}
+              onMouseDown={() => handleSelect(opt)}
+              className="w-full text-left px-2.5 py-[7px] text-[11px] text-[#bbb] hover:bg-[#252525] hover:text-[#f0f0f0] transition-colors"
+            >
+              {getOptionLabel(opt)}
+            </button>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ── Course tooltip ─────────────────────────────────────────────────────────────
+
+function CourseTooltip({
+  courseId, info, style, onMouseEnter, onMouseLeave,
+}: {
+  courseId: string;
+  info: CourseDetail | undefined;
+  style: React.CSSProperties;
+  onMouseEnter: () => void;
+  onMouseLeave: () => void;
+}) {
+  const [stats, setStats] = useState<CourseStats | null>(null);
+  const [statsLoading, setStatsLoading] = useState(true);
+
+  useEffect(() => {
+    setStatsLoading(true);
+    setStats(null);
+    fetch(`/api/course-stats?id=${encodeURIComponent(courseId)}`)
+      .then((r) => (r.ok ? r.json() : null))
+      .then((d) => setStats(d ?? null))
+      .catch(() => setStats(null))
+      .finally(() => setStatsLoading(false));
+  }, [courseId]);
+
+  const termsSet = useMemo(() => new Set(info?.terms ?? []), [info]);
+  const prof = stats?.professor ?? null;
+
+  return (
+    <div
+      style={style}
+      onMouseEnter={onMouseEnter}
+      onMouseLeave={onMouseLeave}
+      className="w-[300px] bg-[#1e1e1e] border border-[#3a3a3a] rounded-lg shadow-2xl overflow-hidden pointer-events-auto"
+    >
+      {/* ── Course info ── */}
+      <div className="px-3 py-2.5 border-b border-[#2a2a2a]">
+        <p className="text-[13px] font-bold text-[#e8e8e8] leading-tight">{courseId}</p>
+        {info?.title && (
+          <p className="text-[11px] text-[#999] mt-0.5 leading-snug">{info.title}</p>
+        )}
+        {info?.description && (
+          <p className="text-[10px] text-[#555] mt-1.5 leading-relaxed line-clamp-3">
+            {info.description}
+          </p>
+        )}
+        <div className="flex items-center gap-3 mt-1.5">
+          <span className="text-[10px] text-[#666]">
+            {info?.min_units ?? "?"} UNITS
+          </span>
+          {stats?.difficulty_score != null && (
+            <span className="text-[10px] text-[#eab308]">
+              Difficulty {stats.difficulty_score.toFixed(1)}/10
+            </span>
+          )}
+          {statsLoading ? null : stats?.avg_gpa != null && isFinite(stats.avg_gpa) ? (
+            <span className="text-[10px] text-[#22c55e]">
+              Course Avg GPA {stats.avg_gpa.toFixed(2)}
+            </span>
+          ) : (
+            <span className="text-[10px] text-[#444]">No GPA data</span>
+          )}
+        </div>
+      </div>
+
+      {/* ── Offering history ── */}
+      <div className="px-3 py-2 border-b border-[#2a2a2a]">
+        <p className="text-[8px] font-bold uppercase tracking-widest text-[#444] mb-1.5">Offered</p>
+        <div style={{ display: "grid", gridTemplateColumns: "22px repeat(3, 1fr)", gap: "2px 4px" }}>
+          <span />
+          {["F", "W", "S"].map((q) => (
+            <span key={q} className="text-[7px] text-[#444] text-center font-mono">{q}</span>
+          ))}
+          {TIP_YEARS.flatMap((yr) => [
+            <span key={`${yr}l`} className="text-[7px] text-[#444] font-mono">{String(yr).slice(2)}</span>,
+            ...["Fall", "Winter", "Spring"].map((q) => (
+              <span
+                key={`${yr}${q}`}
+                title={`${q} ${yr}`}
+                className={`text-[9px] text-center leading-tight ${
+                  termsSet.has(`${yr} ${q}`) ? "text-[#22c55e]" : "text-[#2a2a2a]"
+                }`}
+              >
+                {termsSet.has(`${yr} ${q}`) ? "✓" : "·"}
+              </span>
+            )),
+          ])}
+        </div>
+      </div>
+
+      {/* ── Top professor ── */}
+      <div className="px-3 py-2">
+        <p className="text-[8px] font-bold uppercase tracking-widest text-[#444] mb-1.5">Top Professor</p>
+        {statsLoading ? (
+          <p className="text-[10px] text-[#3a3a3a]">Loading…</p>
+        ) : prof ? (
+          <div>
+            <p className="text-[11px] font-semibold text-[#ccc]">{prof.name}</p>
+            <div className="flex items-center gap-2 mt-0.5 flex-wrap">
+              <span className="text-[10px] font-bold text-[#22c55e]">
+                {prof.overall_rating.toFixed(1)}/5 overall
+              </span>
+              <span className="text-[10px] text-[#555]">·</span>
+              <span className="text-[10px] text-[#777]">
+                {prof.difficulty_rating.toFixed(1)} difficulty
+              </span>
+              <span className="text-[10px] text-[#555]">·</span>
+              <span className="text-[10px] text-[#555]">{prof.num_ratings} ratings</span>
+              {prof.sentiment_label && (
+                <>
+                  <span className="text-[10px] text-[#555]">·</span>
+                  <span className="text-[10px] text-[#3b82f6]">{prof.sentiment_label}</span>
+                </>
+              )}
+            </div>
+            <div className="mt-1">
+              {stats?.prof_gpa != null && isFinite(stats.prof_gpa) ? (
+                <span className="text-[10px] text-[#22c55e]">
+                  GPA with this prof: {stats.prof_gpa.toFixed(2)}
+                </span>
+              ) : (
+                <span className="text-[10px] text-[#444]">No GPA data for this prof</span>
+              )}
+            </div>
+          </div>
+        ) : (
+          <p className="text-[10px] text-[#3a3a3a]">No professor data available</p>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ── Placed card ────────────────────────────────────────────────────────────────
 
 function PlacedCard({
-  courseId,
-  quarterKey,
-  title,
-  units,
-  isLocked,
-  onToggleLock,
+  courseId, quarterKey, title, units, level, diffScore, gpa, isLocked, onToggleLock, onRemove,
 }: {
   courseId: string;
   quarterKey: string;
   title?: string | null;
   units?: number | null;
+  level?: string | null;
+  diffScore?: number | null;
+  gpa?: number | null;
   isLocked: boolean;
   onToggleLock: (id: string) => void;
+  onRemove: (id: string, qKey: string) => void;
 }) {
   const { attributes, listeners, setNodeRef, transform, isDragging } = useDraggable({
     id: `placed|${quarterKey}|${courseId}`,
     data: { type: "placed", courseId, quarterKey } satisfies DragData,
   });
 
+  const borderColor = isLocked
+    ? "#f59e0b"
+    : diffScore != null
+    ? diffScoreColor(diffScore)
+    : diffColor(level);
+
   const style: React.CSSProperties = {
     ...(transform ? { transform: CSS.Translate.toString(transform) } : {}),
-    ...(isLocked ? { borderLeft: "2px solid rgba(245,158,11,0.6)" } : {}),
+    borderLeft: `3px solid ${borderColor}`,
   };
 
   return (
     <div
       ref={setNodeRef}
       style={style}
-      className={`group/card flex items-center gap-1 rounded px-1 py-[3px] select-none transition-colors
-        ${isDragging ? "opacity-20" : ""}
-        ${isLocked
-          ? "bg-amber-500/[0.04] border border-zinc-700/25"
-          : "bg-zinc-800/50 border border-zinc-700/30 hover:border-zinc-600/40"
-        }`}
+      className={`group/card flex items-center gap-1.5 rounded-r pl-2 pr-1 py-1 select-none
+        bg-[#1e1e1e] border border-l-0 border-[#2a2a2a] transition-colors min-h-[44px]
+        ${isDragging ? "opacity-20" : "hover:bg-[#252525] hover:border-[#333]"}`}
     >
+      {/* drag handle */}
       <span
         {...listeners}
         {...attributes}
-        className="text-[9px] leading-none text-zinc-800 group-hover/card:text-zinc-600 cursor-grab active:cursor-grabbing shrink-0 select-none"
+        className="text-[10px] text-[#2a2a2a] group-hover/card:text-[#444] cursor-grab active:cursor-grabbing shrink-0 leading-none self-start mt-1"
       >
         ⠿
       </span>
-      <span className="w-1.5 h-1.5 rounded-full bg-zinc-600 shrink-0" />
-      <span className="text-[10px] font-bold shrink-0" style={{ color: "#e8e8e8" }}>
-        {courseId}
-      </span>
-      {title && (
-        <span className="text-[9px] text-zinc-600 truncate flex-1 min-w-0">{title}</span>
-      )}
-      {!title && <span className="flex-1" />}
-      <span className="text-[9px] text-zinc-700 shrink-0">{units ?? 4}u</span>
-      <button
-        onPointerDown={(e) => e.stopPropagation()}
-        onClick={() => onToggleLock(courseId)}
-        className="shrink-0"
-        title={isLocked ? "Unlock" : "Lock to quarter"}
-      >
-        <LockIcon locked={isLocked} />
-      </button>
+
+      {/* course info */}
+      <div className="flex-1 min-w-0">
+        <p className="text-[13px] font-bold text-[#e8e8e8] leading-tight truncate">{courseId}</p>
+        {title && (
+          <p className="text-[10px] text-[#999] leading-snug truncate">{title}</p>
+        )}
+      </div>
+
+      {/* right side */}
+      <div className="flex flex-col items-end gap-0.5 shrink-0">
+        {gpa != null && isFinite(gpa) && (
+          <span className="text-[9px] text-[#22c55e] font-mono">{gpa.toFixed(2)} GPA</span>
+        )}
+        <span className="text-[10px] text-[#666]">{units ?? "?"} UNITS</span>
+        <div className="flex gap-1 opacity-0 group-hover/card:opacity-100 transition-opacity">
+          <button
+            onPointerDown={(e) => e.stopPropagation()}
+            onClick={() => onToggleLock(courseId)}
+            title={isLocked ? "Unlock" : "Lock to quarter"}
+          >
+            <LockIcon locked={isLocked} />
+          </button>
+          <button
+            onPointerDown={(e) => e.stopPropagation()}
+            onClick={() => onRemove(courseId, quarterKey)}
+            title="Remove"
+            className="text-[#555] hover:text-[#e8e8e8] text-[12px] leading-none w-3 text-center transition-colors"
+          >
+            ×
+          </button>
+        </div>
+      </div>
     </div>
   );
 }
 
-// ── Quarter cell ──────────────────────────────────────────────────────────────
+// ── Placed card row (with tooltip + prereq warning) ────────────────────────────
+
+function PlacedCardRow({
+  courseId, courseInfoMap, prereqWarning, onDismissWarning,
+  ...cardProps
+}: {
+  courseId: string;
+  courseInfoMap: Record<string, CourseDetail>;
+  prereqWarning?: string;
+  onDismissWarning?: () => void;
+} & Omit<React.ComponentProps<typeof PlacedCard>, "courseId">) {
+  const [tipVisible, setTipVisible] = useState(false);
+  const [tipPos, setTipPos] = useState<{ top: number; left: number }>({ top: 0, left: 0 });
+  const showTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+  const hideTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+  const rowRef = useRef<HTMLDivElement>(null);
+
+  function scheduleShow() {
+    clearTimeout(hideTimer.current);
+    clearTimeout(showTimer.current);
+    showTimer.current = setTimeout(() => {
+      if (!rowRef.current) return;
+      const rect = rowRef.current.getBoundingClientRect();
+      const goRight = window.innerWidth - rect.right >= 320;
+      setTipPos({
+        top: Math.min(rect.top, window.innerHeight - 370),
+        left: goRight ? rect.right + 8 : Math.max(8, rect.left - 308),
+      });
+      setTipVisible(true);
+    }, 300);
+  }
+
+  function scheduleHide() {
+    clearTimeout(showTimer.current);
+    hideTimer.current = setTimeout(() => setTipVisible(false), 120);
+  }
+
+  function cancelHide() {
+    clearTimeout(hideTimer.current);
+  }
+
+  useEffect(() => () => {
+    clearTimeout(showTimer.current);
+    clearTimeout(hideTimer.current);
+  }, []);
+
+  return (
+    <div ref={rowRef} onMouseEnter={scheduleShow} onMouseLeave={scheduleHide}>
+      <PlacedCard courseId={courseId} {...cardProps} />
+
+      {prereqWarning && (
+        <div className="flex items-center gap-1 text-[9px] text-red-400 px-2 py-0.5">
+          <span className="truncate">⚠ {prereqWarning}</span>
+          {onDismissWarning && (
+            <button
+              onClick={onDismissWarning}
+              className="ml-auto shrink-0 hover:text-red-300 leading-none"
+            >
+              ×
+            </button>
+          )}
+        </div>
+      )}
+
+      {tipVisible && (
+        <CourseTooltip
+          courseId={courseId}
+          info={courseInfoMap[courseId]}
+          style={{
+            position: "fixed",
+            top: tipPos.top,
+            left: tipPos.left,
+            zIndex: 9999,
+          }}
+          onMouseEnter={cancelHide}
+          onMouseLeave={scheduleHide}
+        />
+      )}
+    </div>
+  );
+}
+
+// ── Quarter cell ───────────────────────────────────────────────────────────────
 
 function QuarterCell({
   qKey, label, dim,
-  courseIds, courseInfoMap, lockedCourses, onToggleLock,
-  removable, onRemove,
+  courseIds, courseInfoMap, difficultyMap, courseGpaMap, lockedCourses, onToggleLock, onRemove,
+  prereqWarnings, onDismissWarning,
+  removable, onRemoveQuarter,
 }: {
   qKey: string;
   label: string;
   dim: boolean;
   courseIds: string[];
   courseInfoMap: Record<string, CourseDetail>;
+  difficultyMap: Record<string, number>;
+  courseGpaMap: Record<string, number>;
   lockedCourses: Set<string>;
   onToggleLock: (id: string) => void;
+  onRemove: (id: string, qKey: string) => void;
+  prereqWarnings: Record<string, string>;
+  onDismissWarning: (id: string) => void;
   removable?: boolean;
-  onRemove?: () => void;
+  onRemoveQuarter?: () => void;
 }) {
   const { setNodeRef, isOver } = useDroppable({
     id: `zone|${qKey}`,
     data: { quarterKey: qKey },
   });
 
-  const units = courseIds.reduce((sum, id) => sum + (courseInfoMap[id]?.min_units ?? 4), 0);
+  const units = courseIds.reduce(
+    (sum, id) => sum + (courseInfoMap[id]?.min_units ?? 4),
+    0,
+  );
+
+  const avgDiff =
+    courseIds.length > 0
+      ? courseIds.reduce((sum, id) => sum + (difficultyMap[id] ?? 5), 0) / courseIds.length
+      : null;
 
   return (
-    <div className={`flex flex-col border-r border-white/[0.04] ${dim ? "opacity-70" : ""}`}>
-      <div className={`flex items-center gap-1.5 px-2 py-1 border-b border-white/[0.05] shrink-0
-        ${dim ? "bg-[#111]" : "bg-[#131313]"}`}
-      >
-        <span className={`text-[10px] font-semibold ${dim ? "text-zinc-700" : "text-zinc-400"}`}>
+    <div className={`flex flex-col border-r border-[#2a2a2a] last:border-r-0 ${dim ? "opacity-55" : ""}`}>
+      {/* header */}
+      <div className="flex items-center px-2 h-7 border-b border-[#2a2a2a] shrink-0 bg-[#242424]">
+        <span className={`text-[10px] font-semibold ${dim ? "text-[#383838]" : "text-[#666]"}`}>
           {label}
         </span>
-        <span className="text-[9px] text-zinc-700 ml-1">{units}u</span>
-        {removable && onRemove && (
-          <button
-            onClick={onRemove}
-            className="ml-auto text-[9px] text-zinc-700 hover:text-zinc-400 transition-colors leading-none"
-          >
+        {avgDiff != null && (
+          <span style={{ color: diffScoreColor(avgDiff) }} className="text-[9px] ml-1.5">
+            ◆ {avgDiff.toFixed(1)}
+          </span>
+        )}
+        {units > 0 && <span className="text-[9px] text-[#555] ml-auto mr-1">{units} UNITS</span>}
+        {removable && onRemoveQuarter && (
+          <button onClick={onRemoveQuarter}
+            className="text-[9px] text-[#383838] hover:text-[#666] transition-colors leading-none">
             ✕
           </button>
         )}
       </div>
+
+      {/* droppable body */}
       <div
         ref={setNodeRef}
-        className={`flex-1 flex flex-col gap-[3px] p-1.5 transition-colors
-          ${dim ? "bg-[#161616]" : "bg-[#1b1b1b]"}
-          ${isOver ? "!bg-[#152035]" : ""}`}
+        className={`flex-1 flex flex-col gap-[4px] p-1.5 min-h-[160px] transition-colors
+          ${isOver ? "bg-[#0d1a2d]" : "bg-[#1e1e1e]"}`}
       >
+        {courseIds.length === 0 && !isOver && (
+          <div className="m-1 flex-1 border border-dashed border-[#242424] rounded" />
+        )}
         {courseIds.map((cid) => (
-          <PlacedCard
+          <PlacedCardRow
             key={cid}
             courseId={cid}
             quarterKey={qKey}
             title={courseInfoMap[cid]?.title}
             units={courseInfoMap[cid]?.min_units}
+            level={courseInfoMap[cid]?.course_level}
+            diffScore={difficultyMap[cid] ?? null}
+            gpa={courseGpaMap[cid] ?? null}
             isLocked={lockedCourses.has(cid)}
             onToggleLock={onToggleLock}
+            onRemove={onRemove}
+            courseInfoMap={courseInfoMap}
+            prereqWarning={prereqWarnings[cid]}
+            onDismissWarning={() => onDismissWarning(cid)}
           />
         ))}
-        {courseIds.length === 0 && (
-          <div className={`flex-1 flex items-center justify-center text-[9px] min-h-[56px]
-            ${isOver ? "text-blue-400/50" : "text-zinc-800"}`}
-          >
-            {isOver ? "drop here" : ""}
-          </div>
-        )}
       </div>
     </div>
   );
 }
 
-// ── Sidebar card ──────────────────────────────────────────────────────────────
+// ── Course pill (sidebar grid) ─────────────────────────────────────────────────
 
-function SidebarCard({
-  courseId, title, units, isPlaced,
+function CoursePill({
+  courseId, title, units, isPlaced, unavailable, diffScore,
 }: {
   courseId: string;
   title?: string | null;
   units?: number | null;
   isPlaced: boolean;
+  unavailable?: boolean;
+  diffScore?: number | null;
 }) {
   const { attributes, listeners, setNodeRef, transform, isDragging } = useDraggable({
     id: `sidebar|${courseId}`,
@@ -253,13 +640,25 @@ function SidebarCard({
   });
 
   const style = transform ? { transform: CSS.Translate.toString(transform) } : undefined;
+  const tooltip = unavailable
+    ? "Course details unavailable"
+    : title
+    ? `${courseId} — ${title}${units ? ` (${units}u)` : ""}`
+    : courseId;
+  const dot = diffScore != null ? (
+    <span style={{ color: diffScoreColor(diffScore) }} className="text-[6px] mr-0.5 shrink-0 leading-none">●</span>
+  ) : null;
 
   if (isPlaced) {
     return (
-      <div className="flex items-center gap-1.5 rounded px-1.5 py-[3px] opacity-35">
-        <span className="text-green-500 text-[9px] shrink-0">✓</span>
-        <span className="text-[10px] text-zinc-600 truncate">{courseId}</span>
-        {title && <span className="text-[9px] text-zinc-700 truncate flex-1 min-w-0">{title}</span>}
+      <div
+        title={tooltip}
+        className="flex items-center justify-center rounded-full px-2 py-[3px] bg-[#3b82f6]/20 border border-[#3b82f6]/35 min-w-0 overflow-hidden"
+      >
+        {dot}
+        <span className="text-[9px] font-medium leading-none truncate text-[#93c5fd]">
+          {courseId}
+        </span>
       </div>
     );
   }
@@ -270,32 +669,36 @@ function SidebarCard({
       style={style}
       {...listeners}
       {...attributes}
-      className={`flex items-center gap-1.5 rounded px-1.5 py-[3px] border cursor-grab active:cursor-grabbing select-none transition-colors
-        ${isDragging
-          ? "border-blue-500/30 bg-blue-500/5 opacity-40"
-          : "border-zinc-700/40 bg-zinc-800/30 hover:border-zinc-600/50 hover:bg-zinc-700/30"
+      title={tooltip}
+      className={`flex items-center justify-center rounded-full px-2 py-[3px] border cursor-grab active:cursor-grabbing select-none transition-colors min-w-0 overflow-hidden
+        ${unavailable
+          ? "border-dashed border-[#252525] bg-transparent"
+          : isDragging
+            ? "border-[#3b82f6]/40 bg-[#3b82f6]/10 opacity-40"
+            : "border-[#333] bg-transparent hover:border-[#555] hover:bg-[#1a1a1a]"
         }`}
     >
-      <span className="w-1.5 h-1.5 rounded-full bg-zinc-600 shrink-0" />
-      <span className="text-[10px] font-semibold text-zinc-200 shrink-0">{courseId}</span>
-      {title && <span className="text-[9px] text-zinc-500 truncate flex-1 min-w-0">{title}</span>}
-      {!title && <span className="flex-1" />}
-      <span className="text-[9px] text-zinc-700 shrink-0">{units ?? 4}u</span>
+      {!unavailable && dot}
+      <span className={`text-[9px] font-medium leading-none truncate ${unavailable ? "text-[#333]" : "text-[#bbb]"}`}>
+        {courseId}
+      </span>
     </div>
   );
 }
 
-// ── Requirement group section ──────────────────────────────────────────────────
+// ── Requirement group ─────────────────────────────────────────────────────────
 
 function RequirementGroup({
-  req, placedSet, courseInfoMap, searchQuery,
+  req, placedSet, courseInfoMap, difficultyMap, searchQuery, initialOpen,
 }: {
   req: ReqGroup;
   placedSet: Set<string>;
   courseInfoMap: Record<string, CourseDetail>;
+  difficultyMap: Record<string, number>;
   searchQuery: string;
+  initialOpen?: boolean;
 }) {
-  const [open, setOpen] = useState(true);
+  const [open, setOpen] = useState(initialOpen ?? false);
 
   const filtered = useMemo(() => {
     if (!searchQuery) return req.courses;
@@ -303,37 +706,54 @@ function RequirementGroup({
     return req.courses.filter(
       (cid) =>
         cid.toLowerCase().includes(q) ||
-        (courseInfoMap[cid]?.title ?? "").toLowerCase().includes(q)
+        (courseInfoMap[cid]?.title ?? "").toLowerCase().includes(q),
     );
   }, [req.courses, searchQuery, courseInfoMap]);
 
   if (filtered.length === 0) return null;
 
-  const placed = filtered.filter((c) => placedSet.has(c)).length;
+  const placed = req.courses.filter((c) => placedSet.has(c)).length;
+  const done = placed >= req.courses_needed;
+  const partial = !done && placed > 0;
+  const accentColor = done ? "#22c55e" : partial ? "#3b82f6" : "transparent";
 
   return (
-    <div className="rounded overflow-hidden border border-white/[0.05]">
+    <div
+      className="mx-1 mb-[2px] overflow-hidden"
+      style={{ borderLeft: `3px solid ${accentColor}` }}
+    >
       <button
         onClick={() => setOpen((o) => !o)}
-        className="w-full flex items-center justify-between px-2 py-1.5 hover:bg-white/[0.02] transition-colors text-left"
+        className="w-full flex items-center px-2 py-[7px] hover:bg-[#1c1c1c] transition-colors text-left gap-2 bg-[#141414]"
       >
-        <span className="text-[10px] font-semibold text-zinc-300 truncate">{req.group_name}</span>
-        <div className="flex items-center gap-1.5 ml-2 shrink-0">
-          <span className="text-[9px] px-1 py-0.5 rounded bg-zinc-800 text-zinc-500">
-            {placed}/{filtered.length}
+        <div className="flex-1 min-w-0">
+          <span className="text-[10px] font-normal text-[#ccc] block truncate">
+            {req.group_name}
+          </span>
+          {req.courses_needed < req.courses.length && (
+            <span className="text-[9px] text-[#444] leading-none">
+              {req.courses_needed} of {req.courses.length} required
+            </span>
+          )}
+        </div>
+        <div className="flex items-center gap-1.5 shrink-0">
+          <span className="text-[9px] px-1.5 py-[2px] rounded bg-[#1e1e1e] font-mono tabular-nums text-[#555]">
+            {placed}/{req.courses_needed}
           </span>
           <ChevronIcon open={open} />
         </div>
       </button>
       {open && (
-        <div className="flex flex-col gap-px pb-1.5 px-1">
+        <div className="grid grid-cols-3 gap-1 p-1.5 bg-[#0f0f0f]">
           {filtered.map((cid) => (
-            <SidebarCard
+            <CoursePill
               key={cid}
               courseId={cid}
               title={courseInfoMap[cid]?.title}
               units={courseInfoMap[cid]?.min_units}
               isPlaced={placedSet.has(cid)}
+              unavailable={!courseInfoMap[cid]}
+              diffScore={difficultyMap[cid] ?? null}
             />
           ))}
         </div>
@@ -342,58 +762,84 @@ function RequirementGroup({
   );
 }
 
-// ── GE section ────────────────────────────────────────────────────────────────
+// ── GE section ─────────────────────────────────────────────────────────────────
 
 function GESection({
-  req, placedSet, searchQuery,
+  req, placedSet, courseInfoMap, difficultyMap, searchQuery, initialOpen,
 }: {
   req: ReqGroup;
   placedSet: Set<string>;
+  courseInfoMap: Record<string, CourseDetail>;
+  difficultyMap: Record<string, number>;
   searchQuery: string;
+  initialOpen?: boolean;
 }) {
-  const [open, setOpen] = useState(false);
-  const LIMIT = 40;
+  const [open, setOpen] = useState(initialOpen ?? false);
 
   const filtered = useMemo(() => {
     if (!searchQuery) return req.courses;
     const q = searchQuery.toLowerCase();
-    return req.courses.filter((cid) => cid.toLowerCase().includes(q));
-  }, [req.courses, searchQuery]);
+    return req.courses.filter(
+      (cid) =>
+        cid.toLowerCase().includes(q) ||
+        (courseInfoMap[cid]?.title ?? "").toLowerCase().includes(q),
+    );
+  }, [req.courses, searchQuery, courseInfoMap]);
 
   if (filtered.length === 0) return null;
 
-  const satisfied = filtered.filter((c) => placedSet.has(c)).length;
+  const satisfied = Math.min(
+    req.courses.filter((c) => placedSet.has(c)).length,
+    req.courses_needed,
+  );
   const done = satisfied >= req.courses_needed;
+  const partial = !done && satisfied > 0;
+  const accentColor = done ? "#22c55e" : partial ? "#3b82f6" : "transparent";
 
   return (
-    <div className="rounded overflow-hidden border border-white/[0.05]">
+    <div
+      className="mx-1 mb-[2px] overflow-hidden"
+      style={{ borderLeft: `3px solid ${accentColor}` }}
+    >
       <button
         onClick={() => setOpen((o) => !o)}
-        className="w-full flex items-center justify-between px-2 py-1.5 hover:bg-white/[0.02] transition-colors text-left"
+        className="w-full flex items-center px-2 py-[7px] hover:bg-[#1c1c1c] transition-colors text-left gap-2 bg-[#141414]"
       >
-        <span className="text-[10px] font-semibold text-zinc-300 truncate">{req.group_name}</span>
-        <div className="flex items-center gap-1.5 ml-2 shrink-0">
-          <span className={`text-[9px] px-1 py-0.5 rounded ${done ? "bg-green-900/50 text-green-400" : "bg-zinc-800 text-zinc-500"}`}>
-            {Math.min(satisfied, req.courses_needed)}/{req.courses_needed}
+        <div className="flex-1 min-w-0">
+          <span className="text-[10px] font-normal text-[#ccc] block truncate">{req.group_name}</span>
+          {req.courses_needed < req.courses.length && (
+            <span className="text-[9px] text-[#444] leading-none">
+              {req.courses_needed} of {req.courses.length} required
+            </span>
+          )}
+        </div>
+        <div className="flex items-center gap-1.5 shrink-0">
+          <span className="text-[9px] px-1.5 py-[2px] rounded bg-[#1e1e1e] font-mono tabular-nums text-[#555]">
+            {satisfied}/{req.courses_needed}
           </span>
           <ChevronIcon open={open} />
         </div>
       </button>
       {open && (
-        <div className="flex flex-col gap-px pb-1.5 px-1 max-h-48 overflow-y-auto">
-          {filtered.slice(0, LIMIT).map((cid) => (
-            <SidebarCard key={cid} courseId={cid} title={null} isPlaced={placedSet.has(cid)} />
+        <div className="grid grid-cols-3 gap-1 p-1.5 bg-[#0f0f0f] max-h-[300px] overflow-y-auto">
+          {filtered.map((cid) => (
+            <CoursePill
+              key={cid}
+              courseId={cid}
+              title={courseInfoMap[cid]?.title}
+              units={courseInfoMap[cid]?.min_units}
+              isPlaced={placedSet.has(cid)}
+              unavailable={!courseInfoMap[cid]}
+              diffScore={difficultyMap[cid] ?? null}
+            />
           ))}
-          {filtered.length > LIMIT && (
-            <p className="text-[9px] text-zinc-700 text-center py-1">+{filtered.length - LIMIT} more</p>
-          )}
         </div>
       )}
     </div>
   );
 }
 
-// ── Main component ────────────────────────────────────────────────────────────
+// ── Main component ─────────────────────────────────────────────────────────────
 
 export default function PlannerClient() {
   // ── Data state ─────────────────────────────────────────────────────────────
@@ -401,6 +847,7 @@ export default function PlannerClient() {
   const [requirements, setRequirements] = useState<ReqGroup[]>([]);
   const [geRequirements, setGeRequirements] = useState<ReqGroup[]>([]);
   const [courseInfoMap, setCourseInfoMap] = useState<Record<string, CourseDetail>>({});
+  const [programNames, setProgramNames] = useState<Map<string, string>>(new Map());
 
   // ── Error + retry state ────────────────────────────────────────────────────
   const [majorListError, setMajorListError] = useState<string | null>(null);
@@ -422,6 +869,11 @@ export default function PlannerClient() {
   const [lockedCourses, setLockedCourses] = useState<Set<string>>(new Set());
   const [searchQuery, setSearchQuery] = useState("");
   const [autoFillLoading, setAutoFillLoading] = useState(false);
+  const [toast, setToast] = useState<string | null>(null);
+  const [prereqWarnings, setPrereqWarnings] = useState<Record<string, string>>({});
+  const [difficultyMap, setDifficultyMap] = useState<Record<string, number>>({});
+  const [courseGpaMap, setCourseGpaMap] = useState<Record<string, number>>({});
+  const [optimizerOnline, setOptimizerOnline] = useState<boolean | null>(null);
 
   // ── Derived ────────────────────────────────────────────────────────────────
   const placedSet = useMemo(() => {
@@ -431,14 +883,14 @@ export default function PlannerClient() {
   }, [plannedCourses]);
 
   const totalUnits = useMemo(
-    () => Object.values(plannedCourses).reduce(
-      (sum, ids) => sum + ids.reduce((s, id) => s + (courseInfoMap[id]?.min_units ?? 4), 0),
-      0
-    ),
-    [plannedCourses, courseInfoMap]
+    () =>
+      Object.values(plannedCourses).reduce(
+        (sum, ids) => sum + ids.reduce((s, id) => s + (courseInfoMap[id]?.min_units ?? 4), 0),
+        0,
+      ),
+    [plannedCourses, courseInfoMap],
   );
 
-  // Group majorList by display_name (multiple major_ids can share a name = specializations)
   const majorGroups = useMemo(() => {
     const map = new Map<string, string[]>();
     for (const { major_id, display_name } of majorList) {
@@ -449,17 +901,60 @@ export default function PlannerClient() {
     return map;
   }, [majorList]);
 
-  const sortedMajorNames = useMemo(() => Array.from(majorGroups.keys()).sort(), [majorGroups]);
   const specializations = useMemo(
     () => (selectedDisplayName ? (majorGroups.get(selectedDisplayName) ?? []) : []),
-    [majorGroups, selectedDisplayName]
+    [majorGroups, selectedDisplayName],
   );
 
-  const remainingCount = useMemo(() => {
-    if (!selectedMajorId) return 0;
-    const total = requirements.reduce((sum, r) => sum + r.courses_needed, 0);
-    return Math.max(0, total - placedSet.size);
-  }, [requirements, placedSet, selectedMajorId]);
+  const selectedLabel = useMemo(() => {
+    if (!selectedMajorId) return "";
+    return programNames.get(selectedMajorId) || selectedDisplayName || selectedMajorId;
+  }, [selectedMajorId, selectedDisplayName, programNames]);
+
+  const totalRequired = useMemo(
+    () => requirements.reduce((s, r) => s + r.courses_needed, 0),
+    [requirements],
+  );
+
+  const placedRequired = useMemo(
+    () =>
+      [...placedSet].filter((id) => requirements.some((r) => r.courses.includes(id))).length,
+    [placedSet, requirements],
+  );
+
+  // Programs API (anteaterapi.com/v2/rest/programs) is IP-banned until the
+  // Cloudflare block from rate-limit abuse clears. Spec names fall back to
+  // raw major_id codes until then.
+
+  // ── Batch difficulty fetch ─────────────────────────────────────────────────
+  const fetchDifficulties = useCallback(async (ids: string[]) => {
+    if (ids.length === 0) return;
+    try {
+      const res = await fetch("/api/course-difficulties", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ ids }),
+      });
+      if (!res.ok) return;
+      const d = await res.json();
+      if (d?.scores) setDifficultyMap((prev) => ({ ...prev, ...d.scores }));
+    } catch {}
+  }, []);
+
+  // ── Batch GPA fetch (runs whenever placed courses change) ─────────────────
+  const fetchGpas = useCallback(async (ids: string[]) => {
+    if (ids.length === 0) return;
+    try {
+      const res = await fetch("/api/course-gpas", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ ids }),
+      });
+      if (!res.ok) return;
+      const d = await res.json();
+      if (d?.gpas) setCourseGpaMap((prev) => ({ ...prev, ...d.gpas }));
+    } catch {}
+  }, []);
 
   // ── Fetch major list ───────────────────────────────────────────────────────
   useEffect(() => {
@@ -473,9 +968,19 @@ export default function PlannerClient() {
   useEffect(() => {
     setGeError(null);
     fetchGERequirements()
-      .then(setGeRequirements)
+      .then(async (reqs) => {
+        setGeRequirements(reqs);
+        const allIds = [...new Set(reqs.flatMap((r) => r.courses))];
+        const details = await fetchCourseDetails(allIds);
+        setCourseInfoMap((prev) => {
+          const next = { ...prev };
+          for (const c of details) next[c.id] = c;
+          return next;
+        });
+        fetchDifficulties(allIds);
+      })
       .catch((e: Error) => setGeError(e.message));
-  }, [geRetry]);
+  }, [geRetry, fetchDifficulties]);
 
   // ── Fetch major requirements + course details ──────────────────────────────
   useEffect(() => {
@@ -485,7 +990,6 @@ export default function PlannerClient() {
     }
     setLoadingReqs(true);
     setReqError(null);
-
     fetchMajorRequirements(selectedMajorId)
       .then(async (reqs) => {
         setRequirements(reqs);
@@ -496,13 +1000,64 @@ export default function PlannerClient() {
           for (const c of details) next[c.id] = c;
           return next;
         });
+        fetchDifficulties(allIds);
       })
       .catch((e: Error) => setReqError(e.message))
       .finally(() => setLoadingReqs(false));
-  }, [selectedMajorId, reqRetry]);
+  }, [selectedMajorId, reqRetry, fetchDifficulties]);
+
+  // ── Fetch GPAs when planned courses change ────────────────────────────────
+  useEffect(() => {
+    const ids = [...new Set(Object.values(plannedCourses).flat())];
+    fetchGpas(ids);
+  }, [plannedCourses, fetchGpas]);
+
+  // ── Prereq validation ──────────────────────────────────────────────────────
+  const validatePlan = useCallback(async (placed: PlannedCourses) => {
+    const locked: Record<string, string> = {};
+    for (const [qk, ids] of Object.entries(placed)) {
+      for (const id of ids) locked[id] = qk;
+    }
+    if (Object.keys(locked).length === 0) return;
+    const payload = { locked_courses: locked };
+    console.log("[validate-plan] payload:", payload);
+    try {
+      const res = await fetch("/api/validate-plan", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+      if (!res.ok) return;
+      const data = (await res.json()) as { valid: boolean; conflicts: string[]; online?: boolean };
+      console.log("[validate-plan] response:", data);
+      setOptimizerOnline(data.online ?? true);
+      if (!data.valid && data.conflicts.length > 0) {
+        setPrereqWarnings((prev) => {
+          const next = { ...prev };
+          for (const conflict of data.conflicts) {
+            // Backend format: "COURSEID locked to QUARTER: BLOCKER must be placed in an earlier quarter"
+            const courseId = conflict.split(" locked to")[0]?.trim();
+            if (!courseId) continue;
+            const afterColon = conflict.split(": ").slice(1).join(": ");
+            const blocker = afterColon
+              ? afterColon.replace(" must be placed in an earlier quarter", "").trim()
+              : "a prerequisite";
+            if (!(courseId in next)) {
+              next[courseId] = `Needs: ${blocker}`;
+            }
+          }
+          return next;
+        });
+      }
+    } catch {
+      setOptimizerOnline(false);
+    }
+  }, []);
 
   // ── DnD ────────────────────────────────────────────────────────────────────
-  const sensors = useSensors(useSensor(PointerSensor, { activationConstraint: { distance: 5 } }));
+  const sensors = useSensors(
+    useSensor(PointerSensor, { activationConstraint: { distance: 5 } }),
+  );
 
   function handleDragStart(e: DragStartEvent) {
     setActiveData(e.active.data.current as DragData);
@@ -511,14 +1066,21 @@ export default function PlannerClient() {
   function handleDragEnd(e: DragEndEvent) {
     setActiveData(null);
     const src = e.active.data.current as DragData;
-    const dst = e.over?.data.current as { quarterKey: string } | undefined;
+    const dst =
+      e.over?.id?.toString().startsWith("zone|")
+        ? (e.over.data.current as { quarterKey: string })
+        : undefined;
 
-    if (!dst?.quarterKey) {
+    if (!dst) {
       if (src.type === "placed" && src.quarterKey) {
-        setPlannedCourses((prev) => ({
-          ...prev,
-          [src.quarterKey!]: prev[src.quarterKey!]?.filter((c) => c !== src.courseId) ?? [],
-        }));
+        setPlannedCourses((prev) => {
+          const next = {
+            ...prev,
+            [src.quarterKey!]: prev[src.quarterKey!]?.filter((c) => c !== src.courseId) ?? [],
+          };
+          validatePlan(next);
+          return next;
+        });
       }
       return;
     }
@@ -527,30 +1089,63 @@ export default function PlannerClient() {
     if (src.type === "sidebar") {
       setPlannedCourses((prev) => {
         if (prev[tq]?.includes(src.courseId)) return prev;
-        return { ...prev, [tq]: [...(prev[tq] ?? []), src.courseId] };
+        const next = { ...prev, [tq]: [...(prev[tq] ?? []), src.courseId] };
+        validatePlan(next);
+        return next;
       });
     } else if (src.type === "placed" && src.quarterKey && src.quarterKey !== tq) {
-      setPlannedCourses((prev) => ({
-        ...prev,
-        [src.quarterKey!]: prev[src.quarterKey!]?.filter((c) => c !== src.courseId) ?? [],
-        [tq]: [...(prev[tq] ?? []), src.courseId],
-      }));
+      setPlannedCourses((prev) => {
+        const next = {
+          ...prev,
+          [src.quarterKey!]: prev[src.quarterKey!]?.filter((c) => c !== src.courseId) ?? [],
+          [tq]: [...(prev[tq] ?? []), src.courseId],
+        };
+        validatePlan(next);
+        return next;
+      });
     }
   }
 
   // ── Handlers ───────────────────────────────────────────────────────────────
-  const handleMajorNameChange = useCallback((name: string) => {
-    setSelectedDisplayName(name);
-    const ids = majorGroups.get(name) ?? [];
-    setSelectedMajorId(ids[0] ?? "");
-    setRequirements([]);
-    setReqError(null);
-  }, [majorGroups]);
+  const handleMajorNameChange = useCallback(
+    (dbDisplayName: string) => {
+      setSelectedDisplayName(dbDisplayName);
+      const ids = majorGroups.get(dbDisplayName) ?? [];
+      setSelectedMajorId(ids[0] ?? "");
+      setRequirements([]);
+      setReqError(null);
+    },
+    [majorGroups],
+  );
 
   const toggleLock = useCallback((id: string) => {
     setLockedCourses((prev) => {
       const next = new Set(prev);
       next.has(id) ? next.delete(id) : next.add(id);
+      return next;
+    });
+  }, []);
+
+  const removeCourse = useCallback((id: string, qKey: string) => {
+    setPlannedCourses((prev) => {
+      const next = {
+        ...prev,
+        [qKey]: prev[qKey]?.filter((c) => c !== id) ?? [],
+      };
+      validatePlan(next);
+      return next;
+    });
+    setPrereqWarnings((prev) => {
+      const next = { ...prev };
+      delete next[id];
+      return next;
+    });
+  }, [validatePlan]);
+
+  const dismissWarning = useCallback((id: string) => {
+    setPrereqWarnings((prev) => {
+      const next = { ...prev };
+      delete next[id];
       return next;
     });
   }, []);
@@ -571,90 +1166,105 @@ export default function PlannerClient() {
   const requiredGroups = requirements.filter((r) => r.requirement_type === "required");
   const electiveGroups = requirements.filter((r) => r.requirement_type === "elective");
 
+  // Index of the first incomplete group in each section (for default-open on load)
+  const firstIncompleteReq = requiredGroups.findIndex(
+    (r) => r.courses.filter((c) => placedSet.has(c)).length < r.courses_needed,
+  );
+  const firstIncompleteElec = electiveGroups.findIndex(
+    (r) => r.courses.filter((c) => placedSet.has(c)).length < r.courses_needed,
+  );
+  const firstIncompleteGE = geRequirements.findIndex(
+    (r) => r.courses.filter((c) => placedSet.has(c)).length < r.courses_needed,
+  );
+
   // ── Render ──────────────────────────────────────────────────────────────────
   return (
     <DndContext sensors={sensors} onDragStart={handleDragStart} onDragEnd={handleDragEnd}>
-      <div className="flex flex-1 overflow-hidden" style={{ height: "calc(100vh - 56px)" }}>
+      <div className="flex overflow-hidden" style={{ height: "calc(100vh - 56px)" }}>
 
         {/* ── Sidebar ──────────────────────────────────────────────────────── */}
-        <aside className="w-[256px] shrink-0 flex flex-col bg-[#111] border-r border-white/[0.06]">
+        <aside className="w-[260px] shrink-0 flex flex-col bg-[#181818] border-r border-[#2a2a2a]">
 
           {/* Tabs */}
-          <div className="flex border-b border-white/[0.07] shrink-0">
+          <div className="flex border-b border-[#2a2a2a] shrink-0">
             {(["major", "ge"] as const).map((tab) => (
               <button
                 key={tab}
                 onClick={() => setSidebarTab(tab)}
                 className={`flex-1 py-2 text-[10px] font-bold tracking-widest uppercase transition-colors
                   ${sidebarTab === tab
-                    ? "text-white border-b-2 border-blue-500 bg-white/[0.02]"
-                    : "text-zinc-600 hover:text-zinc-400"}`}
+                    ? "text-[#f0f0f0] border-b-2 border-[#3b82f6]"
+                    : "text-[#444] hover:text-[#666]"}`}
               >
                 {tab === "major" ? "Major" : "GE"}
               </button>
             ))}
           </div>
 
-          {/* Major selectors */}
-          <div className="px-2.5 py-2 border-b border-white/[0.05] shrink-0 flex flex-col gap-1.5">
+          {/* Fixed top */}
+          <div className="px-2 pt-2 flex flex-col gap-1.5 shrink-0">
             {majorListError ? (
               <ErrorBanner
                 message="Failed to load majors"
                 onRetry={() => setMajorListRetry((n) => n + 1)}
               />
             ) : (
-              <select
-                value={selectedDisplayName}
-                onChange={(e) => handleMajorNameChange(e.target.value)}
-                disabled={majorList.length === 0}
-                className="w-full rounded border border-white/[0.08] bg-[#1a1a1a] px-2 py-1.5 text-[10px] text-zinc-200 focus:outline-none focus:border-blue-500/50 disabled:opacity-50"
-              >
-                <option value="">{majorList.length === 0 ? "Loading majors…" : "Select major…"}</option>
-                {sortedMajorNames.map((n) => <option key={n} value={n}>{n}</option>)}
-              </select>
+              <MajorCombobox
+                options={majorList}
+                selectedDisplayName={selectedDisplayName}
+                programNames={programNames}
+                onSelect={handleMajorNameChange}
+                loading={majorList.length === 0 && !majorListError}
+              />
             )}
 
             {specializations.length > 1 && (
               <select
                 value={selectedMajorId}
                 onChange={(e) => setSelectedMajorId(e.target.value)}
-                className="w-full rounded border border-white/[0.08] bg-[#1a1a1a] px-2 py-1.5 text-[10px] text-zinc-200 focus:outline-none focus:border-blue-500/50"
+                className="w-full bg-[#111] border border-[#2a2a2a] rounded px-2.5 py-1.5 text-[11px] text-[#f0f0f0] focus:outline-none focus:border-[#3b82f6]/60"
               >
-                {specializations.map((id) => <option key={id} value={id}>{id}</option>)}
+                {specializations.map((id) => (
+                  <option key={id} value={id}>{programNames.get(id) || id}</option>
+                ))}
               </select>
             )}
 
-            {selectedMajorId && !loadingReqs && !reqError && (
-              <p className="text-[9px] text-zinc-600">
-                <span className="text-zinc-400 font-semibold">{remainingCount}</span> courses remaining
-              </p>
-            )}
-          </div>
-
-          {/* Search */}
-          <div className="px-2.5 py-2 border-b border-white/[0.05] shrink-0">
-            <div className="relative flex items-center">
-              <svg className="absolute left-2 w-3 h-3 text-zinc-600 pointer-events-none" viewBox="0 0 12 12" fill="none">
+            <div className="relative">
+              <svg
+                className="absolute left-2 top-1/2 -translate-y-1/2 w-3 h-3 text-[#333] pointer-events-none"
+                viewBox="0 0 12 12" fill="none"
+              >
                 <circle cx="5" cy="5" r="3.5" stroke="currentColor" strokeWidth="1.2"/>
                 <path d="M8 8l2.5 2.5" stroke="currentColor" strokeWidth="1.2" strokeLinecap="round"/>
               </svg>
               <input
                 type="text"
-                placeholder="Search courses…"
+                placeholder="Search courses..."
                 value={searchQuery}
                 onChange={(e) => setSearchQuery(e.target.value)}
-                className="w-full pl-7 pr-2 py-1 rounded border border-white/[0.07] bg-[#1a1a1a] text-[10px] text-zinc-300 placeholder-zinc-600 focus:outline-none focus:border-blue-500/40"
+                className="w-full pl-7 pr-2 py-1.5 bg-[#111] border border-[#2a2a2a] rounded text-[11px] text-[#ccc] placeholder-[#333] focus:outline-none focus:border-[#3b82f6]/60"
               />
             </div>
+
+            {selectedMajorId && !loadingReqs && !reqError && (
+              <p className="text-[9px] text-[#444] pb-0.5">
+                <span className="text-[#666] font-semibold">{placedRequired}</span>
+                {" "}of{" "}
+                <span className="text-[#666] font-semibold">{totalRequired}</span>
+                {" "}courses placed
+              </p>
+            )}
           </div>
 
-          {/* Course list */}
-          <div className="flex-1 overflow-y-auto p-2 flex flex-col gap-1">
+          <div className="border-t border-[#2a2a2a] mt-1 shrink-0" />
 
+          {/* Scrollable list */}
+          <div className="flex-1 overflow-y-auto py-1 min-h-0">
             {sidebarTab === "major" && (
               <>
                 {loadingReqs && (
-                  <p className="text-[10px] text-zinc-600 text-center py-4">Loading requirements…</p>
+                  <p className="text-[10px] text-[#444] text-center py-8">Loading requirements…</p>
                 )}
                 {reqError && (
                   <ErrorBanner
@@ -666,24 +1276,42 @@ export default function PlannerClient() {
                   <>
                     {requiredGroups.length > 0 && (
                       <>
-                        <p className="text-[8px] font-bold uppercase tracking-widest text-zinc-600 pt-0.5 pb-0.5 px-1">Required</p>
-                        {requiredGroups.map((r) => (
-                          <RequirementGroup key={r.id} req={r} placedSet={placedSet}
-                            courseInfoMap={courseInfoMap} searchQuery={searchQuery} />
+                        <div className="px-2 pt-2 pb-1">
+                          <span className="text-[8px] font-bold uppercase tracking-[0.15em] text-[#333]">
+                            Required
+                          </span>
+                        </div>
+                        {requiredGroups.map((r, i) => (
+                          <RequirementGroup
+                            key={r.id} req={r} placedSet={placedSet}
+                            courseInfoMap={courseInfoMap} difficultyMap={difficultyMap}
+                            searchQuery={searchQuery}
+                            initialOpen={i === firstIncompleteReq}
+                          />
                         ))}
                       </>
                     )}
                     {electiveGroups.length > 0 && (
                       <>
-                        <p className="text-[8px] font-bold uppercase tracking-widest text-zinc-600 pt-2 pb-0.5 px-1">Electives</p>
-                        {electiveGroups.map((r) => (
-                          <RequirementGroup key={r.id} req={r} placedSet={placedSet}
-                            courseInfoMap={courseInfoMap} searchQuery={searchQuery} />
+                        <div className="px-2 pt-3 pb-1">
+                          <span className="text-[8px] font-bold uppercase tracking-[0.15em] text-[#333]">
+                            Electives
+                          </span>
+                        </div>
+                        {electiveGroups.map((r, i) => (
+                          <RequirementGroup
+                            key={r.id} req={r} placedSet={placedSet}
+                            courseInfoMap={courseInfoMap} difficultyMap={difficultyMap}
+                            searchQuery={searchQuery}
+                            initialOpen={i === firstIncompleteElec}
+                          />
                         ))}
                       </>
                     )}
                     {!selectedMajorId && (
-                      <p className="text-[10px] text-zinc-700 text-center py-8">Select a major to see requirements</p>
+                      <p className="text-[10px] text-[#333] text-center py-12">
+                        Search for your major above
+                      </p>
                     )}
                   </>
                 )}
@@ -699,12 +1327,21 @@ export default function PlannerClient() {
                   />
                 ) : (
                   <>
-                    <p className="text-[8px] font-bold uppercase tracking-widest text-zinc-600 py-0.5 px-1">General Education</p>
-                    {geRequirements.map((r) => (
-                      <GESection key={r.id} req={r} placedSet={placedSet} searchQuery={searchQuery} />
+                    <div className="px-2 pt-2 pb-1">
+                      <span className="text-[8px] font-bold uppercase tracking-[0.15em] text-[#333]">
+                        General Education
+                      </span>
+                    </div>
+                    {geRequirements.map((r, i) => (
+                      <GESection
+                        key={r.id} req={r} placedSet={placedSet}
+                        courseInfoMap={courseInfoMap} difficultyMap={difficultyMap}
+                        searchQuery={searchQuery}
+                        initialOpen={i === firstIncompleteGE}
+                      />
                     ))}
                     {geRequirements.length === 0 && (
-                      <p className="text-[10px] text-zinc-700 text-center py-8">Loading…</p>
+                      <p className="text-[10px] text-[#333] text-center py-12">Loading…</p>
                     )}
                   </>
                 )}
@@ -713,19 +1350,62 @@ export default function PlannerClient() {
           </div>
 
           {/* Auto-fill */}
-          <div className="px-2.5 py-2.5 border-t border-white/[0.06] shrink-0">
+          <div className="px-2.5 py-2.5 border-t border-[#2a2a2a] shrink-0">
+            {toast && (
+              <div className="flex items-start gap-1.5 mb-2 px-2 py-1.5 rounded bg-red-950/30 border border-red-900/40">
+                <span className="text-[9px] text-red-400 flex-1 leading-snug">{toast}</span>
+                <button
+                  onClick={() => setToast(null)}
+                  className="text-red-500 hover:text-red-300 text-[11px] leading-none shrink-0 mt-px"
+                >
+                  ×
+                </button>
+              </div>
+            )}
             <button
               disabled={!selectedMajorId || autoFillLoading}
-              onClick={() => {
+              onClick={async () => {
                 if (!selectedMajorId || autoFillLoading) return;
                 setAutoFillLoading(true);
-                setTimeout(() => setAutoFillLoading(false), 1500);
+                setToast(null);
+                try {
+                  const res = await fetch("/api/optimizer", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({
+                      major_id: selectedMajorId,
+                      completed_courses: [],
+                      graduation_quarter: gradQuarter,
+                      units_per_quarter: 16,
+                      waived_ges: [],
+                    }),
+                  });
+                  const data = await res.json();
+                  if (!res.ok) {
+                    const msg =
+                      typeof data?.detail === "object"
+                        ? (data.detail.message ?? JSON.stringify(data.detail))
+                        : (data?.detail ?? data?.error ?? "Optimizer error");
+                    setToast(String(msg));
+                  } else {
+                    const plan = data?.variants?.[0]?.planned_courses as PlannedCourses | undefined;
+                    if (plan) {
+                      setPlannedCourses(plan);
+                      validatePlan(plan);
+                    } else {
+                      setToast("No plan returned from optimizer");
+                    }
+                  }
+                } catch (err) {
+                  setToast(err instanceof Error ? err.message : "Optimizer unavailable");
+                } finally {
+                  setAutoFillLoading(false);
+                }
               }}
-              className={`w-full flex items-center justify-center gap-2 rounded-md py-2.5 text-[11px] font-bold tracking-wide transition-all
+              className={`w-full flex items-center justify-center gap-2 rounded py-2.5 text-[11px] font-bold tracking-wide transition-all
                 ${selectedMajorId && !autoFillLoading
-                  ? "bg-blue-600 hover:bg-blue-500 text-white shadow-lg shadow-blue-900/30"
-                  : "bg-zinc-800 text-zinc-600 cursor-not-allowed"
-                }`}
+                  ? "bg-[#3b82f6] hover:bg-[#2563eb] text-white"
+                  : "bg-[#1a1a1a] text-[#3a3a3a] cursor-not-allowed"}`}
             >
               {autoFillLoading ? (
                 <>
@@ -742,20 +1422,20 @@ export default function PlannerClient() {
         </aside>
 
         {/* ── Main ─────────────────────────────────────────────────────────── */}
-        <main className="flex-1 flex flex-col overflow-hidden bg-[#141414]">
+        <main className="flex-1 flex flex-col overflow-hidden bg-[#111]">
 
           {/* Top bar */}
-          <div className="h-10 shrink-0 flex items-center px-4 border-b border-white/[0.06] bg-[#111] gap-3">
-            <span className="text-[10px] font-medium text-zinc-400 truncate max-w-[220px]">
-              {selectedDisplayName || <span className="text-zinc-700">—</span>}
+          <div className="h-10 shrink-0 flex items-center px-5 border-b border-[#2a2a2a] bg-[#141414] gap-3">
+            <span className="text-[11px] text-[#666] truncate max-w-[260px]">
+              {selectedLabel || <span className="text-[#333]">No major selected</span>}
             </span>
             <div className="flex-1" />
             <div className="flex items-center gap-1.5">
-              <span className="text-[9px] font-semibold uppercase tracking-widest text-zinc-600">Grad</span>
+              <span className="text-[9px] font-bold uppercase tracking-widest text-[#333]">Grad</span>
               <select
                 value={gradQuarter}
                 onChange={(e) => setGradQuarter(e.target.value)}
-                className="h-6 rounded border border-white/[0.08] bg-[#1a1a1a] px-1.5 text-[10px] text-zinc-300 focus:outline-none focus:border-blue-500/40"
+                className="h-6 rounded border border-[#2a2a2a] bg-[#1a1a1a] px-1.5 text-[10px] text-[#999] focus:outline-none focus:border-[#3b82f6]/60"
               >
                 {GRAD_OPTIONS.map((o) => (
                   <option key={o.value} value={o.value}>{o.label}</option>
@@ -763,31 +1443,44 @@ export default function PlannerClient() {
               </select>
             </div>
             <div className="flex-1" />
-            <span className="text-[10px] font-bold text-zinc-400">
-              {totalUnits}<span className="text-zinc-600 font-normal">u planned</span>
+            <span className="text-[10px] font-bold text-[#666]">
+              {totalUnits} <span className="text-[#444] font-normal">UNITS</span>
             </span>
           </div>
 
+          {/* Optimizer offline banner */}
+          {optimizerOnline === false && (
+            <div className="px-4 py-1.5 bg-amber-950/30 border-b border-amber-900/40 shrink-0 flex items-center gap-2">
+              <span className="text-[10px] text-amber-400">
+                ⚠ Optimizer offline — prereq checking disabled
+              </span>
+            </div>
+          )}
+
           {/* Grid */}
-          <div className="flex-1 overflow-auto">
-            <div className="border border-white/[0.05] m-3 rounded-lg overflow-hidden">
+          <div className="flex-1 overflow-auto p-4">
+            <div className="border border-[#2a2a2a] rounded-lg overflow-hidden">
               {YEARS.map((year) => {
                 const hasSummer = summerYears.has(year);
                 const summerQk = qkey(year, "summer");
-                const totalCols = hasSummer ? 4 : 3;
 
                 return (
-                  <div key={year} className="flex border-b border-white/[0.05] last:border-b-0">
-                    <div className="w-9 shrink-0 flex items-center justify-center border-r border-white/[0.05] bg-[#0f0f0f]">
+                  <div key={year} className="flex border-b border-[#2a2a2a] last:border-b-0">
+                    {/* Year label */}
+                    <div className="w-8 shrink-0 flex items-center justify-center border-r border-[#2a2a2a] bg-[#0f0f0f]">
                       <span
-                        className="text-[8px] font-bold uppercase tracking-[0.18em] text-zinc-600 select-none"
+                        className="text-[7px] font-bold uppercase tracking-[0.2em] text-[#2a2a2a] select-none"
                         style={{ writingMode: "vertical-rl", transform: "rotate(180deg)" }}
                       >
-                        Year {year}
+                        Y{year}
                       </span>
                     </div>
 
-                    <div className="flex-1 grid" style={{ gridTemplateColumns: `repeat(${totalCols}, 1fr)` }}>
+                    {/* Quarter grid */}
+                    <div
+                      className="flex-1 grid"
+                      style={{ gridTemplateColumns: hasSummer ? "1fr 1fr 1fr 0.6fr" : "1fr 1fr 1fr" }}
+                    >
                       {BASE_QUARTERS.map((q) => {
                         const qk = qkey(year, q.key);
                         return (
@@ -795,31 +1488,48 @@ export default function PlannerClient() {
                             key={qk} qKey={qk} label={q.label} dim={false}
                             courseIds={plannedCourses[qk] ?? []}
                             courseInfoMap={courseInfoMap}
-                            lockedCourses={lockedCourses} onToggleLock={toggleLock}
+                            difficultyMap={difficultyMap}
+                            courseGpaMap={courseGpaMap}
+                            lockedCourses={lockedCourses}
+                            onToggleLock={toggleLock}
+                            onRemove={removeCourse}
+                            prereqWarnings={prereqWarnings}
+                            onDismissWarning={dismissWarning}
                           />
                         );
                       })}
                       {hasSummer && (
                         <QuarterCell
-                          key={summerQk} qKey={summerQk} label="Summer" dim
+                          key={summerQk} qKey={summerQk} label="Sum" dim
                           courseIds={plannedCourses[summerQk] ?? []}
                           courseInfoMap={courseInfoMap}
-                          lockedCourses={lockedCourses} onToggleLock={toggleLock}
-                          removable onRemove={() => toggleSummer(year)}
+                          difficultyMap={difficultyMap}
+                          courseGpaMap={courseGpaMap}
+                          lockedCourses={lockedCourses}
+                          onToggleLock={toggleLock}
+                          onRemove={removeCourse}
+                          prereqWarnings={prereqWarnings}
+                          onDismissWarning={dismissWarning}
+                          removable onRemoveQuarter={() => toggleSummer(year)}
                         />
                       )}
                     </div>
 
-                    <div className="w-7 shrink-0 flex items-center justify-center border-l border-white/[0.04] bg-[#0f0f0f]">
+                    {/* + Summer */}
+                    <div className="w-6 shrink-0 flex items-center justify-center border-l border-[#2a2a2a] bg-[#0f0f0f]">
                       {!hasSummer && (
                         <button
                           onClick={() => toggleSummer(year)}
                           title="Add Summer"
-                          className="flex flex-col items-center gap-0.5 text-zinc-700 hover:text-zinc-400 transition-colors"
+                          className="flex flex-col items-center text-[#252525] hover:text-[#4a4a4a] transition-colors"
                         >
-                          <span className="text-[11px] font-bold leading-none">+</span>
-                          <span className="text-[7px] font-bold uppercase tracking-wider leading-none"
-                            style={{ writingMode: "vertical-rl" }}>Sum</span>
+                          <span className="text-[10px] font-bold leading-none">+</span>
+                          <span
+                            className="text-[6px] font-bold uppercase leading-none"
+                            style={{ writingMode: "vertical-rl" }}
+                          >
+                            Sum
+                          </span>
                         </button>
                       )}
                     </div>
@@ -834,9 +1544,8 @@ export default function PlannerClient() {
       {/* Drag overlay */}
       <DragOverlay dropAnimation={null}>
         {activeData && (
-          <div className="flex items-center gap-1.5 rounded border border-blue-500/40 bg-[#1e2a3a] px-2 py-1 text-[10px] shadow-xl pointer-events-none">
-            <span className="w-1.5 h-1.5 rounded-full bg-zinc-500 shrink-0" />
-            <span className="font-bold" style={{ color: "#e8e8e8" }}>{activeData.courseId}</span>
+          <div className="flex items-center gap-1.5 rounded border border-[#3b82f6]/40 bg-[#111d2e] px-2.5 py-1 text-[10px] shadow-2xl pointer-events-none">
+            <span className="font-bold text-[#f0f0f0]">{activeData.courseId}</span>
           </div>
         )}
       </DragOverlay>
