@@ -55,20 +55,31 @@ const BASE_QUARTERS = [
 const TIP_YEARS = [2021, 2022, 2023, 2024, 2025];
 
 function qkey(year: number, q: string) {
-  return `${START_YEAR + year - 1}_${q}`;
+  const fallYear = START_YEAR + year - 1;
+  // Winter, Spring, Summer belong to the calendar year after the Fall quarter
+  const calYear = q === "fall" ? fallYear : fallYear + 1;
+  return `${calYear}_${q}`;
 }
 
 function generateGradOptions() {
   const out: { value: string; label: string }[] = [];
-  const seq = ["winter", "spring", "fall"];
-  let year = 2026;
-  let qi = 1;
-  while (true) {
-    const q = seq[qi];
-    out.push({ value: `${year}_${q}`, label: `${q[0].toUpperCase() + q.slice(1)} ${year}` });
-    if (year === 2032 && q === "spring") break;
-    qi = (qi + 1) % 3;
-    if (qi === 0) year++;
+  // Emit quarters in chronological academic-year order:
+  // Fall(N) → Winter(N+1) → Spring(N+1)  for each planner year
+  const seasons: Array<{ key: string; offset: number }> = [
+    { key: "fall",   offset: 0 },
+    { key: "winter", offset: 1 },
+    { key: "spring", offset: 1 },
+  ];
+  for (let yr = 1; yr <= 8; yr++) {
+    const fallYear = START_YEAR + yr - 1;
+    for (const { key, offset } of seasons) {
+      const calYear = fallYear + offset;
+      out.push({
+        value: `${calYear}_${key}`,
+        label: `${key[0].toUpperCase() + key.slice(1)} ${calYear}`,
+      });
+    }
+    if (fallYear >= 2033) break;
   }
   return out;
 }
@@ -988,13 +999,12 @@ export default function PlannerClient() {
 
   // ── Prereq validation ──────────────────────────────────────────────────────
   const validatePlan = useCallback(async (placed: PlannedCourses) => {
-    const locked: Record<string, string> = {};
-    for (const [qk, ids] of Object.entries(placed)) {
-      for (const id of ids) locked[id] = qk;
-    }
-    if (Object.keys(locked).length === 0) return;
-    const payload = { locked_courses: locked };
-    console.log("[validate-plan] payload:", payload);
+    const lockedCourses: Record<string, string> = {};
+    Object.entries(placed).forEach(([quarter, courses]) => {
+      courses.forEach((courseId) => { lockedCourses[courseId] = quarter; });
+    });
+    if (Object.keys(lockedCourses).length === 0) return;
+    const payload = { locked_courses: lockedCourses, completed_courses: [] };
     try {
       const res = await fetch("/api/validate-plan", {
         method: "POST",
@@ -1003,25 +1013,27 @@ export default function PlannerClient() {
       });
       if (!res.ok) return;
       const data = (await res.json()) as { valid: boolean; conflicts: string[]; online?: boolean };
-      console.log("[validate-plan] response:", data);
       setOptimizerOnline(data.online ?? true);
-      if (!data.valid && data.conflicts.length > 0) {
-        setPrereqWarnings((prev) => {
-          const next = { ...prev };
-          for (const conflict of data.conflicts) {
-            // Backend format: "COURSEID locked to QUARTER: BLOCKER must be placed in an earlier quarter"
-            const courseId = conflict.split(" locked to")[0]?.trim();
-            if (!courseId) continue;
-            const afterColon = conflict.split(": ").slice(1).join(": ");
-            const blocker = afterColon
-              ? afterColon.replace(" must be placed in an earlier quarter", "").trim()
-              : "a prerequisite";
-            if (!(courseId in next)) {
-              next[courseId] = `Needs: ${blocker}`;
-            }
-          }
-          return next;
-        });
+      if (data.valid || data.conflicts.length === 0) {
+        setPrereqWarnings({});
+      } else {
+        const next: Record<string, string> = {};
+        for (const conflict of data.conflicts) {
+          // Backend format: "COURSEID locked to QUARTER: BLOCKER must be placed in an earlier quarter"
+          const courseId = conflict.split(" locked to")[0]?.trim();
+          if (!courseId) continue;
+          const afterColon = conflict.split(": ").slice(1).join(": ");
+          const blockerFull = afterColon
+            ? afterColon.replace(" must be placed in an earlier quarter", "").trim()
+            : "";
+          const firstBlocker = blockerFull.split(",")[0].trim();
+          const blockerCourse = firstBlocker.split(" (")[0].trim();
+          const blocker = !blockerCourse || blockerCourse.startsWith("a ")
+            ? "a prerequisite"
+            : blockerCourse;
+          next[courseId] = `${blocker} must come before this`;
+        }
+        setPrereqWarnings(next);
       }
     } catch {
       setOptimizerOnline(false);
@@ -1443,10 +1455,10 @@ export default function PlannerClient() {
                     {/* Year label */}
                     <div className="w-8 shrink-0 flex items-center justify-center border-r border-[#2a2a2a] bg-[#0f0f0f]">
                       <span
-                        className="text-[7px] font-bold uppercase tracking-[0.2em] text-[#2a2a2a] select-none"
+                        className="text-[6px] font-bold uppercase tracking-[0.15em] text-[#2a2a2a] select-none"
                         style={{ writingMode: "vertical-rl", transform: "rotate(180deg)" }}
                       >
-                        Y{year}
+                        {`Y${year} ${START_YEAR + year - 1}–${(START_YEAR + year).toString().slice(2)}`}
                       </span>
                     </div>
 

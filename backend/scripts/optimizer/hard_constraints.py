@@ -48,6 +48,7 @@ class CoursePlan:
 def _eval_item(item: dict, available: set[str]) -> bool:
     prereq_type = item.get("prereqType")
     if prereq_type == "course":
+        # _norm strips spaces so "MATH 2A" matches "MATH2A" in available
         return _norm(item.get("courseId", "")) in available
     if prereq_type == "exam":
         return False  # treat placement exams as not satisfied
@@ -65,7 +66,13 @@ def _eval_tree(node: dict, available: set[str]) -> bool:
         if logic_key == "OR":
             return any(_eval_item(i, available) for i in items)
         if logic_key == "NOT":
-            return not any(_eval_item(i, available) for i in items)
+            # Only fail if a course anti-coreq is explicitly in available.
+            # Exams and nested subtrees inside NOT are ignored.
+            return not any(
+                i.get("prereqType") == "course"
+                and _norm(i.get("courseId", "")) in available
+                for i in items
+            )
     return True  # empty node — no prereqs
 
 
