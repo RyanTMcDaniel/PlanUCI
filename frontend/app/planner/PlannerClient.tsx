@@ -40,7 +40,6 @@ interface CourseStats {
     sentiment_label: string | null;
   } | null;
   difficulty_score: number | null;
-  avg_gpa: number | null;
   prof_gpa: number | null;
 }
 
@@ -285,13 +284,11 @@ function CourseTooltip({
               Difficulty {stats.difficulty_score.toFixed(1)}/10
             </span>
           )}
-          {statsLoading ? null : stats?.avg_gpa != null && isFinite(stats.avg_gpa) ? (
-            <span className="text-[10px] text-[#22c55e]">
-              Course Avg GPA {stats.avg_gpa.toFixed(2)}
-            </span>
-          ) : (
-            <span className="text-[10px] text-[#444]">No GPA data</span>
-          )}
+          <span className="text-[10px] text-[#22c55e]">
+            {info?.avg_gpa != null && isFinite(info.avg_gpa)
+              ? `Avg GPA: ${info.avg_gpa.toFixed(2)}`
+              : "Avg GPA: No data"}
+          </span>
         </div>
       </div>
 
@@ -423,7 +420,7 @@ function PlacedCard({
       {/* right side */}
       <div className="flex flex-col items-end gap-0.5 shrink-0">
         {gpa != null && isFinite(gpa) && (
-          <span className="text-[9px] text-[#22c55e] font-mono">{gpa.toFixed(2)} GPA</span>
+          <span className="text-[9px] font-mono" style={{ color: "#888" }}>{gpa.toFixed(2)} GPA</span>
         )}
         <span className="text-[10px] text-[#666]">{units ?? "?"} UNITS</span>
         <div className="flex gap-1 opacity-0 group-hover/card:opacity-100 transition-opacity">
@@ -534,7 +531,7 @@ function PlacedCardRow({
 
 function QuarterCell({
   qKey, label, dim,
-  courseIds, courseInfoMap, difficultyMap, courseGpaMap, lockedCourses, onToggleLock, onRemove,
+  courseIds, courseInfoMap, difficultyMap, lockedCourses, onToggleLock, onRemove,
   prereqWarnings, onDismissWarning,
   removable, onRemoveQuarter,
 }: {
@@ -544,7 +541,6 @@ function QuarterCell({
   courseIds: string[];
   courseInfoMap: Record<string, CourseDetail>;
   difficultyMap: Record<string, number>;
-  courseGpaMap: Record<string, number>;
   lockedCourses: Set<string>;
   onToggleLock: (id: string) => void;
   onRemove: (id: string, qKey: string) => void;
@@ -607,7 +603,7 @@ function QuarterCell({
             units={courseInfoMap[cid]?.min_units}
             level={courseInfoMap[cid]?.course_level}
             diffScore={difficultyMap[cid] ?? null}
-            gpa={courseGpaMap[cid] ?? null}
+            gpa={courseInfoMap[cid]?.avg_gpa ?? null}
             isLocked={lockedCourses.has(cid)}
             onToggleLock={onToggleLock}
             onRemove={onRemove}
@@ -872,7 +868,6 @@ export default function PlannerClient() {
   const [toast, setToast] = useState<string | null>(null);
   const [prereqWarnings, setPrereqWarnings] = useState<Record<string, string>>({});
   const [difficultyMap, setDifficultyMap] = useState<Record<string, number>>({});
-  const [courseGpaMap, setCourseGpaMap] = useState<Record<string, number>>({});
   const [optimizerOnline, setOptimizerOnline] = useState<boolean | null>(null);
 
   // ── Derived ────────────────────────────────────────────────────────────────
@@ -941,21 +936,6 @@ export default function PlannerClient() {
     } catch {}
   }, []);
 
-  // ── Batch GPA fetch (runs whenever placed courses change) ─────────────────
-  const fetchGpas = useCallback(async (ids: string[]) => {
-    if (ids.length === 0) return;
-    try {
-      const res = await fetch("/api/course-gpas", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ ids }),
-      });
-      if (!res.ok) return;
-      const d = await res.json();
-      if (d?.gpas) setCourseGpaMap((prev) => ({ ...prev, ...d.gpas }));
-    } catch {}
-  }, []);
-
   // ── Fetch major list ───────────────────────────────────────────────────────
   useEffect(() => {
     setMajorListError(null);
@@ -1005,12 +985,6 @@ export default function PlannerClient() {
       .catch((e: Error) => setReqError(e.message))
       .finally(() => setLoadingReqs(false));
   }, [selectedMajorId, reqRetry, fetchDifficulties]);
-
-  // ── Fetch GPAs when planned courses change ────────────────────────────────
-  useEffect(() => {
-    const ids = [...new Set(Object.values(plannedCourses).flat())];
-    fetchGpas(ids);
-  }, [plannedCourses, fetchGpas]);
 
   // ── Prereq validation ──────────────────────────────────────────────────────
   const validatePlan = useCallback(async (placed: PlannedCourses) => {
@@ -1489,7 +1463,6 @@ export default function PlannerClient() {
                             courseIds={plannedCourses[qk] ?? []}
                             courseInfoMap={courseInfoMap}
                             difficultyMap={difficultyMap}
-                            courseGpaMap={courseGpaMap}
                             lockedCourses={lockedCourses}
                             onToggleLock={toggleLock}
                             onRemove={removeCourse}
@@ -1504,7 +1477,6 @@ export default function PlannerClient() {
                           courseIds={plannedCourses[summerQk] ?? []}
                           courseInfoMap={courseInfoMap}
                           difficultyMap={difficultyMap}
-                          courseGpaMap={courseGpaMap}
                           lockedCourses={lockedCourses}
                           onToggleLock={toggleLock}
                           onRemove={removeCourse}

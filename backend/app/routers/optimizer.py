@@ -239,13 +239,14 @@ def optimizer_move(req: MoveRequest):
 # ── /optimizer/validate_locks ─────────────────────────────────────────────────
 
 class ValidateLocksRequest(BaseModel):
-    locked_courses: dict[str, str]   # {course_id: quarter}
+    locked_courses:    dict[str, str]   # {course_id: quarter}
+    completed_courses: list[str] = []
 
 
 @router.post("/validate_locks")
 def optimizer_validate_locks(req: ValidateLocksRequest):
     try:
-        valid, conflicts = validate_locks(req.locked_courses)
+        valid, conflicts = validate_locks(req.locked_courses, req.completed_courses)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
