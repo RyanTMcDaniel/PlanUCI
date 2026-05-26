@@ -16,6 +16,7 @@ export interface CourseDetail {
   description: string | null;
   course_level: string | null;
   terms: string[] | null;
+  avg_gpa: number | null;
 }
 
 // Extract course IDs embedded in group_name strings like "POLSCI 192A" or
@@ -87,7 +88,7 @@ export async function fetchCourseDetails(ids: string[]): Promise<CourseDetail[]>
   for (let i = 0; i < ids.length; i += BATCH) {
     const { data, error } = await supabase
       .from("courses")
-      .select("id, title, min_units, description, course_level, terms")
+      .select("id, title, min_units, description, course_level, terms, avg_gpa")
       .in("id", ids.slice(i, i + BATCH));
 
     if (error) throw new Error(error.message);

@@ -66,30 +66,57 @@ class WhatIfResult:
 
 # ── Lock validation ───────────────────────────────────────────────────────────
 
-def _eval_locked_item(item: dict, avail: set[str], locked_norm: set[str]) -> bool:
-    """Eval one prereq item; non-locked courses are assumed satisfied."""
+def _eval_locked_item(
+    item: dict, avail: set[str], locked_norm: set[str], completed_norm: set[str]
+) -> bool | None:
+    """Eval one prereq item. Returns True/False for locked/completed courses; None for unknowns.
+
+    - locked course in avail → True (satisfied)
+    - locked course NOT in avail → False (definitely wrong)
+    - completed course → True (satisfied)
+    - unlocked/non-completed course or exam → None (unknown; caller decides)
+    """
     t = item.get("prereqType")
     if t == "course":
         cid = _norm(item.get("courseId", ""))
-        return (cid in avail) if (cid in locked_norm) else True
+        if cid in locked_norm:
+            return cid in avail
+        if cid in completed_norm:
+            return True
+        return None  # not locked, not completed — unknown
     if t == "exam":
-        return True
-    return _eval_locked_tree(item, avail, locked_norm)
+        return None  # can't verify
+    # nested AND/OR/NOT subtree — always returns bool
+    return _eval_locked_tree(item, avail, locked_norm, completed_norm)
 
 
-def _eval_locked_tree(node: dict, avail: set[str], locked_norm: set[str]) -> bool:
-    """AND/OR/NOT prereq tree eval; only locked courses matter for conflict detection."""
+def _eval_locked_tree(
+    node: dict, avail: set[str], locked_norm: set[str], completed_norm: set[str]
+) -> bool:
+    """AND/OR/NOT prereq tree eval — only flags conflicts caused by locked courses.
+
+    Three-valued logic (True / False / None=unknown):
+      AND — fails only if any item is definitely False; unknown items pass.
+      OR  — passes if any item is True; fails only if some item is False and none are True;
+            if all items are unknown, passes (can't judge without full history).
+      NOT — fails only if an anti-coreq is explicitly locked to an earlier slot.
+    """
     for key in ("AND", "OR", "NOT"):
         if key not in node:
             continue
         items = node[key]
         if key == "AND":
-            return all(_eval_locked_item(i, avail, locked_norm) for i in items)
+            results = [_eval_locked_item(i, avail, locked_norm, completed_norm) for i in items]
+            return not any(r is False for r in results)
         if key == "OR":
-            return any(_eval_locked_item(i, avail, locked_norm) for i in items)
+            results = [_eval_locked_item(i, avail, locked_norm, completed_norm) for i in items]
+            if any(r is True for r in results):
+                return True
+            if any(r is False for r in results):
+                # A locked alternative is in the wrong position AND nothing else satisfies it
+                return False
+            return True  # all unknown → no data to flag a conflict
         if key == "NOT":
-            # Only fail if an anti-coreq course is explicitly locked to an earlier slot.
-            # Non-locked courses are unknown — assume they don't conflict.
             return not any(
                 i.get("prereqType") == "course"
                 and _norm(i.get("courseId", "")) in locked_norm
@@ -99,25 +126,30 @@ def _eval_locked_tree(node: dict, avail: set[str], locked_norm: set[str]) -> boo
     return True
 
 
-def validate_locks(locked_courses: dict[str, str]) -> tuple[bool, list[str]]:
+def validate_locks(
+    locked_courses: dict[str, str],
+    completed_courses: list[str] | None = None,
+) -> tuple[bool, list[str]]:
     """Check whether locked quarter assignments conflict with each other prereq-wise.
 
     Only intra-lock conflicts are reported: if a locked course A requires
-    another locked course B to have appeared in an earlier quarter, but B
-    is pinned to the same or a later quarter, that is a conflict.
+    another locked course B in an earlier quarter, but B is pinned to the
+    same or a later quarter, that is a conflict.
 
-    Non-locked courses (potentially completed or freely scheduled) are
-    assumed satisfied — only the locking of B to the wrong position is flagged.
+    completed_courses are treated as already satisfied. Unlocked, non-completed
+    courses and exams are treated as NOT satisfied so OR-prereq alternatives
+    don't silently mask real ordering conflicts.
     """
     if len(locked_courses) < 2:
         return True, []
+
+    completed_norm = {_norm(c) for c in (completed_courses or [])}
 
     client      = create_client(os.getenv("SUPABASE_URL"), os.getenv("SUPABASE_SERVICE_KEY"))
     course_ids  = list(locked_courses.keys())
     trees       = _prereq_trees(client, course_ids)
     locked_norm = {_norm(c) for c in locked_courses}
 
-    # Invert: norm_id → original quarter
     norm_to_quarter = {_norm(c): q for c, q in locked_courses.items()}
 
     conflicts: list[str] = []
@@ -126,14 +158,12 @@ def validate_locks(locked_courses: dict[str, str]) -> tuple[bool, list[str]]:
         if not tree:
             continue
 
-        # available_locked = locked courses in strictly earlier quarters
         avail = {
             n for n, q in norm_to_quarter.items()
             if _qkey(q) < _qkey(quarter)
         }
 
-        if not _eval_locked_tree(tree, avail, locked_norm):
-            # Identify which locked course is causing the conflict
+        if not _eval_locked_tree(tree, avail, locked_norm, completed_norm):
             blocking = [
                 f"{c} (locked to {q})"
                 for c, q in locked_courses.items()
