@@ -95,10 +95,50 @@ function diffColor(level: string | null | undefined): string {
 }
 
 function diffScoreColor(score: number): string {
-  if (score <= 3) return "#22c55e";
-  if (score <= 6) return "#eab308";
-  if (score <= 8) return "#f97316";
+  if (score < 4) return "#22c55e";
+  if (score < 6) return "#eab308";
+  if (score < 8) return "#f97316";
   return "#ef4444";
+}
+
+interface CourseWithDifficulty {
+  difficulty_score: number | null;
+  units: number | null;
+}
+
+interface QuarterDifficultyResult {
+  combined: number;
+  difficultyComponent: number;
+  unitComponent: number;
+  totalUnits: number;
+}
+
+function calculateQuarterDifficulty(courses: CourseWithDifficulty[]): QuarterDifficultyResult | null {
+  if (courses.length === 0) return null;
+
+  const sorted = [...courses]
+    .filter((c) => c.difficulty_score != null)
+    .sort((a, b) => (b.difficulty_score ?? 5) - (a.difficulty_score ?? 5));
+
+  const weights = [1.0, 0.85, 0.72, 0.61, 0.52, 0.44];
+  let weightedSum = 0;
+  let totalWeight = 0;
+  sorted.forEach((course, i) => {
+    const w = weights[i] ?? 0.4;
+    weightedSum += (course.difficulty_score ?? 5) * w;
+    totalWeight += w;
+  });
+
+  const difficultyComponent = totalWeight > 0 ? weightedSum / totalWeight : 5.0;
+  const countPenalty = Math.max(0, (sorted.length - 3) * 0.3);
+  const adjustedDifficulty = Math.min(10, difficultyComponent + countPenalty);
+
+  const totalUnits = courses.reduce((sum, c) => sum + (c.units ?? 4), 0);
+  const unitComponent = Math.min(10, (totalUnits / 20) * 10);
+
+  const combined = Math.min(10, adjustedDifficulty * 0.6 + unitComponent * 0.4);
+
+  return { combined, difficultyComponent: adjustedDifficulty, unitComponent, totalUnits };
 }
 
 // ── Icons ─────────────────────────────────────────────────────────────────────
@@ -565,15 +605,17 @@ function QuarterCell({
     data: { quarterKey: qKey },
   });
 
+  const quarterDiff = calculateQuarterDifficulty(
+    courseIds.map((id) => ({
+      difficulty_score: difficultyMap[id] ?? null,
+      units: courseInfoMap[id]?.min_units ?? null,
+    })),
+  );
+
   const units = courseIds.reduce(
     (sum, id) => sum + (courseInfoMap[id]?.min_units ?? 4),
     0,
   );
-
-  const avgDiff =
-    courseIds.length > 0
-      ? courseIds.reduce((sum, id) => sum + (difficultyMap[id] ?? 5), 0) / courseIds.length
-      : null;
 
   return (
     <div className={`flex flex-col border-r border-[#2a2a2a] last:border-r-0 ${dim ? "opacity-55" : ""}`}>
@@ -582,9 +624,17 @@ function QuarterCell({
         <span className={`text-[10px] font-semibold ${dim ? "text-[#383838]" : "text-[#666]"}`}>
           {label}
         </span>
-        {avgDiff != null && (
-          <span style={{ color: diffScoreColor(avgDiff) }} className="text-[9px] ml-1.5">
-            ◆ {avgDiff.toFixed(1)}
+        {quarterDiff != null && (
+          <span
+            style={{ color: diffScoreColor(quarterDiff.combined) }}
+            className="text-[9px] ml-1.5 cursor-default"
+            title={[
+              `Difficulty: ${quarterDiff.combined.toFixed(1)}/10`,
+              `Course difficulty: ${quarterDiff.difficultyComponent.toFixed(1)}  Unit load: ${quarterDiff.totalUnits} units`,
+              `(60% course difficulty + 40% unit load)`,
+            ].join("\n")}
+          >
+            ◆ {quarterDiff.combined.toFixed(1)}
           </span>
         )}
         {units > 0 && <span className="text-[9px] text-[#555] ml-auto mr-1">{units} UNITS</span>}
@@ -981,7 +1031,12 @@ export default function PlannerClient() {
     }
     setLoadingReqs(true);
     setReqError(null);
-    fetchMajorRequirements(selectedMajorId)
+    // For specialization programs (multiple IDs share the same display name), also fetch
+    // the parent program rows — the parent API response captures spec-specific groups.
+    const parentId = specializations.length > 1
+      ? selectedMajorId.replace(/[A-Z]$/, "")
+      : undefined;
+    fetchMajorRequirements(selectedMajorId, parentId)
       .then(async (reqs) => {
         setRequirements(reqs);
         const allIds = [...new Set(reqs.flatMap((r) => r.courses))];

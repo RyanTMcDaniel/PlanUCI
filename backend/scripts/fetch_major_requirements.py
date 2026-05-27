@@ -2,18 +2,13 @@
 Fetches major requirements from the Anteater API and populates the
 major_requirements table in Supabase.
 
-Expected table schema (run migration in Supabase SQL editor if needed):
-  CREATE TABLE major_requirements (
-    id               bigserial PRIMARY KEY,
-    major_id         text NOT NULL,          -- program ID or specialization ID
-    major_name       text NOT NULL,
-    requirement_group text NOT NULL,         -- requirementId of this Course node
-    requirement_type text NOT NULL,          -- 'required' | 'elective' | 'GE'
-    courses          jsonb NOT NULL,         -- array of course ID strings
-    courses_needed   int  NOT NULL,          -- how many courses to take from list
-    group_name       text,                   -- label of this Course node
-    parent_group     text                    -- requirementId of parent Group node
-  );
+Run from repo root:
+  cd /Users/ryanmcdaniel/Desktop/PlanUCI
+  source backend/venv/bin/activate
+  python3 backend/scripts/fetch_major_requirements.py
+
+IMPORTANT: truncate non-GE rows before running:
+  client.table('major_requirements').delete().neq('major_id', 'ALL_MAJORS').execute()
 """
 
 import os
@@ -27,18 +22,35 @@ _ENV = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".env")
 load_dotenv(_ENV)
 
 BASE_URL = "https://anteaterapi.com/v2/rest"
-DELAY = 0.5
-BATCH_SIZE = 500
+DELAY = 0.5       # seconds between API requests
+BATCH_SIZE = 500  # rows per Supabase insert
 
 
 def get_client():
     return create_client(os.getenv("SUPABASE_URL"), os.getenv("SUPABASE_SERVICE_KEY"))
 
 
-def fetch_json(url: str) -> dict:
-    resp = httpx.get(url, timeout=15)
-    resp.raise_for_status()
-    return resp.json()
+def fetch_json(url: str, retries: int = 3) -> dict:
+    """GET url with retry-on-429 backoff."""
+    for attempt in range(retries):
+        resp = httpx.get(url, timeout=20, headers={"Origin": "https://anteaterapi.com"})
+        if resp.status_code == 429:
+            wait = 30 * (attempt + 1)
+            print(f"    429 rate-limited — waiting {wait}s before retry {attempt + 1}/{retries}...")
+            time.sleep(wait)
+            continue
+        resp.raise_for_status()
+        return resp.json()
+    raise RuntimeError(f"Failed after {retries} retries: {url}")
+
+
+def fetch_all_programs() -> list[dict]:
+    """Fetch all programs in a single request (API returns full list, no pagination)."""
+    data = fetch_json(f"{BASE_URL}/programs/majors")
+    if not data.get("ok"):
+        raise RuntimeError(f"programs/majors returned ok=false: {data.get('message')}")
+    items = data.get("data", [])
+    return [p for p in items if p.get("division") == "Undergraduate"]
 
 
 def infer_type(label: str, ancestors: list[str], from_school: bool) -> str:
@@ -53,168 +65,142 @@ def infer_type(label: str, ancestors: list[str], from_school: bool) -> str:
 def flatten_req(
     req: dict,
     major_id: str,
+    major_name: str,
     parent_group_id: str | None,
     ancestors: list[str],
     from_school: bool,
 ) -> list[dict]:
     req_type = req.get("requirementType")
-    req_id = req.get("requirementId", "")
-    label = req.get("label", "")
+    req_id   = req.get("requirementId", "")
+    label    = req.get("label", "")
 
     if req_type == "Course":
         courses = req.get("courses", [])
         return [{
-            "major_id": major_id,
+            "major_id":         major_id,
+            "major_name":       major_name,
             "requirement_group": req_id,
             "requirement_type": infer_type(label, ancestors, from_school),
-            "courses": courses,
-            "courses_needed": req.get("courseCount", len(courses)),
-            "group_name": label,
-            "parent_group": parent_group_id,
+            "courses":          courses,
+            "courses_needed":   req.get("courseCount", len(courses)),
+            "group_name":       label,
+            "parent_group":     parent_group_id,
+            "waivable":         False,
         }]
 
     if req_type == "Group":
         rows = []
         for child in req.get("requirements", []):
-            rows.extend(flatten_req(child, major_id, req_id, ancestors + [label], from_school))
+            rows.extend(flatten_req(
+                child, major_id, major_name, req_id, ancestors + [label], from_school
+            ))
         return rows
 
     return []
 
 
-def fetch_and_flatten(prog_id: str, spec_id: str | None) -> tuple[list[dict], bool]:
+def fetch_and_flatten(prog_id: str, spec_id: str | None, major_name: str) -> tuple[list[dict], bool]:
     url = f"{BASE_URL}/programs/major?programId={prog_id}"
     if spec_id:
         url += f"&specializationId={spec_id}"
     time.sleep(DELAY)
 
-    data = fetch_json(url)
+    try:
+        data = fetch_json(url)
+    except Exception as e:
+        print(f"    ERROR fetching {spec_id or prog_id}: {e}")
+        return [], False
+
     if not data.get("ok"):
         return [], False
 
-    resp = data["data"]
+    resp     = data["data"]
     major_id = spec_id if spec_id else prog_id
-    rows = []
+    rows: list[dict] = []
 
-    school_reqs = (resp.get("schoolRequirements") or {}).get("requirements", [])
-    for req in school_reqs:
-        rows.extend(flatten_req(req, major_id, None, [], from_school=True))
+    for req in (resp.get("schoolRequirements") or {}).get("requirements", []):
+        rows.extend(flatten_req(req, major_id, major_name, None, [], from_school=True))
 
     for req in (resp.get("requirements") or []):
-        rows.extend(flatten_req(req, major_id, None, [], from_school=False))
+        rows.extend(flatten_req(req, major_id, major_name, None, [], from_school=False))
 
     return rows, True
-
-
-MIGRATION_SQL = """
--- Run this in the Supabase SQL editor before executing this script:
-TRUNCATE TABLE major_requirements;
-ALTER TABLE major_requirements
-  DROP COLUMN IF EXISTS major_code,
-  DROP COLUMN IF EXISTS course_id,
-  DROP COLUMN IF EXISTS elective_group,
-  DROP COLUMN IF EXISTS is_required,
-  DROP COLUMN IF EXISTS units_required,
-  DROP COLUMN IF EXISTS notes,
-  DROP COLUMN IF EXISTS min_courses_required,
-  ADD COLUMN IF NOT EXISTS major_id         text,
-  ADD COLUMN IF NOT EXISTS major_name       text,
-  ADD COLUMN IF NOT EXISTS requirement_group text,
-  ADD COLUMN IF NOT EXISTS requirement_type text,
-  ADD COLUMN IF NOT EXISTS courses          jsonb,
-  ADD COLUMN IF NOT EXISTS courses_needed   int,
-  ADD COLUMN IF NOT EXISTS group_name       text,
-  ADD COLUMN IF NOT EXISTS parent_group     text;
-"""
-
-
-def check_schema(client) -> bool:
-    """Returns True if the table has the expected columns."""
-    try:
-        client.table("major_requirements").insert({
-            "major_id": "__schema_check__",
-            "major_name": "__schema_check__",
-            "requirement_group": "__schema_check__",
-            "requirement_type": "required",
-            "courses": [],
-            "courses_needed": 0,
-            "group_name": None,
-            "parent_group": None,
-        }).execute()
-        client.table("major_requirements").delete().eq("major_id", "__schema_check__").execute()
-        return True
-    except Exception:
-        return False
 
 
 def main() -> None:
     client = get_client()
 
-    print("Checking table schema...")
-    if not check_schema(client):
-        print("\nTable schema does not match. Run this SQL in the Supabase SQL editor:\n")
-        print(MIGRATION_SQL)
-        print("Then re-run this script.")
-        return
+    # Confirm GE rows are intact
+    ge_count = client.table("major_requirements").select("*", count="exact").eq("major_id", "ALL_MAJORS").execute()
+    print(f"GE rows present (ALL_MAJORS): {ge_count.count}")
 
-    print("  Schema OK\n")
-    print("Fetching undergraduate programs...")
-    programs = [
-        m for m in fetch_json(f"{BASE_URL}/programs/majors")["data"]
-        if m["division"] == "Undergraduate"
-    ]
-    print(f"  {len(programs)} undergraduate programs\n")
+    # Clear all non-GE rows before repopulating
+    print("Truncating non-GE rows...")
+    client.table("major_requirements").delete().neq("major_id", "ALL_MAJORS").execute()
+
+    print("\nFetching undergraduate program list (paginated)...")
+    programs = fetch_all_programs()
+    print(f"  {len(programs)} undergraduate programs found\n")
 
     all_rows: list[dict] = []
     empty: list[str] = []
     n_fetched = 0
+    n_targets = sum(
+        (len(p.get("specializations", [])) + 1) if p.get("specializations") else 1
+        for p in programs
+    )
 
     for prog in programs:
-        prog_id = prog["id"]
+        prog_id   = prog["id"]
         prog_name = prog["name"]
-        specs = prog.get("specializations", [])
-        targets = [(prog_id, s) for s in specs] if specs else [(prog_id, None)]
+        specs     = prog.get("specializations", [])
+        # For programs with specializations, also fetch the parent (no spec) to get
+        # specialization-specific requirement groups that only appear at the parent level.
+        targets   = [(prog_id, None)] + [(prog_id, s) for s in specs] if specs else [(prog_id, None)]
 
         for pid, sid in targets:
-            rows, ok = fetch_and_flatten(pid, sid)
+            rows, ok = fetch_and_flatten(pid, sid, prog_name)
             label = f"{prog_name} ({sid or pid})"
             if not ok or not rows:
-                print(f"  WARNING: empty — {label}")
                 empty.append(sid or pid)
-                continue
-            for row in rows:
-                row["major_name"] = prog_name
-            all_rows.extend(rows)
-            n_fetched += 1
-            print(f"  {label}: {len(rows)} rows")
+            else:
+                all_rows.extend(rows)
+                n_fetched += 1
+
+            if n_fetched % 10 == 0 and n_fetched > 0:
+                print(f"  [{n_fetched}/{n_targets}] {len(all_rows)} rows so far — last: {label}")
 
     # ── Summary ──────────────────────────────────────────────────────────────
-    print(f"\nTotal programs/specs fetched: {n_fetched}")
+    print(f"\n{'='*50}")
+    print(f"Total programs/specs fetched: {n_fetched}")
     print(f"Total requirement rows:       {len(all_rows)}")
 
-    type_counts = {}
+    type_counts: dict[str, int] = {}
     for row in all_rows:
-        type_counts[row["requirement_type"]] = type_counts.get(row["requirement_type"], 0) + 1
+        t = row["requirement_type"]
+        type_counts[t] = type_counts.get(t, 0) + 1
     print("Requirement type breakdown:")
     for t, c in sorted(type_counts.items()):
         print(f"  {t:<10} {c}")
 
     if empty:
         print(f"\nMajors with empty/failed requirements ({len(empty)}):")
-        for m in empty:
+        for m in empty[:20]:
             print(f"  - {m}")
+        if len(empty) > 20:
+            print(f"  ... and {len(empty) - 20} more")
 
-    # ── Clear and repopulate ─────────────────────────────────────────────────
-    print("\nClearing major_requirements table...")
-    client.table("major_requirements").delete().gt("id", 0).execute()
-
-    print(f"Inserting {len(all_rows)} rows...")
+    # ── Insert (GE rows already preserved — do NOT delete ALL_MAJORS) ────────
+    print(f"\nInserting {len(all_rows)} rows in batches of {BATCH_SIZE}...")
     for i in range(0, len(all_rows), BATCH_SIZE):
         batch = all_rows[i : i + BATCH_SIZE]
         client.table("major_requirements").insert(batch).execute()
-        print(f"  {min(i + BATCH_SIZE, len(all_rows))}/{len(all_rows)}")
+        pct = min(i + BATCH_SIZE, len(all_rows))
+        print(f"  {pct}/{len(all_rows)}")
 
-    print("\nDone.")
+    final = client.table("major_requirements").select("*", count="exact").execute()
+    print(f"\nFinal row count in table: {final.count}")
+    print("Done.")
 
 
 if __name__ == "__main__":
