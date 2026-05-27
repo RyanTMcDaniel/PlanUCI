@@ -35,27 +35,36 @@ function parseCoursesFromGroupName(groupName: string): string[] {
   return result;
 }
 
-/** All requirement groups for a given major_id. Paginates, merges duplicate
- *  group_names, and parses inline course IDs for empty groups. */
-export async function fetchMajorRequirements(major_id: string): Promise<ReqGroup[]> {
-  const supabase = createClient();
+async function fetchReqRowsForId(supabase: ReturnType<typeof createClient>, major_id: string): Promise<ReqGroup[]> {
   const PAGE = 1000;
-  const rawRows: ReqGroup[] = [];
-
+  const rows: ReqGroup[] = [];
   for (let from = 0; ; from += PAGE) {
     const { data, error } = await supabase
       .from("major_requirements")
       .select("id, group_name, requirement_type, courses, courses_needed, waivable")
       .eq("major_id", major_id)
       .range(from, from + PAGE - 1);
-
     if (error) throw new Error(error.message);
     if (!data || data.length === 0) break;
-    rawRows.push(...(data as ReqGroup[]));
+    rows.push(...(data as ReqGroup[]));
     if (data.length < PAGE) break;
   }
+  return rows;
+}
 
-  // Merge rows that share a group_name (rare in practice, but correct to handle)
+/** All requirement groups for a given major. Optionally merges parent program rows
+ *  (for specialization programs where the parent fetch captures spec-specific groups). */
+export async function fetchMajorRequirements(major_id: string, parent_id?: string): Promise<ReqGroup[]> {
+  const supabase = createClient();
+
+  const [specRows, parentRows] = await Promise.all([
+    fetchReqRowsForId(supabase, major_id),
+    parent_id && parent_id !== major_id ? fetchReqRowsForId(supabase, parent_id) : Promise.resolve([]),
+  ]);
+
+  const rawRows = [...specRows, ...parentRows];
+
+  // Merge rows that share a group_name, deduplicating courses
   const grouped = new Map<string, ReqGroup>();
   for (const row of rawRows) {
     const existing = grouped.get(row.group_name);

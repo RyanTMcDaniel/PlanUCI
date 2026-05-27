@@ -32,11 +32,16 @@ export async function fetchMajors(): Promise<MajorOption[]> {
     if (data.length < PAGE) break;
   }
 
+  const allIds = new Set(allRows.map((r) => r.major_id));
   const seen = new Map<string, string>();
   for (const row of allRows) {
-    if (!seen.has(row.major_id)) {
-      seen.set(row.major_id, cleanDisplayName(row.major_name, row.major_id));
-    }
+    if (seen.has(row.major_id)) continue;
+    // Skip parent IDs — an ID is a parent if another ID in the list equals it + one letter
+    // (e.g. skip "BS-0K6" when "BS-0K6A" exists; keep "BS-201E" since "BS-201EA" doesn't)
+    const isParent = [...allIds].some(
+      (id) => id !== row.major_id && id.startsWith(row.major_id) && /^[A-Z]$/.test(id.slice(row.major_id.length)),
+    );
+    if (!isParent) seen.set(row.major_id, cleanDisplayName(row.major_name, row.major_id));
   }
 
   return Array.from(seen.entries())
