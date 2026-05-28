@@ -26,12 +26,53 @@ def _qkey(qstr: str) -> tuple[int, int]:
     return (int(year), QUARTER_ORDER.get(quarter.lower(), 99))
 
 
+# ── CSE ↔ ICS alias map (FIX 6) ─────────────────────────────────────────────
+# CSE was the old department prefix; current catalog uses I&CSCI / ICS after norm.
+# Hardcoded known aliases; _load_aliases() extends this from the DB at runtime.
+_ALIASES: dict[str, str] = {
+    "CSE31":  "ICS31",
+    "CSE43":  "ICS43",
+    "CSE45C": "ICS45C",
+    "CSE46":  "ICS46",
+}
+_ALIASES_INITIALIZED = False
+
+
+def _load_aliases(client) -> None:
+    """FIX 6: query major_requirements to discover additional CSE↔ICS aliases."""
+    global _ALIASES, _ALIASES_INITIALIZED
+    if _ALIASES_INITIALIZED:
+        return
+    try:
+        rows = (
+            client.table("major_requirements")
+            .select("courses")
+            .execute()
+            .data
+        )
+    except Exception:
+        _ALIASES_INITIALIZED = True
+        return
+
+    for row in rows:
+        courses = row.get("courses") or []
+        raw_norms = [c.replace(" ", "").upper().replace("I&CSCI", "ICS") for c in courses]
+        cse_nums = {n[3:] for n in raw_norms if n.startswith("CSE")}
+        ics_nums = {n[3:] for n in raw_norms if n.startswith("ICS")}
+        for num in cse_nums & ics_nums:
+            _ALIASES.setdefault("CSE" + num, "ICS" + num)
+
+    _ALIASES_INITIALIZED = True
+    print(f"[FIX 6] Alias map ({len(_ALIASES)} entries): {dict(sorted(_ALIASES.items()))}")
+
+
 def _norm(course_id: str) -> str:
     """Normalize course ID for comparison: remove spaces, uppercase, resolve UCI dept aliases."""
     s = course_id.replace(" ", "").upper()
     # prereq_edges stores raw catalog text like "I&C SCI 46"; courses table uses "ICS46"
     s = s.replace("I&CSCI", "ICS")
-    return s
+    # FIX 6: resolve CSE→ICS aliases so CSE46 == ICS46 in all comparisons
+    return _ALIASES.get(s, s)
 
 
 @dataclass
@@ -90,6 +131,8 @@ def _probe_group_column(client) -> str | None:
 # ── Validators ───────────────────────────────────────────────────────────────
 
 def prereqs_satisfied(plan: CoursePlan, client) -> tuple[bool, list[str]]:
+    # FIX 6 — ensure alias map is populated before any _norm() comparisons
+    _load_aliases(client)
     """Every planned course must have its prerequisites completed or planned earlier.
 
     OR logic is handled by evaluating the prerequisite_tree JSON from the
@@ -171,8 +214,14 @@ def prereqs_satisfied(plan: CoursePlan, client) -> tuple[bool, list[str]]:
 
 def major_requirements_met(plan: CoursePlan, client) -> tuple[bool, list[str]]:
     """Required, elective, and GE requirement rows must be covered by the plan."""
+    _load_aliases(client)  # FIX 6
     violations: list[str] = []
 
+    all_courses = {_norm(c) for c in plan.completed_courses}
+    for courses_in_q in plan.planned_courses.values():
+        all_courses.update(_norm(c) for c in courses_in_q)
+
+    # Check major-specific requirements
     rows = (
         client.table("major_requirements")
         .select("requirement_type,courses,courses_needed,group_name")
@@ -183,10 +232,6 @@ def major_requirements_met(plan: CoursePlan, client) -> tuple[bool, list[str]]:
 
     if not rows:
         return True, [f"No requirements found for major {plan.major_id!r} — skipping"]
-
-    all_courses = {_norm(c) for c in plan.completed_courses}
-    for courses in plan.planned_courses.values():
-        all_courses.update(_norm(c) for c in courses)
 
     for req in rows:
         course_list: list[str] = req.get("courses") or []
@@ -203,6 +248,33 @@ def major_requirements_met(plan: CoursePlan, client) -> tuple[bool, list[str]]:
             ellipsis = "…" if len(course_list) > 4 else ""
             violations.append(
                 f"[{req_type}] {group_name!r}: need {needed} of "
+                f"{short}{ellipsis}, have {covered}"
+            )
+
+    # FIX 3: Also validate university-wide GE requirements (major_id = "ALL_MAJORS").
+    # A plan fails if any GE group has fewer courses than courses_needed.
+    ge_rows = (
+        client.table("major_requirements")
+        .select("requirement_type,courses,courses_needed,group_name")
+        .eq("major_id", "ALL_MAJORS")
+        .execute()
+        .data
+    )
+
+    for req in ge_rows:
+        course_list = req.get("courses") or []
+        needed = req.get("courses_needed") or 1
+        group_name = req.get("group_name") or "unnamed GE group"
+
+        if not course_list:
+            continue
+
+        covered = sum(1 for c in course_list if _norm(c) in all_courses)
+        if covered < needed:
+            short = course_list[:4]
+            ellipsis = "…" if len(course_list) > 4 else ""
+            violations.append(
+                f"[GE] {group_name!r}: need {needed} of "
                 f"{short}{ellipsis}, have {covered}"
             )
 
@@ -247,6 +319,7 @@ def no_duplicate_courses(plan: CoursePlan, client=None) -> tuple[bool, list[str]
 def validate(plan: CoursePlan) -> tuple[bool, list[str]]:
     """Run all hard constraints. Returns (all_passed, all_violations)."""
     client = create_client(os.getenv("SUPABASE_URL"), os.getenv("SUPABASE_SERVICE_KEY"))
+    _load_aliases(client)  # FIX 6
 
     checks = [
         ("prereqs_satisfied",      prereqs_satisfied(plan, client)),

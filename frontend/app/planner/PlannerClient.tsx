@@ -86,6 +86,12 @@ function generateGradOptions() {
 
 const GRAD_OPTIONS = generateGradOptions();
 
+const UNIT_PRESETS: { label: string; value: number; warning: boolean }[] = [
+  { label: "Standard", value: 19, warning: false },
+  { label: "Heavy",    value: 20, warning: true  },
+  { label: "Overload", value: 22, warning: true  },
+];
+
 function diffColor(level: string | null | undefined): string {
   if (!level) return "#3a3a3a";
   if (level.includes("Lower")) return "#22c55e";
@@ -99,6 +105,55 @@ function diffScoreColor(score: number): string {
   if (score < 6) return "#eab308";
   if (score < 8) return "#f97316";
   return "#ef4444";
+}
+
+// ── Bucket classification ──────────────────────────────────────────────────────
+
+type BucketKey = "lower" | "upper" | "choice" | "elective";
+
+const BUCKET_LABELS: Record<BucketKey, string> = {
+  lower:    "LOWER DIVISION REQUIRED",
+  upper:    "UPPER DIVISION REQUIRED",
+  choice:   "REQUIRED SELECTIONS",
+  elective: "ELECTIVES",
+};
+
+// Groups with more courses than this get their own collapsible row inside a bucket
+const INLINE_THRESHOLD = 8;
+
+function extractCourseNumber(courseId: string): number {
+  const m = courseId.match(/\d+/);
+  return m ? parseInt(m[0], 10) : 0;
+}
+
+function classifyGroup(req: ReqGroup): BucketKey {
+  const name = req.group_name.toLowerCase();
+
+  // Rule 1: elective type is absolute — never overridden
+  if (req.requirement_type === "elective") return "elective";
+
+  // Rule 2: name keywords that signal a choice/pool regardless of type field
+  if (
+    name.includes("elective")   ||
+    name.includes("select")     ||
+    name.includes("choose")     ||
+    name.includes("outside")    ||
+    name.includes("additional") ||
+    name.includes("pick")
+  ) {
+    return "elective";
+  }
+
+  // Rule 3: any pick-N group → "Required Selections" bucket (clearly a choice, not individually required)
+  if (req.courses_needed < req.courses.length) {
+    return "choice";
+  }
+
+  // Rule 4: lower vs upper by highest course number; sequences stay in their natural bucket
+  if (req.courses.length === 0) return "upper";
+  const nums = req.courses.map(extractCourseNumber).filter((n) => n > 0);
+  if (nums.length === 0) return "upper";
+  return Math.max(...nums) < 100 ? "lower" : "upper";
 }
 
 interface CourseWithDifficulty {
@@ -585,6 +640,7 @@ function QuarterCell({
   courseIds, courseInfoMap, difficultyMap, lockedCourses, onToggleLock, onRemove,
   prereqWarnings, onDismissWarning,
   removable, onRemoveQuarter,
+  maxUnitsPerQuarter,
 }: {
   qKey: string;
   label: string;
@@ -599,6 +655,7 @@ function QuarterCell({
   onDismissWarning: (id: string) => void;
   removable?: boolean;
   onRemoveQuarter?: () => void;
+  maxUnitsPerQuarter?: number;
 }) {
   const { setNodeRef, isOver } = useDroppable({
     id: `zone|${qKey}`,
@@ -637,7 +694,19 @@ function QuarterCell({
             ◆ {quarterDiff.combined.toFixed(1)}
           </span>
         )}
-        {units > 0 && <span className="text-[9px] text-[#555] ml-auto mr-1">{units} UNITS</span>}
+        {units > 0 && (() => {
+          const overload = maxUnitsPerQuarter != null
+            ? units > maxUnitsPerQuarter
+            : units > 19;
+          return (
+            <span
+              className={`text-[9px] ml-auto mr-1 ${overload ? "text-amber-500 font-semibold" : "text-[#555]"}`}
+              title={overload ? `⚠ Exceeds ${maxUnitsPerQuarter ?? 19}-unit cap` : undefined}
+            >
+              {overload && "⚠ "}{units} UNITS
+            </span>
+          );
+        })()}
         {removable && onRemoveQuarter && (
           <button onClick={onRemoveQuarter}
             className="text-[9px] text-[#383838] hover:text-[#666] transition-colors leading-none">
@@ -788,8 +857,8 @@ function RequirementGroup({
             {req.group_name}
           </span>
           {req.courses_needed < req.courses.length && (
-            <span className="text-[9px] text-[#444] leading-none">
-              {req.courses_needed} of {req.courses.length} required
+            <span className="text-[9px] text-amber-500/70 leading-none font-medium">
+              pick {req.courses_needed} of {req.courses.length}
             </span>
           )}
         </div>
@@ -813,6 +882,137 @@ function RequirementGroup({
               diffScore={difficultyMap[cid] ?? null}
             />
           ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ── Flat group (inline pills, no expand) ──────────────────────────────────────
+
+function FlatGroup({
+  req, placedSet, courseInfoMap, difficultyMap, searchQuery,
+}: {
+  req: ReqGroup;
+  placedSet: Set<string>;
+  courseInfoMap: Record<string, CourseDetail>;
+  difficultyMap: Record<string, number>;
+  searchQuery: string;
+}) {
+  const filtered = useMemo(() => {
+    if (!searchQuery) return req.courses;
+    const q = searchQuery.toLowerCase();
+    return req.courses.filter(
+      (cid) => cid.toLowerCase().includes(q) || (courseInfoMap[cid]?.title ?? "").toLowerCase().includes(q),
+    );
+  }, [req.courses, searchQuery, courseInfoMap]);
+
+  if (filtered.length === 0) return null;
+
+  const placed = req.courses.filter((c) => placedSet.has(c)).length;
+  const done = placed >= req.courses_needed;
+  const isChoice = req.courses_needed < req.courses.length;
+  const showLabel = isChoice || req.courses.length > 1;
+
+  return (
+    <div className="px-2 pt-1 pb-1.5">
+      {showLabel && (
+        <div className="flex items-center gap-1.5 mb-1">
+          <span className="text-[9px] text-[#4a4a4a] flex-1 truncate">{req.group_name}</span>
+          {isChoice && (
+            <span className={`text-[8px] font-mono shrink-0 ${done ? "text-[#22c55e]" : "text-[#444]"}`}>
+              pick {req.courses_needed}
+            </span>
+          )}
+        </div>
+      )}
+      <div className="flex flex-wrap gap-1">
+        {filtered.map((cid) => (
+          <CoursePill
+            key={cid}
+            courseId={cid}
+            title={courseInfoMap[cid]?.title}
+            units={courseInfoMap[cid]?.min_units}
+            isPlaced={placedSet.has(cid)}
+            unavailable={!courseInfoMap[cid]}
+            diffScore={difficultyMap[cid] ?? null}
+          />
+        ))}
+      </div>
+    </div>
+  );
+}
+
+// ── Bucket section ────────────────────────────────────────────────────────────
+
+function BucketSection({
+  bucketKey, groups, placedSet, courseInfoMap, difficultyMap, searchQuery, defaultOpen,
+}: {
+  bucketKey: BucketKey;
+  groups: ReqGroup[];
+  placedSet: Set<string>;
+  courseInfoMap: Record<string, CourseDetail>;
+  difficultyMap: Record<string, number>;
+  searchQuery: string;
+  defaultOpen: boolean;
+}) {
+  const [open, setOpen] = useState(defaultOpen);
+
+  if (groups.length === 0) return null;
+
+  const totalNeeded = groups.reduce((s, r) => s + r.courses_needed, 0);
+  const totalPlaced = groups.reduce(
+    (s, r) => s + Math.min(r.courses.filter((c) => placedSet.has(c)).length, r.courses_needed),
+    0,
+  );
+  const done = totalPlaced >= totalNeeded;
+  const partial = !done && totalPlaced > 0;
+  const firstIncomplete = groups.findIndex(
+    (r) => r.courses.filter((c) => placedSet.has(c)).length < r.courses_needed,
+  );
+
+  return (
+    <div className="mb-px">
+      <button
+        onClick={() => setOpen((o) => !o)}
+        className="w-full flex items-center px-2 py-[9px] hover:bg-[#1a1a1a] transition-colors text-left gap-2"
+      >
+        <span className="flex-1 text-[8px] font-bold uppercase tracking-[0.15em] text-[#444]">
+          {BUCKET_LABELS[bucketKey]}
+        </span>
+        <span
+          className={`text-[9px] px-1.5 py-[2px] rounded bg-[#1e1e1e] font-mono tabular-nums ${
+            done ? "text-[#22c55e]" : partial ? "text-[#3b82f6]" : "text-[#555]"
+          }`}
+        >
+          {totalPlaced}/{totalNeeded}
+        </span>
+        <ChevronIcon open={open} />
+      </button>
+      {open && (
+        <div className={bucketKey === "elective" || bucketKey === "choice" ? "border-l-2 border-[#1e1e1e] ml-3" : "pt-0.5 pb-1"}>
+          {groups.map((r, i) =>
+            bucketKey === "elective" || bucketKey === "choice" || r.courses.length > INLINE_THRESHOLD || r.courses_needed < r.courses.length ? (
+              <RequirementGroup
+                key={r.id}
+                req={r}
+                placedSet={placedSet}
+                courseInfoMap={courseInfoMap}
+                difficultyMap={difficultyMap}
+                searchQuery={searchQuery}
+                initialOpen={i === firstIncomplete}
+              />
+            ) : (
+              <FlatGroup
+                key={r.id}
+                req={r}
+                placedSet={placedSet}
+                courseInfoMap={courseInfoMap}
+                difficultyMap={difficultyMap}
+                searchQuery={searchQuery}
+              />
+            ),
+          )}
         </div>
       )}
     </div>
@@ -865,8 +1065,8 @@ function GESection({
         <div className="flex-1 min-w-0">
           <span className="text-[10px] font-normal text-[#ccc] block truncate">{req.group_name}</span>
           {req.courses_needed < req.courses.length && (
-            <span className="text-[9px] text-[#444] leading-none">
-              {req.courses_needed} of {req.courses.length} required
+            <span className="text-[9px] text-amber-500/70 leading-none font-medium">
+              pick {req.courses_needed} of {req.courses.length}
             </span>
           )}
         </div>
@@ -918,7 +1118,8 @@ export default function PlannerClient() {
   const [sidebarTab, setSidebarTab] = useState<"major" | "ge">("major");
   const [selectedDisplayName, setSelectedDisplayName] = useState("");
   const [selectedMajorId, setSelectedMajorId] = useState("");
-  const [gradQuarter, setGradQuarter] = useState("2028_spring");
+  const [gradQuarter, setGradQuarter]   = useState("2028_spring");
+  const [maxUnits,    setMaxUnits]      = useState(19);
   const [plannedCourses, setPlannedCourses] = useState<PlannedCourses>({});
   const [activeData, setActiveData] = useState<DragData | null>(null);
   const [loadingReqs, setLoadingReqs] = useState(false);
@@ -1074,7 +1275,15 @@ export default function PlannerClient() {
       } else {
         const next: Record<string, string> = {};
         for (const conflict of data.conflicts) {
-          // Backend format: "COURSEID locked to QUARTER: BLOCKER must be placed in an earlier quarter"
+          // Format 1: "COURSEID missing prereq: PREREQID"
+          if (conflict.includes(" missing prereq: ")) {
+            const [courseId, prereqId] = conflict.split(" missing prereq: ");
+            if (courseId && prereqId) {
+              next[courseId.trim()] = `Missing prereq: ${prereqId.trim()} not in plan`;
+            }
+            continue;
+          }
+          // Format 2: "COURSEID locked to QUARTER: BLOCKER must be placed in an earlier quarter"
           const courseId = conflict.split(" locked to")[0]?.trim();
           if (!courseId) continue;
           const afterColon = conflict.split(": ").slice(1).join(": ");
@@ -1204,16 +1413,27 @@ export default function PlannerClient() {
     });
   }, []);
 
-  const requiredGroups = requirements.filter((r) => r.requirement_type === "required");
-  const electiveGroups = requirements.filter((r) => r.requirement_type === "elective");
+  // Classify requirements into logical display buckets
+  const bucketed = useMemo(() => {
+    const lower: ReqGroup[] = [], upper: ReqGroup[] = [], choice: ReqGroup[] = [], elective: ReqGroup[] = [];
+    for (const req of requirements) {
+      switch (classifyGroup(req)) {
+        case "lower":    lower.push(req);    break;
+        case "upper":    upper.push(req);    break;
+        case "choice":   choice.push(req);   break;
+        case "elective": elective.push(req); break;
+      }
+    }
+    return { lower, upper, choice, elective };
+  }, [requirements]);
 
-  // Index of the first incomplete group in each section (for default-open on load)
-  const firstIncompleteReq = requiredGroups.findIndex(
-    (r) => r.courses.filter((c) => placedSet.has(c)).length < r.courses_needed,
-  );
-  const firstIncompleteElec = electiveGroups.findIndex(
-    (r) => r.courses.filter((c) => placedSet.has(c)).length < r.courses_needed,
-  );
+  const firstIncompleteBucket = useMemo(() => {
+    const order: BucketKey[] = ["lower", "upper", "choice", "elective"];
+    return order.find((k) =>
+      bucketed[k].some((r) => r.courses.filter((c) => placedSet.has(c)).length < r.courses_needed),
+    ) ?? null;
+  }, [bucketed, placedSet]);
+
   const firstIncompleteGE = geRequirements.findIndex(
     (r) => r.courses.filter((c) => placedSet.has(c)).length < r.courses_needed,
   );
@@ -1315,40 +1535,18 @@ export default function PlannerClient() {
                 )}
                 {!loadingReqs && !reqError && (
                   <>
-                    {requiredGroups.length > 0 && (
-                      <>
-                        <div className="px-2 pt-2 pb-1">
-                          <span className="text-[8px] font-bold uppercase tracking-[0.15em] text-[#333]">
-                            Required
-                          </span>
-                        </div>
-                        {requiredGroups.map((r, i) => (
-                          <RequirementGroup
-                            key={r.id} req={r} placedSet={placedSet}
-                            courseInfoMap={courseInfoMap} difficultyMap={difficultyMap}
-                            searchQuery={searchQuery}
-                            initialOpen={i === firstIncompleteReq}
-                          />
-                        ))}
-                      </>
-                    )}
-                    {electiveGroups.length > 0 && (
-                      <>
-                        <div className="px-2 pt-3 pb-1">
-                          <span className="text-[8px] font-bold uppercase tracking-[0.15em] text-[#333]">
-                            Electives
-                          </span>
-                        </div>
-                        {electiveGroups.map((r, i) => (
-                          <RequirementGroup
-                            key={r.id} req={r} placedSet={placedSet}
-                            courseInfoMap={courseInfoMap} difficultyMap={difficultyMap}
-                            searchQuery={searchQuery}
-                            initialOpen={i === firstIncompleteElec}
-                          />
-                        ))}
-                      </>
-                    )}
+                    {(["lower", "upper", "choice", "elective"] as const).map((key) => (
+                      <BucketSection
+                        key={`${key}-${selectedMajorId}`}
+                        bucketKey={key}
+                        groups={bucketed[key]}
+                        placedSet={placedSet}
+                        courseInfoMap={courseInfoMap}
+                        difficultyMap={difficultyMap}
+                        searchQuery={searchQuery}
+                        defaultOpen={firstIncompleteBucket === key}
+                      />
+                    ))}
                     {!selectedMajorId && (
                       <p className="text-[10px] text-[#333] text-center py-12">
                         Search for your major above
@@ -1392,6 +1590,33 @@ export default function PlannerClient() {
 
           {/* Auto-fill */}
           <div className="px-2.5 py-2.5 border-t border-[#2a2a2a] shrink-0">
+            {/* Unit load selector */}
+            <div className="mb-2.5">
+              <span className="text-[8px] font-bold uppercase tracking-[0.12em] text-[#333] block mb-1.5">
+                Units / Quarter
+              </span>
+              <div className="flex gap-1">
+                {UNIT_PRESETS.map((p) => (
+                  <button
+                    key={p.value}
+                    onClick={() => setMaxUnits(p.value)}
+                    className={`flex-1 rounded py-1 text-center transition-all
+                      ${maxUnits === p.value
+                        ? "bg-[#3b82f6]/15 border border-[#3b82f6]/50 text-[#3b82f6]"
+                        : "bg-[#1a1a1a] border border-[#2a2a2a] text-[#444] hover:text-[#666]"}`}
+                  >
+                    <span className="block text-[9px] font-bold">{p.label}</span>
+                    <span className="block text-[8px] font-normal opacity-70">{p.value}u</span>
+                  </button>
+                ))}
+              </div>
+              {UNIT_PRESETS.find((p) => p.value === maxUnits)?.warning && (
+                <p className="mt-1.5 text-[8.5px] text-amber-500/80 leading-snug">
+                  ⚠ Heavy course loads significantly increase difficulty and dropout risk — only recommended if required for your graduation timeline.
+                </p>
+              )}
+            </div>
+
             {toast && (
               <div className="flex items-start gap-1.5 mb-2 px-2 py-1.5 rounded bg-red-950/30 border border-red-900/40">
                 <span className="text-[9px] text-red-400 flex-1 leading-snug">{toast}</span>
@@ -1417,7 +1642,7 @@ export default function PlannerClient() {
                       major_id: selectedMajorId,
                       completed_courses: [],
                       graduation_quarter: gradQuarter,
-                      units_per_quarter: 16,
+                      units_per_quarter: maxUnits,
                       waived_ges: [],
                     }),
                   });
@@ -1535,6 +1760,7 @@ export default function PlannerClient() {
                             onRemove={removeCourse}
                             prereqWarnings={prereqWarnings}
                             onDismissWarning={dismissWarning}
+                            maxUnitsPerQuarter={maxUnits}
                           />
                         );
                       })}
@@ -1550,6 +1776,7 @@ export default function PlannerClient() {
                           prereqWarnings={prereqWarnings}
                           onDismissWarning={dismissWarning}
                           removable onRemoveQuarter={() => toggleSummer(year)}
+                          maxUnitsPerQuarter={maxUnits}
                         />
                       )}
                     </div>
