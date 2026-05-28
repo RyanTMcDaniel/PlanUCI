@@ -95,7 +95,7 @@ class GenerateRequest(BaseModel):
     major_id:           str
     completed_courses:  list[str] = []
     graduation_quarter: str
-    units_per_quarter:  int = 16
+    units_per_quarter:  int = 19   # UCI standard max (12–19); Heavy=20, Overload=22
     waived_ges:         list[str] = []
 
 
@@ -143,6 +143,8 @@ def optimizer_generate(req: GenerateRequest):
         "quarters_available": result.quarters_available,
         "quarters_needed":    result.quarters_needed,
         "overflow_count":     result.overflow_count,
+        "overflow_courses":   result.overflow_courses,
+        "extended_by":        result.extended_by,
         "group_map":          result.group_map,
         "cached":             False,
     }
