@@ -30,6 +30,9 @@ WEIGHTS = {
     "ge_distribution":      0.20,
     "workload_progression": 0.20,
     "major_clustering":     0.20,
+    # Adjacent-quarter smoothing (2× the implicit progression weight).
+    # Penalises sharp swings between consecutive quarters, including cliff jumps.
+    "adjacent_smoothing":   0.40,
 }
 
 _DEFAULT_DIFFICULTY = 5.0   # used when a course has no entry in the CSV
@@ -185,6 +188,38 @@ def major_clustering(plan: CoursePlan, course_meta: dict[str, dict]) -> float:
         penalties.append(penalty)
 
     return statistics.mean(penalties) if penalties else 0.0
+
+
+def adjacent_smoothing(plan: CoursePlan, diff_scores: dict[str, float]) -> float:
+    """Penalty for sharp difficulty swings between consecutive quarters.
+
+    Two-component penalty:
+    1. Proportional: each adjacent pair with |Δ| > 1.5 contributes linearly.
+       A swing of 1.5 → 0 penalty; a swing of 3.5 → 1.0 penalty per pair.
+    2. Cliff-jump: any adjacent pair with |Δ| > 2.0 adds a flat +0.5 penalty.
+       This is the 'flat -50' in the design brief scaled to the [0, 1] scorer
+       range (0.5 × weight 0.40 dominates other scorers when triggered).
+
+    Result is averaged over pairs and clamped to [0, 1].
+    """
+    avgs = _quarter_avgs(plan, diff_scores)
+    if len(avgs) < 2:
+        return 0.0
+
+    total = 0.0
+    n_pairs = len(avgs) - 1
+
+    for a, b in zip(avgs, avgs[1:]):
+        diff = abs(b - a)
+        if diff > 1.5:
+            # Proportional component: ramps from 0 at diff=1.5 to 1.0 at diff=3.5
+            total += min(1.0, (diff - 1.5) / 2.0)
+        if diff > 2.0:
+            # Cliff-jump flat penalty — designed to dominate and force the
+            # optimizer to reject moves that create jumps > 2 difficulty points.
+            total += 0.5
+
+    return min(1.0, total / n_pairs)
 
 
 # ── Combined scorer ───────────────────────────────────────────────────────────

@@ -37,6 +37,7 @@ from .soft_constraints import (
     WEIGHTS,
     _load_course_meta,
     _load_difficulty_scores,
+    adjacent_smoothing,
     difficulty_balance,
     ge_distribution,
     major_clustering,
@@ -87,9 +88,10 @@ def _check_prereqs(plan: CoursePlan, trees: dict[str, dict]) -> list[str]:
     available: set[str] = {_norm(c) for c in plan.completed_courses}
 
     for quarter in sorted_quarters:
+        same_q = frozenset(_norm(c) for c in plan.planned_courses[quarter])
         for course in plan.planned_courses[quarter]:
             tree = trees.get(_norm(course))
-            if tree and not _eval_tree(tree, available):
+            if tree and not _eval_tree(tree, available, same_q):
                 violations.append(
                     f"{course} in {quarter}: prerequisites not satisfied"
                 )
@@ -109,6 +111,7 @@ def _soft_score(
         "ge_distribution":      ge_distribution(plan, meta),
         "workload_progression": workload_progression(plan, diff_scores),
         "major_clustering":     major_clustering(plan, meta),
+        "adjacent_smoothing":   adjacent_smoothing(plan, diff_scores),
     }
     return sum(WEIGHTS[k] * v for k, v in breakdown.items()), breakdown
 
