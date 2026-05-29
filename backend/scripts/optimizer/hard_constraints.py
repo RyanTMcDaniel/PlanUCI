@@ -86,28 +86,46 @@ class CoursePlan:
 
 # ── Prerequisite tree evaluation ──────────────────────────────────────────────
 
-def _eval_item(item: dict, available: set[str]) -> bool:
+def _eval_item(
+    item: dict,
+    available: set[str],
+    same_quarter: frozenset[str] = frozenset(),
+) -> bool:
     prereq_type = item.get("prereqType")
     if prereq_type == "course":
-        # _norm strips spaces so "MATH 2A" matches "MATH2A" in available
-        return _norm(item.get("courseId", "")) in available
+        cid = _norm(item.get("courseId", ""))
+        if item.get("coreq"):
+            # A corequisite is satisfied if the course has been completed in any
+            # prior quarter OR is being taken concurrently (same quarter).
+            return cid in available or cid in same_quarter
+        return cid in available
     if prereq_type == "exam":
         return False  # treat placement exams as not satisfied
-    return _eval_tree(item, available)
+    return _eval_tree(item, available, same_quarter)
 
 
-def _eval_tree(node: dict, available: set[str]) -> bool:
-    """Recursively evaluate an AND/OR/NOT prerequisite_tree node."""
+def _eval_tree(
+    node: dict,
+    available: set[str],
+    same_quarter: frozenset[str] = frozenset(),
+) -> bool:
+    """Recursively evaluate an AND/OR/NOT prerequisite_tree node.
+
+    same_quarter: normed IDs of courses placed in the current quarter.
+    Coreq leaves are satisfied when their course is in same_quarter OR available.
+    Callers that don't care about coreqs (e.g. optimizer inner loop) can omit
+    same_quarter and rely on the default empty frozenset.
+    """
     for logic_key in ("AND", "OR", "NOT"):
         if logic_key not in node:
             continue
         items = node[logic_key]
         if logic_key == "AND":
-            return all(_eval_item(i, available) for i in items)
+            return all(_eval_item(i, available, same_quarter) for i in items)
         if logic_key == "OR":
-            return any(_eval_item(i, available) for i in items)
+            return any(_eval_item(i, available, same_quarter) for i in items)
         if logic_key == "NOT":
-            # Only fail if a course anti-coreq is explicitly in available.
+            # Anti-prereqs: only fail if the forbidden course is in prior quarters.
             # Exams and nested subtrees inside NOT are ignored.
             return not any(
                 i.get("prereqType") == "course"
@@ -199,10 +217,12 @@ def prereqs_satisfied(plan: CoursePlan, client) -> tuple[bool, list[str]]:
         available = {_norm(c) for c in plan.completed_courses}
 
         for quarter in sorted_quarters:
+            # Pass same-quarter courses so coreq leaves are satisfied correctly.
+            same_q = frozenset(_norm(c) for c in plan.planned_courses[quarter])
             for course in plan.planned_courses[quarter]:
                 nc = _norm(course)
                 tree = prereq_trees.get(nc)
-                if tree and not _eval_tree(tree, available):
+                if tree and not _eval_tree(tree, available, same_q):
                     violations.append(
                         f"{course} in {quarter}: prerequisites not satisfied "
                         f"(evaluated prerequisite_tree for {course})"

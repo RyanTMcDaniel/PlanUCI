@@ -126,21 +126,73 @@ def _eval_locked_tree(
     return True
 
 
+def _missing_prereq_norms(
+    tree: dict, locked_norm: set[str], completed_norm: set[str]
+) -> set[str]:
+    """Return normalized course IDs that are AND-required by tree but absent from the plan.
+
+    Uses conservative logic: only flags courses that are definitively missing.
+    - AND: all children must be satisfied; collect missing from each child.
+    - OR: if any alternative is in locked_norm or completed_norm, nothing missing.
+          Otherwise collect missing from the first course alternative.
+    - NOT/exam: ignored.
+    """
+    all_norm = locked_norm | completed_norm
+    return _missing_item_norms_set(tree, all_norm)
+
+
+def _missing_item_norms_set(node: dict, all_norm: set[str]) -> set[str]:
+    for key in ("AND", "OR", "NOT"):
+        if key not in node:
+            continue
+        items = node[key]
+        if key == "AND":
+            result: set[str] = set()
+            for item in items:
+                result |= _missing_leaf_norms(item, all_norm)
+            return result
+        if key == "OR":
+            for item in items:
+                if item.get("prereqType") == "course" and _norm(item.get("courseId", "")) in all_norm:
+                    return set()
+                if item.get("prereqType") not in ("course", "exam", None):
+                    if not _missing_item_norms_set(item, all_norm):
+                        return set()
+            for item in items:
+                if item.get("prereqType") == "course":
+                    cid = _norm(item.get("courseId", ""))
+                    if cid not in all_norm:
+                        return {cid}
+            return set()
+        if key == "NOT":
+            return set()
+    return set()
+
+
+def _missing_leaf_norms(item: dict, all_norm: set[str]) -> set[str]:
+    t = item.get("prereqType")
+    if t == "course":
+        cid = _norm(item.get("courseId", ""))
+        return set() if cid in all_norm else {cid}
+    if t == "exam":
+        return set()
+    return _missing_item_norms_set(item, all_norm)
+
+
 def validate_locks(
     locked_courses: dict[str, str],
     completed_courses: list[str] | None = None,
 ) -> tuple[bool, list[str]]:
-    """Check whether locked quarter assignments conflict with each other prereq-wise.
+    """Check locked quarter assignments for prereq ordering conflicts and missing prereqs.
 
-    Only intra-lock conflicts are reported: if a locked course A requires
-    another locked course B in an earlier quarter, but B is pinned to the
-    same or a later quarter, that is a conflict.
+    Two types of conflicts are reported:
+    1. Ordering: a locked course A requires another locked course B in an earlier
+       quarter, but B is pinned to the same or later quarter.
+    2. Missing: a course in the plan requires a prereq that is not in the plan at all.
 
-    completed_courses are treated as already satisfied. Unlocked, non-completed
-    courses and exams are treated as NOT satisfied so OR-prereq alternatives
-    don't silently mask real ordering conflicts.
+    completed_courses are treated as already satisfied.
     """
-    if len(locked_courses) < 2:
+    if not locked_courses:
         return True, []
 
     completed_norm = {_norm(c) for c in (completed_courses or [])}
@@ -158,22 +210,32 @@ def validate_locks(
         if not tree:
             continue
 
-        avail = {
-            n for n, q in norm_to_quarter.items()
-            if _qkey(q) < _qkey(quarter)
-        }
+        # 1. Ordering conflict: prereq is in plan but placed in wrong quarter
+        # (only meaningful when there are at least 2 courses to compare)
+        if len(locked_courses) >= 2:
+            avail = {
+                n for n, q in norm_to_quarter.items()
+                if _qkey(q) < _qkey(quarter)
+            }
 
-        if not _eval_locked_tree(tree, avail, locked_norm, completed_norm):
-            blocking = [
-                f"{c} (locked to {q})"
-                for c, q in locked_courses.items()
-                if c != course_id and _norm(c) in locked_norm
-                and _qkey(locked_courses[c]) >= _qkey(quarter)
-            ]
-            blocker_str = ", ".join(blocking) if blocking else "a locked prerequisite"
+            if not _eval_locked_tree(tree, avail, locked_norm, completed_norm):
+                blocking = [
+                    f"{c} (locked to {q})"
+                    for c, q in locked_courses.items()
+                    if c != course_id and _norm(c) in locked_norm
+                    and _qkey(locked_courses[c]) >= _qkey(quarter)
+                ]
+                blocker_str = ", ".join(blocking) if blocking else "a locked prerequisite"
+                conflicts.append(
+                    f"{course_id} locked to {quarter}: {blocker_str} must be "
+                    f"placed in an earlier quarter"
+                )
+
+        # 2. Missing prereq: required course is not in the plan at all
+        missing = _missing_prereq_norms(tree, locked_norm, completed_norm)
+        for missing_norm in sorted(missing):
             conflicts.append(
-                f"{course_id} locked to {quarter}: {blocker_str} must be "
-                f"placed in an earlier quarter"
+                f"{course_id} missing prereq: {missing_norm}"
             )
 
     return len(conflicts) == 0, conflicts

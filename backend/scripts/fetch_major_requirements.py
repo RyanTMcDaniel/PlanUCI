@@ -62,6 +62,24 @@ def infer_type(label: str, ancestors: list[str], from_school: bool) -> str:
     return "required"
 
 
+def collect_all_courses(requirements: list[dict]) -> list[str]:
+    """Recursively collect all course IDs from a requirement subtree."""
+    courses: list[str] = []
+    for req in requirements:
+        if req.get("requirementType") == "Course":
+            courses.extend(req.get("courses", []))
+        elif req.get("requirementType") == "Group":
+            courses.extend(collect_all_courses(req.get("requirements", [])))
+    # deduplicate while preserving order
+    seen: set[str] = set()
+    result: list[str] = []
+    for c in courses:
+        if c not in seen:
+            seen.add(c)
+            result.append(c)
+    return result
+
+
 def flatten_req(
     req: dict,
     major_id: str,
@@ -77,24 +95,43 @@ def flatten_req(
     if req_type == "Course":
         courses = req.get("courses", [])
         return [{
-            "major_id":         major_id,
-            "major_name":       major_name,
+            "major_id":          major_id,
+            "major_name":        major_name,
             "requirement_group": req_id,
-            "requirement_type": infer_type(label, ancestors, from_school),
-            "courses":          courses,
-            "courses_needed":   req.get("courseCount", len(courses)),
-            "group_name":       label,
-            "parent_group":     parent_group_id,
-            "waivable":         False,
+            "requirement_type":  infer_type(label, ancestors, from_school),
+            "courses":           courses,
+            "courses_needed":    req.get("courseCount", len(courses)),
+            "group_name":        label,
+            "parent_group":      parent_group_id,
+            "waivable":          False,
         }]
 
     if req_type == "Group":
-        rows = []
-        for child in req.get("requirements", []):
-            rows.extend(flatten_req(
-                child, major_id, major_name, req_id, ancestors + [label], from_school
-            ))
-        return rows
+        children  = req.get("requirements", [])
+        req_count = req.get("requirementCount", len(children))
+
+        if req_count < len(children):
+            # Pick-N pool: collapse all descendant courses into one elective row
+            all_courses = collect_all_courses(children)
+            return [{
+                "major_id":          major_id,
+                "major_name":        major_name,
+                "requirement_group": req_id,
+                "requirement_type":  "elective",
+                "courses":           all_courses,
+                "courses_needed":    req_count,
+                "group_name":        label,
+                "parent_group":      parent_group_id,
+                "waivable":          False,
+            }]
+        else:
+            # Do-all: flatten children individually
+            rows: list[dict] = []
+            for child in children:
+                rows.extend(flatten_req(
+                    child, major_id, major_name, req_id, ancestors + [label], from_school
+                ))
+            return rows
 
     return []
 

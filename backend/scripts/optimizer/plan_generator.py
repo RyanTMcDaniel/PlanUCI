@@ -547,6 +547,26 @@ def _resolve_implicit_prereqs(
     return courses_set, trees
 
 
+# ── Coreq helper ─────────────────────────────────────────────────────────────
+
+def _collect_and_coreq_norms(tree: dict | None) -> set[str]:
+    """Return the normed IDs of all AND-required corequisite courses in a tree.
+
+    Only AND-linked coreqs are returned — an OR branch means the coreq is
+    optional (one of several alternatives), so we don't force it.
+    """
+    if not tree:
+        return set()
+    result: set[str] = set()
+    if "AND" in tree:
+        for item in tree["AND"]:
+            if item.get("prereqType") == "course" and item.get("coreq"):
+                result.add(_norm(item.get("courseId", "")))
+            elif "AND" in item or "OR" in item:
+                result |= _collect_and_coreq_norms(item)
+    return result
+
+
 # ── ASAP scheduler ────────────────────────────────────────────────────────────
 
 def _asap_schedule(
@@ -601,27 +621,83 @@ def _asap_schedule(
             if q_units >= units_per_quarter:
                 break  # quarter is full by unit budget
 
-            # Find the first eligible course that fits in the remaining budget.
-            # `available` holds only PRIOR quarters' courses so the schedule is
-            # consistent with _check_prereqs validation (prereq must be in an
-            # earlier quarter, not the same one).
-            eligible_idx = next(
-                (
-                    i for i, c in enumerate(remaining)
-                    if (
-                        not prereq_trees.get(_norm(c))
-                        or _eval_tree(prereq_trees[_norm(c)], available)
-                    )
-                    and _offered_in_quarter(c, quarter)
-                    and q_units + _course_units(c) <= units_per_quarter
-                ),
-                None,
-            )
-            if eligible_idx is None:
-                break  # nothing eligible or fits this quarter; advance to next
+            same_q_norms: frozenset[str] = frozenset(_norm(x) for x in plan[quarter])
 
-            course = remaining.pop(eligible_idx)
-            plan[quarter].append(course)
+            # Build a norm→raw index over remaining for O(1) coreq lookup.
+            remaining_norm_to_raw: dict[str, str] = {}
+            for raw in remaining:
+                n = _norm(raw)
+                if n not in remaining_norm_to_raw:
+                    remaining_norm_to_raw[n] = raw
+
+            eligible_idx: int | None = None
+            coreqs_to_place: list[str] = []  # raw IDs to co-place in this quarter
+
+            for i, c in enumerate(remaining):
+                tree = prereq_trees.get(_norm(c))
+
+                # Identify coreqs that aren't yet satisfied (prior or current quarter)
+                required_coreqs = _collect_and_coreq_norms(tree)
+                unresolved = [
+                    n for n in required_coreqs
+                    if n not in available and n not in same_q_norms
+                ]
+
+                # Optimistic prereq check: assume unresolved coreqs will be placed
+                # in this quarter so their coreq leaves evaluate to True.
+                hypothetical_q = same_q_norms | set(unresolved)
+                if tree and not _eval_tree(tree, available, hypothetical_q):
+                    continue  # non-coreq prereq still missing — truly ineligible
+
+                if not _offered_in_quarter(c, quarter):
+                    continue
+
+                # Verify each unresolved coreq can actually be placed here.
+                candidate_coreqs: list[str] = []
+                ok = True
+                extra_units = 0
+                for n in unresolved:
+                    raw_coreq = remaining_norm_to_raw.get(n)
+                    if raw_coreq is None or raw_coreq == c:
+                        ok = False
+                        break  # coreq not in plan — can't satisfy
+                    coreq_tree = prereq_trees.get(n)
+                    if coreq_tree and not _eval_tree(coreq_tree, available, hypothetical_q):
+                        ok = False
+                        break
+                    if not _offered_in_quarter(raw_coreq, quarter):
+                        ok = False
+                        break
+                    candidate_coreqs.append(raw_coreq)
+                    extra_units += _course_units(raw_coreq)
+
+                if not ok:
+                    continue
+
+                # Unit budget: main course + all unresolved coreqs must fit together.
+                if q_units + _course_units(c) + extra_units > units_per_quarter:
+                    continue
+
+                eligible_idx = i
+                coreqs_to_place = candidate_coreqs
+                break
+
+            if eligible_idx is None:
+                break  # nothing eligible this quarter; advance to next
+
+            # Save the main course's raw ID before any list mutations.
+            main_course = remaining[eligible_idx]
+
+            # Place coreqs first so they're in the quarter when validation runs.
+            for coreq_raw in coreqs_to_place:
+                if coreq_raw in remaining:
+                    remaining.remove(coreq_raw)
+                    plan[quarter].append(coreq_raw)
+
+            # Remove and place the main course by value (eligible_idx may have
+            # shifted if a coreq appeared before it in the list).
+            remaining.remove(main_course)
+            plan[quarter].append(main_course)
 
         # Make this quarter's courses available to all subsequent quarters.
         available.update(_norm(c) for c in plan[quarter])
