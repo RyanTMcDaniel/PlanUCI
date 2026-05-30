@@ -17,10 +17,15 @@ import { type MajorOption, fetchMajors } from "@/lib/api/majors";
 import {
   type ReqGroup,
   type CourseDetail,
+  type ApCreditResult,
   fetchMajorRequirements,
   fetchCourseDetails,
   fetchGERequirements,
+  fetchApExamNames,
+  resolveApCredits,
 } from "@/lib/api/courses";
+import { createClient } from "@/lib/supabase/client";
+import { savePlan, loadPlan, syncUserProfile } from "@/lib/api/plans";
 // ── Types ─────────────────────────────────────────────────────────────────────
 
 type PlannedCourses = Record<string, string[]>;
@@ -41,6 +46,28 @@ interface CourseStats {
   } | null;
   difficulty_score: number | null;
   prof_gpa: number | null;
+}
+
+interface TopProfessor {
+  name: string;
+  ucinetid: string;
+  avg_difficulty: number | null;
+  avg_quality: number | null;
+  review_count: number;
+  overall_avg_gpa: number | null;
+  quarters_taught: string[];
+  teaching_frequency: number;
+}
+
+// Module-level cache — survives tooltip unmount/remount within the session
+const _topProfsCache = new Map<string, TopProfessor[]>();
+
+const _QUARTER_ABBREV: Record<string, string> = {
+  Fall: "F", Winter: "W", Spring: "S", Summer: "Su",
+};
+function abbrevQuarter(q: string): string {
+  const [season, year] = q.split(" ");
+  return (_QUARTER_ABBREV[season] ?? season[0]) + (year?.slice(2) ?? "");
 }
 
 // ── Constants ─────────────────────────────────────────────────────────────────
@@ -233,12 +260,11 @@ function ErrorBanner({ message, onRetry }: { message: string; onRetry: () => voi
 // ── Major combobox ────────────────────────────────────────────────────────────
 
 function MajorCombobox({
-  options, selectedDisplayName, programNames, onSelect, loading,
+  options, selectedDisplayName, onSelect, loading,
 }: {
   options: MajorOption[];
   selectedDisplayName: string;
-  programNames: Map<string, string>;
-  onSelect: (dbDisplayName: string) => void;
+  onSelect: (displayName: string) => void;
   loading: boolean;
 }) {
   const [query, setQuery] = useState("");
@@ -246,56 +272,38 @@ function MajorCombobox({
   const containerRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
 
-  const selectedLabel = useMemo(() => {
-    if (!selectedDisplayName) return "";
-    const match = options.find((o) => o.display_name === selectedDisplayName);
-    return (match ? programNames.get(match.major_id) : undefined) || selectedDisplayName;
-  }, [selectedDisplayName, options, programNames]);
-
   useEffect(() => {
-    if (!open) setQuery(selectedLabel);
-  }, [selectedLabel, open]);
+    if (!open) setQuery(selectedDisplayName);
+  }, [selectedDisplayName, open]);
 
   useEffect(() => {
     function onMouseDown(e: MouseEvent) {
       if (containerRef.current && !containerRef.current.contains(e.target as Node)) {
         setOpen(false);
-        setQuery(selectedLabel);
+        setQuery(selectedDisplayName);
       }
     }
     document.addEventListener("mousedown", onMouseDown);
     return () => document.removeEventListener("mousedown", onMouseDown);
-  }, [selectedLabel]);
+  }, [selectedDisplayName]);
 
   const filtered = useMemo(() => {
-    const seen = new Set<string>();
     const q = query.trim().toLowerCase();
     return options
-      .filter((o) => {
-        if (seen.has(o.display_name)) return false;
-        seen.add(o.display_name);
-        if (!q) return true;
-        const dbName = o.display_name.toLowerCase();
-        const apiName = (programNames.get(o.major_id) ?? "").toLowerCase();
-        return dbName.includes(q) || apiName.includes(q);
-      })
+      .filter((o) => !q || o.display_name.toLowerCase().includes(q))
       .slice(0, 40);
-  }, [options, query, programNames]);
-
-  function getOptionLabel(opt: MajorOption): string {
-    return programNames.get(opt.major_id) || opt.display_name;
-  }
+  }, [options, query]);
 
   function handleSelect(opt: MajorOption) {
     onSelect(opt.display_name);
-    setQuery(getOptionLabel(opt));
+    setQuery(opt.display_name);
     setOpen(false);
   }
 
   function handleKeyDown(e: React.KeyboardEvent) {
     if (e.key === "Escape") {
       setOpen(false);
-      setQuery(selectedLabel);
+      setQuery(selectedDisplayName);
       inputRef.current?.blur();
     }
     if (e.key === "Enter" && filtered.length > 0) handleSelect(filtered[0]);
@@ -327,7 +335,7 @@ function MajorCombobox({
               onMouseDown={() => handleSelect(opt)}
               className="w-full text-left px-2.5 py-[7px] text-[11px] text-[#bbb] hover:bg-[#252525] hover:text-[#f0f0f0] transition-colors"
             >
-              {getOptionLabel(opt)}
+              {opt.display_name}
             </button>
           ))}
         </div>
@@ -348,20 +356,32 @@ function CourseTooltip({
   onMouseLeave: () => void;
 }) {
   const [stats, setStats] = useState<CourseStats | null>(null);
-  const [statsLoading, setStatsLoading] = useState(true);
+  const [topProfs, setTopProfs] = useState<TopProfessor[]>(() => _topProfsCache.get(courseId) ?? []);
+  const [topProfsLoading, setTopProfsLoading] = useState(!_topProfsCache.has(courseId));
 
   useEffect(() => {
-    setStatsLoading(true);
     setStats(null);
     fetch(`/api/course-stats?id=${encodeURIComponent(courseId)}`)
       .then((r) => (r.ok ? r.json() : null))
       .then((d) => setStats(d ?? null))
-      .catch(() => setStats(null))
-      .finally(() => setStatsLoading(false));
+      .catch(() => setStats(null));
+  }, [courseId]);
+
+  useEffect(() => {
+    if (_topProfsCache.has(courseId)) return;
+    setTopProfsLoading(true);
+    fetch(`/api/top-professors?id=${encodeURIComponent(courseId)}`)
+      .then((r) => (r.ok ? r.json() : { professors: [] }))
+      .then((d) => {
+        const profs: TopProfessor[] = d?.professors ?? [];
+        _topProfsCache.set(courseId, profs);
+        setTopProfs(profs);
+      })
+      .catch(() => {})
+      .finally(() => setTopProfsLoading(false));
   }, [courseId]);
 
   const termsSet = useMemo(() => new Set(info?.terms ?? []), [info]);
-  const prof = stats?.professor ?? null;
 
   return (
     <div
@@ -423,43 +443,35 @@ function CourseTooltip({
         </div>
       </div>
 
-      {/* ── Top professor ── */}
+      {/* ── Top professors ── */}
       <div className="px-3 py-2">
-        <p className="text-[8px] font-bold uppercase tracking-widest text-[#444] mb-1.5">Top Professor</p>
-        {statsLoading ? (
+        <p className="text-[8px] font-bold uppercase tracking-widest text-[#444] mb-1.5">
+          Top Professors · Past 3 Years
+        </p>
+        {topProfsLoading ? (
           <p className="text-[10px] text-[#3a3a3a]">Loading…</p>
-        ) : prof ? (
-          <div>
-            <p className="text-[11px] font-semibold text-[#ccc]">{prof.name}</p>
-            <div className="flex items-center gap-2 mt-0.5 flex-wrap">
-              <span className="text-[10px] font-bold text-[#22c55e]">
-                {prof.overall_rating.toFixed(1)}/5 overall
-              </span>
-              <span className="text-[10px] text-[#555]">·</span>
-              <span className="text-[10px] text-[#777]">
-                {prof.difficulty_rating.toFixed(1)} difficulty
-              </span>
-              <span className="text-[10px] text-[#555]">·</span>
-              <span className="text-[10px] text-[#555]">{prof.num_ratings} ratings</span>
-              {prof.sentiment_label && (
-                <>
-                  <span className="text-[10px] text-[#555]">·</span>
-                  <span className="text-[10px] text-[#3b82f6]">{prof.sentiment_label}</span>
-                </>
-              )}
-            </div>
-            <div className="mt-1">
-              {stats?.prof_gpa != null && isFinite(stats.prof_gpa) ? (
-                <span className="text-[10px] text-[#22c55e]">
-                  GPA with this prof: {stats.prof_gpa.toFixed(2)}
-                </span>
-              ) : (
-                <span className="text-[10px] text-[#444]">No GPA data for this prof</span>
-              )}
-            </div>
-          </div>
+        ) : topProfs.length === 0 ? (
+          <p className="text-[10px] text-[#3a3a3a]">No recent professor data</p>
         ) : (
-          <p className="text-[10px] text-[#3a3a3a]">No professor data available</p>
+          <div className="flex flex-col gap-1.5">
+            {topProfs.map((prof) => (
+              <div key={prof.ucinetid} className="text-[9px] leading-snug">
+                <span className="font-semibold text-[#ccc]">{prof.name}</span>
+                {prof.avg_quality != null && (
+                  <span className="text-[#22c55e]">{"  "}Quality: {prof.avg_quality.toFixed(1)}</span>
+                )}
+                {prof.avg_difficulty != null && (
+                  <span className="text-[#aaa]">{"  "}Difficulty: {prof.avg_difficulty.toFixed(1)}</span>
+                )}
+                {prof.overall_avg_gpa != null && Number.isFinite(prof.overall_avg_gpa) && (
+                  <span className="text-[#22c55e]">{"  "}GPA: {prof.overall_avg_gpa.toFixed(2)}</span>
+                )}
+                {prof.quarters_taught.length > 0 && (
+                  <span className="text-[#555]">{"  "}Taught: {prof.quarters_taught.map(abbrevQuarter).join(", ")}</span>
+                )}
+              </div>
+            ))}
+          </div>
         )}
       </div>
     </div>
@@ -750,12 +762,13 @@ function QuarterCell({
 // ── Course pill (sidebar grid) ─────────────────────────────────────────────────
 
 function CoursePill({
-  courseId, title, units, isPlaced, unavailable, diffScore,
+  courseId, title, units, isPlaced, isApCredit, unavailable, diffScore,
 }: {
   courseId: string;
   title?: string | null;
   units?: number | null;
   isPlaced: boolean;
+  isApCredit?: boolean;
   unavailable?: boolean;
   diffScore?: number | null;
 }) {
@@ -774,6 +787,19 @@ function CoursePill({
   const dot = diffScore != null ? (
     <span style={{ color: diffScoreColor(diffScore) }} className="text-[6px] mr-0.5 shrink-0 leading-none">●</span>
   ) : null;
+
+  if (isApCredit) {
+    return (
+      <div
+        title={`${tooltip} — satisfied by AP credit`}
+        className="flex items-center gap-1 rounded-full px-2 py-[3px] bg-emerald-950/40 border border-emerald-700/40 min-w-0 overflow-hidden"
+      >
+        {dot}
+        <span className="text-[9px] font-medium leading-none truncate text-emerald-400">{courseId}</span>
+        <span className="text-[6.5px] font-bold leading-none text-emerald-500 uppercase tracking-wide shrink-0">AP</span>
+      </div>
+    );
+  }
 
   if (isPlaced) {
     return (
@@ -815,10 +841,11 @@ function CoursePill({
 // ── Requirement group ─────────────────────────────────────────────────────────
 
 function RequirementGroup({
-  req, placedSet, courseInfoMap, difficultyMap, searchQuery, initialOpen,
+  req, placedSet, apCreditedSet, courseInfoMap, difficultyMap, searchQuery, initialOpen,
 }: {
   req: ReqGroup;
   placedSet: Set<string>;
+  apCreditedSet: Set<string>;
   courseInfoMap: Record<string, CourseDetail>;
   difficultyMap: Record<string, number>;
   searchQuery: string;
@@ -878,6 +905,7 @@ function RequirementGroup({
               title={courseInfoMap[cid]?.title}
               units={courseInfoMap[cid]?.min_units}
               isPlaced={placedSet.has(cid)}
+              isApCredit={apCreditedSet.has(cid)}
               unavailable={!courseInfoMap[cid]}
               diffScore={difficultyMap[cid] ?? null}
             />
@@ -891,10 +919,11 @@ function RequirementGroup({
 // ── Flat group (inline pills, no expand) ──────────────────────────────────────
 
 function FlatGroup({
-  req, placedSet, courseInfoMap, difficultyMap, searchQuery,
+  req, placedSet, apCreditedSet, courseInfoMap, difficultyMap, searchQuery,
 }: {
   req: ReqGroup;
   placedSet: Set<string>;
+  apCreditedSet: Set<string>;
   courseInfoMap: Record<string, CourseDetail>;
   difficultyMap: Record<string, number>;
   searchQuery: string;
@@ -934,6 +963,7 @@ function FlatGroup({
             title={courseInfoMap[cid]?.title}
             units={courseInfoMap[cid]?.min_units}
             isPlaced={placedSet.has(cid)}
+            isApCredit={apCreditedSet.has(cid)}
             unavailable={!courseInfoMap[cid]}
             diffScore={difficultyMap[cid] ?? null}
           />
@@ -946,11 +976,12 @@ function FlatGroup({
 // ── Bucket section ────────────────────────────────────────────────────────────
 
 function BucketSection({
-  bucketKey, groups, placedSet, courseInfoMap, difficultyMap, searchQuery, defaultOpen,
+  bucketKey, groups, placedSet, apCreditedSet, courseInfoMap, difficultyMap, searchQuery, defaultOpen,
 }: {
   bucketKey: BucketKey;
   groups: ReqGroup[];
   placedSet: Set<string>;
+  apCreditedSet: Set<string>;
   courseInfoMap: Record<string, CourseDetail>;
   difficultyMap: Record<string, number>;
   searchQuery: string;
@@ -997,6 +1028,7 @@ function BucketSection({
                 key={r.id}
                 req={r}
                 placedSet={placedSet}
+                apCreditedSet={apCreditedSet}
                 courseInfoMap={courseInfoMap}
                 difficultyMap={difficultyMap}
                 searchQuery={searchQuery}
@@ -1007,6 +1039,7 @@ function BucketSection({
                 key={r.id}
                 req={r}
                 placedSet={placedSet}
+                apCreditedSet={apCreditedSet}
                 courseInfoMap={courseInfoMap}
                 difficultyMap={difficultyMap}
                 searchQuery={searchQuery}
@@ -1022,10 +1055,12 @@ function BucketSection({
 // ── GE section ─────────────────────────────────────────────────────────────────
 
 function GESection({
-  req, placedSet, courseInfoMap, difficultyMap, searchQuery, initialOpen,
+  req, placedSet, apCreditedSet, apSatisfiedGEs, courseInfoMap, difficultyMap, searchQuery, initialOpen,
 }: {
   req: ReqGroup;
   placedSet: Set<string>;
+  apCreditedSet: Set<string>;
+  apSatisfiedGEs: Set<string>;
   courseInfoMap: Record<string, CourseDetail>;
   difficultyMap: Record<string, number>;
   searchQuery: string;
@@ -1045,10 +1080,12 @@ function GESection({
 
   if (filtered.length === 0) return null;
 
-  const satisfied = Math.min(
-    req.courses.filter((c) => placedSet.has(c)).length,
-    req.courses_needed,
-  );
+  // AP exam directly satisfies this GE category (e.g. AP World History → GE-VIII)
+  const apDirect = apSatisfiedGEs.has(req.requirement_group ?? "");
+
+  const satisfied = apDirect
+    ? req.courses_needed
+    : Math.min(req.courses.filter((c) => placedSet.has(c)).length, req.courses_needed);
   const done = satisfied >= req.courses_needed;
   const partial = !done && satisfied > 0;
   const accentColor = done ? "#22c55e" : partial ? "#3b82f6" : "transparent";
@@ -1071,6 +1108,11 @@ function GESection({
           )}
         </div>
         <div className="flex items-center gap-1.5 shrink-0">
+          {apDirect && (
+            <span className="text-[7px] font-bold uppercase tracking-wide px-1 py-[2px] rounded bg-emerald-900/40 border border-emerald-700/40 text-emerald-400">
+              AP
+            </span>
+          )}
           <span className="text-[9px] px-1.5 py-[2px] rounded bg-[#1e1e1e] font-mono tabular-nums text-[#555]">
             {satisfied}/{req.courses_needed}
           </span>
@@ -1086,6 +1128,7 @@ function GESection({
               title={courseInfoMap[cid]?.title}
               units={courseInfoMap[cid]?.min_units}
               isPlaced={placedSet.has(cid)}
+              isApCredit={apCreditedSet.has(cid)}
               unavailable={!courseInfoMap[cid]}
               diffScore={difficultyMap[cid] ?? null}
             />
@@ -1104,7 +1147,7 @@ export default function PlannerClient() {
   const [requirements, setRequirements] = useState<ReqGroup[]>([]);
   const [geRequirements, setGeRequirements] = useState<ReqGroup[]>([]);
   const [courseInfoMap, setCourseInfoMap] = useState<Record<string, CourseDetail>>({});
-  const [programNames, setProgramNames] = useState<Map<string, string>>(new Map());
+  // programNames removed — spec names now come from MajorOption.specialization_name
 
   // ── Error + retry state ────────────────────────────────────────────────────
   const [majorListError, setMajorListError] = useState<string | null>(null);
@@ -1131,13 +1174,25 @@ export default function PlannerClient() {
   const [prereqWarnings, setPrereqWarnings] = useState<Record<string, string>>({});
   const [difficultyMap, setDifficultyMap] = useState<Record<string, number>>({});
   const [optimizerOnline, setOptimizerOnline] = useState<boolean | null>(null);
+  const [apScores, setApScores] = useState<Record<string, number>>({});
+  const [apExamNames, setApExamNames] = useState<string[]>([]);
+  const [apCreditedSet, setApCreditedSet] = useState<Set<string>>(new Set());
+  const [apSatisfiedGEs, setApSatisfiedGEs] = useState<Set<string>>(new Set());
+  const [apSectionOpen, setApSectionOpen] = useState(false);
+  const [apSearch, setApSearch] = useState("");
+
+  const supabase = useMemo(() => createClient(), []);
+  const saveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const saveEnabledRef = useRef(false);
 
   // ── Derived ────────────────────────────────────────────────────────────────
   const placedSet = useMemo(() => {
     const s = new Set<string>();
     for (const ids of Object.values(plannedCourses)) ids.forEach((id) => s.add(id));
+    // AP-credited courses count as "placed" for sidebar coverage checks
+    apCreditedSet.forEach((id) => s.add(id));
     return s;
-  }, [plannedCourses]);
+  }, [plannedCourses, apCreditedSet]);
 
   const totalUnits = useMemo(
     () =>
@@ -1148,25 +1203,28 @@ export default function PlannerClient() {
     [plannedCourses, courseInfoMap],
   );
 
-  const majorGroups = useMemo(() => {
-    const map = new Map<string, string[]>();
-    for (const { major_id, display_name } of majorList) {
-      const ex = map.get(display_name);
-      if (ex) ex.push(major_id);
-      else map.set(display_name, [major_id]);
-    }
-    return map;
-  }, [majorList]);
+  // Parent majors: rows with no specialization_name — these populate the first dropdown
+  const parentMajors = useMemo(
+    () => majorList.filter((m) => !m.specialization_name),
+    [majorList],
+  );
 
+  // Specialization options for the currently selected parent major
   const specializations = useMemo(
-    () => (selectedDisplayName ? (majorGroups.get(selectedDisplayName) ?? []) : []),
-    [majorGroups, selectedDisplayName],
+    () =>
+      selectedDisplayName
+        ? majorList.filter((m) => m.display_name === selectedDisplayName && m.specialization_name)
+        : [],
+    [majorList, selectedDisplayName],
   );
 
   const selectedLabel = useMemo(() => {
     if (!selectedMajorId) return "";
-    return programNames.get(selectedMajorId) || selectedDisplayName || selectedMajorId;
-  }, [selectedMajorId, selectedDisplayName, programNames]);
+    const spec = specializations.find((s) => s.major_id === selectedMajorId);
+    return spec?.specialization_name
+      ? `${selectedDisplayName} — ${spec.specialization_name}`
+      : selectedDisplayName || selectedMajorId;
+  }, [selectedMajorId, selectedDisplayName, specializations]);
 
   const totalRequired = useMemo(
     () => requirements.reduce((s, r) => s + r.courses_needed, 0),
@@ -1198,6 +1256,49 @@ export default function PlannerClient() {
     } catch {}
   }, []);
 
+  // ── Load plan + sync profile on mount ─────────────────────────────────────
+  useEffect(() => {
+    supabase.auth.getUser().then(async ({ data }) => {
+      if (!data.user) { saveEnabledRef.current = true; return; }
+      const plan = await loadPlan();
+      if (plan) {
+        setPlannedCourses(plan.plannedCourses);
+        setSelectedMajorId(plan.selectedMajorId);
+        setSelectedDisplayName(plan.selectedDisplayName);
+        setGradQuarter(plan.gradQuarter);
+        setMaxUnits(plan.maxUnits);
+        setLockedCourses(new Set(plan.lockedCourses));
+        setApScores(plan.apScores);
+        setSummerYears(new Set(plan.summerYears));
+      }
+      saveEnabledRef.current = true;
+      syncUserProfile({
+        majorCode: plan?.selectedMajorId ?? "",
+        gradQuarter: plan?.gradQuarter ?? "2028_spring",
+        preferredMaxUnits: plan?.maxUnits ?? 19,
+      }).catch(() => {});
+    }).catch(() => { saveEnabledRef.current = true; });
+  }, [supabase]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // ── Auto-save (debounced 500ms) on plan state change ───────────────────────
+  useEffect(() => {
+    if (!saveEnabledRef.current) return;
+    if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
+    saveTimerRef.current = setTimeout(() => {
+      savePlan({
+        plannedCourses,
+        selectedMajorId,
+        selectedDisplayName,
+        gradQuarter,
+        maxUnits,
+        lockedCourses: [...lockedCourses],
+        apScores,
+        summerYears: [...summerYears],
+      }).catch(() => {});
+    }, 500);
+    return () => { if (saveTimerRef.current) clearTimeout(saveTimerRef.current); };
+  }, [plannedCourses, selectedMajorId, selectedDisplayName, gradQuarter, maxUnits, lockedCourses, apScores, summerYears]); // eslint-disable-line react-hooks/exhaustive-deps
+
   // ── Fetch major list ───────────────────────────────────────────────────────
   useEffect(() => {
     setMajorListError(null);
@@ -1205,6 +1306,24 @@ export default function PlannerClient() {
       .then(setMajorList)
       .catch((e: Error) => setMajorListError(e.message));
   }, [majorListRetry]);
+
+  // ── Fetch AP exam names once on mount ──────────────────────────────────────
+  useEffect(() => {
+    fetchApExamNames().then(setApExamNames).catch(() => {});
+  }, []);
+
+  // ── Re-resolve AP credits whenever apScores changes ────────────────────────
+  useEffect(() => {
+    resolveApCredits(apScores)
+      .then(({ courses, geGroups }: ApCreditResult) => {
+        setApCreditedSet(courses);
+        setApSatisfiedGEs(geGroups);
+      })
+      .catch(() => {
+        setApCreditedSet(new Set());
+        setApSatisfiedGEs(new Set());
+      });
+  }, [apScores]);
 
   // ── Fetch GE requirements ──────────────────────────────────────────────────
   useEffect(() => {
@@ -1232,9 +1351,8 @@ export default function PlannerClient() {
     }
     setLoadingReqs(true);
     setReqError(null);
-    // For specialization programs (multiple IDs share the same display name), also fetch
-    // the parent program rows — the parent API response captures spec-specific groups.
-    const parentId = specializations.length > 1
+    // For specialization rows, also fetch parent program requirements (merged coverage).
+    const parentId = specializations.length > 0
       ? selectedMajorId.replace(/[A-Z]$/, "")
       : undefined;
     fetchMajorRequirements(selectedMajorId, parentId)
@@ -1260,7 +1378,7 @@ export default function PlannerClient() {
       courses.forEach((courseId) => { lockedCourses[courseId] = quarter; });
     });
     if (Object.keys(lockedCourses).length === 0) return;
-    const payload = { locked_courses: lockedCourses, completed_courses: [] };
+    const payload = { locked_courses: lockedCourses, completed_courses: [], ap_scores: apScores };
     try {
       const res = await fetch("/api/validate-plan", {
         method: "POST",
@@ -1302,7 +1420,7 @@ export default function PlannerClient() {
     } catch {
       setOptimizerOnline(false);
     }
-  }, []);
+  }, [apScores]);
 
   // ── DnD ────────────────────────────────────────────────────────────────────
   const sensors = useSensors(
@@ -1358,14 +1476,20 @@ export default function PlannerClient() {
 
   // ── Handlers ───────────────────────────────────────────────────────────────
   const handleMajorNameChange = useCallback(
-    (dbDisplayName: string) => {
-      setSelectedDisplayName(dbDisplayName);
-      const ids = majorGroups.get(dbDisplayName) ?? [];
-      setSelectedMajorId(ids[0] ?? "");
+    (displayName: string) => {
+      setSelectedDisplayName(displayName);
       setRequirements([]);
       setReqError(null);
+      // Find specs for this parent; if none, use the parent's own major_id
+      const specs = majorList.filter((m) => m.display_name === displayName && m.specialization_name);
+      if (specs.length > 0) {
+        setSelectedMajorId(specs[0].major_id);
+      } else {
+        const parent = majorList.find((m) => m.display_name === displayName && !m.specialization_name);
+        setSelectedMajorId(parent?.major_id ?? "");
+      }
     },
-    [majorGroups],
+    [majorList],
   );
 
   const toggleLock = useCallback((id: string) => {
@@ -1471,22 +1595,23 @@ export default function PlannerClient() {
               />
             ) : (
               <MajorCombobox
-                options={majorList}
+                options={parentMajors}
                 selectedDisplayName={selectedDisplayName}
-                programNames={programNames}
                 onSelect={handleMajorNameChange}
                 loading={majorList.length === 0 && !majorListError}
               />
             )}
 
-            {specializations.length > 1 && (
+            {specializations.length > 0 && (
               <select
                 value={selectedMajorId}
                 onChange={(e) => setSelectedMajorId(e.target.value)}
                 className="w-full bg-[#111] border border-[#2a2a2a] rounded px-2.5 py-1.5 text-[11px] text-[#f0f0f0] focus:outline-none focus:border-[#3b82f6]/60"
               >
-                {specializations.map((id) => (
-                  <option key={id} value={id}>{programNames.get(id) || id}</option>
+                {specializations.map((spec) => (
+                  <option key={spec.major_id} value={spec.major_id}>
+                    {spec.specialization_name ?? spec.major_id}
+                  </option>
                 ))}
               </select>
             )}
@@ -1541,6 +1666,7 @@ export default function PlannerClient() {
                         bucketKey={key}
                         groups={bucketed[key]}
                         placedSet={placedSet}
+                        apCreditedSet={apCreditedSet}
                         courseInfoMap={courseInfoMap}
                         difficultyMap={difficultyMap}
                         searchQuery={searchQuery}
@@ -1574,6 +1700,8 @@ export default function PlannerClient() {
                     {geRequirements.map((r, i) => (
                       <GESection
                         key={r.id} req={r} placedSet={placedSet}
+                        apCreditedSet={apCreditedSet}
+                        apSatisfiedGEs={apSatisfiedGEs}
                         courseInfoMap={courseInfoMap} difficultyMap={difficultyMap}
                         searchQuery={searchQuery}
                         initialOpen={i === firstIncompleteGE}
@@ -1617,6 +1745,86 @@ export default function PlannerClient() {
               )}
             </div>
 
+            {/* AP Credits section */}
+            <div className="mb-2.5 border border-[#2a2a2a] rounded">
+              <button
+                onClick={() => setApSectionOpen((o) => !o)}
+                className="w-full flex items-center justify-between px-2 py-1.5 text-left"
+              >
+                <span className="text-[8px] font-bold uppercase tracking-[0.12em] text-[#333]">
+                  AP Credits
+                </span>
+                <span className="flex items-center gap-1.5">
+                  {Object.keys(apScores).length > 0 && (
+                    <span className="text-[8px] text-[#3b82f6] font-bold">
+                      {Object.keys(apScores).length} exam{Object.keys(apScores).length !== 1 ? "s" : ""}
+                    </span>
+                  )}
+                  <span className="text-[10px] text-[#444]">{apSectionOpen ? "▲" : "▼"}</span>
+                </span>
+              </button>
+              {apSectionOpen && (
+                <div className="border-t border-[#2a2a2a] px-2 pt-1.5 pb-2">
+                  <input
+                    type="text"
+                    value={apSearch}
+                    onChange={(e) => setApSearch(e.target.value)}
+                    placeholder="Search AP exams…"
+                    className="w-full rounded border border-[#2a2a2a] bg-[#141414] px-2 py-1 text-[9px] text-[#aaa] placeholder-[#444] focus:outline-none focus:border-[#3b82f6]/40 mb-1.5"
+                  />
+                  <div className="max-h-40 overflow-y-auto space-y-0.5">
+                    {apExamNames
+                      .filter((n) => !apSearch || n.toLowerCase().includes(apSearch.toLowerCase()))
+                      .map((examName) => {
+                        const score = apScores[examName];
+                        return (
+                          <div key={examName} className="flex items-center justify-between gap-1.5 py-0.5">
+                            <span className="text-[8.5px] text-[#666] leading-tight flex-1 min-w-0 truncate">
+                              {examName.replace(/^AP /, "")}
+                            </span>
+                            <div className="flex gap-0.5 shrink-0">
+                              {([3, 4, 5] as const).map((s) => (
+                                <button
+                                  key={s}
+                                  onClick={() =>
+                                    setApScores((prev) => {
+                                      if (prev[examName] === s) {
+                                        const next = { ...prev };
+                                        delete next[examName];
+                                        return next;
+                                      }
+                                      return { ...prev, [examName]: s };
+                                    })
+                                  }
+                                  className={`w-5 h-5 rounded text-[8px] font-bold transition-all
+                                    ${score === s
+                                      ? "bg-[#3b82f6] text-white"
+                                      : "bg-[#1a1a1a] border border-[#2a2a2a] text-[#444] hover:text-[#999]"
+                                    }`}
+                                >
+                                  {s}
+                                </button>
+                              ))}
+                            </div>
+                          </div>
+                        );
+                      })}
+                    {apExamNames.filter((n) => !apSearch || n.toLowerCase().includes(apSearch.toLowerCase())).length === 0 && (
+                      <p className="text-[8px] text-[#444] text-center py-2">No exams match</p>
+                    )}
+                  </div>
+                  {Object.keys(apScores).length > 0 && (
+                    <button
+                      onClick={() => setApScores({})}
+                      className="mt-1.5 w-full text-[8px] text-[#444] hover:text-[#666] text-center"
+                    >
+                      Clear all
+                    </button>
+                  )}
+                </div>
+              )}
+            </div>
+
             {toast && (
               <div className="flex items-start gap-1.5 mb-2 px-2 py-1.5 rounded bg-red-950/30 border border-red-900/40">
                 <span className="text-[9px] text-red-400 flex-1 leading-snug">{toast}</span>
@@ -1644,6 +1852,7 @@ export default function PlannerClient() {
                       graduation_quarter: gradQuarter,
                       units_per_quarter: maxUnits,
                       waived_ges: [],
+                      ap_scores: apScores,
                     }),
                   });
                   const data = await res.json();
