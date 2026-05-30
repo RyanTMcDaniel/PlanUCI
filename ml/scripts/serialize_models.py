@@ -39,19 +39,19 @@ def run_inference(encoder, classifier, texts: list[str], device: torch.device) -
 
 DIFFICULTY_SAMPLES = [
     (
-        "Department: WRITING. Course: WRITING39A. "
+        "Introduction to Writing and Rhetoric: "
         "Introduction to academic writing. Students develop critical thinking "
         "through short essay assignments with peer review and instructor feedback.",
         "easy",
     ),
     (
-        "Department: COMPSCI. Course: COMPSCI161. "
+        "Design and Analysis of Algorithms: "
         "Design and analysis of algorithms. Covers divide-and-conquer, dynamic "
         "programming, graph algorithms, NP-completeness, and approximation algorithms.",
         "medium/hard",
     ),
     (
-        "Department: MATH. Course: MATH205A. "
+        "Graduate Real Analysis: "
         "Graduate real analysis. Measure theory, Lebesgue integration, Hilbert "
         "spaces, Fourier analysis, and functional analysis. Rigorous proofs required.",
         "hard",
@@ -128,7 +128,7 @@ def main() -> None:
         "test_macro_f1": round(nlp_metrics["macro_f1"], 4),
         "test_accuracy": round(nlp_metrics["accuracy"], 4),
         "classes": diff_labels,
-        "input_format": "Department: {dept}. Course: {course_id}. {description}",
+        "input_format": "{title}: {description}",
         "output_format": "softmax probabilities over [easy, medium, hard]; argmax → tier label",
         "created_at": created_at,
     }

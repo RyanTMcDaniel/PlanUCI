@@ -82,7 +82,7 @@ async def lifespan(app: FastAPI):
     # ── Static data ──────────────────────────────────────────────────────────
     client = create_client(os.getenv("SUPABASE_URL"), os.getenv("SUPABASE_SERVICE_KEY"))
 
-    courses_raw = _fetch_all(client, "courses", "id,description,department")
+    courses_raw = _fetch_all(client, "courses", "id,title,description,department")
     ml["courses"] = {r["id"]: r for r in courses_raw}
 
     prof_df = pd.read_csv(PROF_FEATURES_CSV)

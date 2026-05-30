@@ -40,11 +40,8 @@ def collate_fn(batch):
 
 
 def format_text(df: pd.DataFrame) -> list[str]:
-    return (
-        "Department: " + df["department"] + ". "
-        "Course: " + df["course_id"] + ". "
-        + df["description"]
-    ).tolist()
+    title = df["title"].fillna(df["course_id"])
+    return (title + ": " + df["description"]).tolist()
 
 
 def encode(encoder: SentenceTransformer, texts: list[str], device: torch.device) -> torch.Tensor:

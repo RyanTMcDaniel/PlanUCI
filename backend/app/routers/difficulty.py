@@ -1,3 +1,4 @@
+import re
 import torch
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
@@ -7,6 +8,28 @@ from ..state import ml
 router = APIRouter()
 
 TIER_MIDPOINTS = {"easy": 2.0, "medium": 5.5, "hard": 9.0}
+
+
+_SEMINAR_KEYWORDS = {
+    "independent study", "independent research", "seminar", "proseminar",
+    "dissertation", "thesis", "internship", "special topics", "special studies",
+    "directed study", "directed research", "teaching assistant",
+}
+
+def apply_level_boost(course_id: str, base_score: float, title: str = "") -> float:
+    if title and any(kw in title.lower() for kw in _SEMINAR_KEYWORDS):
+        return base_score
+    match = re.search(r'(\d+)', course_id)
+    if not match:
+        return base_score
+    num = int(match.group(1))
+    if num < 100:
+        boost = 0.0
+    elif num < 150:
+        boost = 0.5
+    else:
+        boost = 0.8
+    return min(9.0, base_score + boost)
 
 
 def _infer(encoder, classifier, text: str, device) -> list[float]:
@@ -33,11 +56,8 @@ def difficulty_course(req: CourseRequest):
     if not course or not course.get("description"):
         raise HTTPException(404, f"Course {req.course_id!r} not found or has no description")
 
-    text = (
-        f"Department: {course.get('department', '')}. "
-        f"Course: {req.course_id}. "
-        f"{course['description']}"
-    )
+    title = course.get("title") or req.course_id
+    text = f"{title}: {course['description']}"
     probs = _infer(ml["diff_encoder"], ml["diff_classifier"], text, ml["device"])
 
     labels = ml["diff_labels"]
@@ -45,7 +65,11 @@ def difficulty_course(req: CourseRequest):
     tier = ml["diff_idx2label"][pred_idx]
     confidence = round(probs[pred_idx], 4)
     difficulty_score = round(
-        sum(p * TIER_MIDPOINTS[l] for p, l in zip(probs, labels)), 2
+        apply_level_boost(
+            req.course_id,
+            sum(p * TIER_MIDPOINTS[l] for p, l in zip(probs, labels)),
+            title,
+        ), 2
     )
 
     return {
