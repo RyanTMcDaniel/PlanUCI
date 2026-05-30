@@ -98,11 +98,8 @@ def fuzzy_match_names(
 
 def nlp_scores(encoder, classifier, courses_df: pd.DataFrame, device) -> pd.Series:
     """Run v2 classifier; convert softmax to 1–10 score: easy→2, medium→5.5, hard→9."""
-    texts = (
-        "Department: " + courses_df["department"] + ". "
-        "Course: " + courses_df["id"] + ". "
-        + courses_df["description"].fillna("")
-    ).tolist()
+    title = courses_df["title"].fillna(courses_df["id"])
+    texts = (title + ": " + courses_df["description"].fillna("")).tolist()
 
     encoder.eval()
     classifier.eval()
