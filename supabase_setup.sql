@@ -23,3 +23,35 @@ CREATE TABLE IF NOT EXISTS public.prof_course_features (
 
 ALTER TABLE public.prof_course_features ENABLE ROW LEVEL SECURITY;
 CREATE POLICY "public read" ON public.prof_course_features FOR SELECT TO anon USING (true);
+
+-- 3. user_profiles: per-user planner preferences
+CREATE TABLE IF NOT EXISTS public.user_profiles (
+  id                        UUID PRIMARY KEY REFERENCES auth.users(id) ON DELETE CASCADE,
+  major_code                TEXT,
+  graduation_target_year    INT,
+  graduation_target_quarter TEXT,
+  preferred_max_units       INT,
+  updated_at                TIMESTAMPTZ DEFAULT now()
+);
+
+ALTER TABLE public.user_profiles ENABLE ROW LEVEL SECURITY;
+-- Users can only read and write their own row
+CREATE POLICY "owner access" ON public.user_profiles
+  USING (auth.uid() = id)
+  WITH CHECK (auth.uid() = id);
+
+-- 4. saved_degree_plans: saved planner state per user
+CREATE TABLE IF NOT EXISTS public.saved_degree_plans (
+  id          BIGSERIAL PRIMARY KEY,
+  user_id     UUID NOT NULL REFERENCES auth.users(id) ON DELETE CASCADE,
+  name        TEXT NOT NULL DEFAULT 'My Plan',
+  plan_data   JSONB,
+  created_at  TIMESTAMPTZ DEFAULT now(),
+  updated_at  TIMESTAMPTZ DEFAULT now()
+);
+
+ALTER TABLE public.saved_degree_plans ENABLE ROW LEVEL SECURITY;
+-- Users can only read and write their own plans
+CREATE POLICY "owner access" ON public.saved_degree_plans
+  USING (auth.uid() = user_id)
+  WITH CHECK (auth.uid() = user_id);
