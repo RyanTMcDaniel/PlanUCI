@@ -68,6 +68,15 @@ export async function loadPlan(): Promise<PlanData | null> {
   return (data?.plan_data as PlanData) ?? null;
 }
 
+// ── Delete ────────────────────────────────────────────────────────────────────
+
+export async function deletePlan(): Promise<void> {
+  const supabase = createClient();
+  const { data: { user } } = await supabase.auth.getUser();
+  if (!user) return;
+  await supabase.from("saved_degree_plans").delete().eq("user_id", user.id);
+}
+
 // ── List (for /plans page) ────────────────────────────────────────────────────
 
 export interface SavedPlanMeta {
