@@ -25,7 +25,7 @@ import {
   resolveApCredits,
 } from "@/lib/api/courses";
 import { createClient } from "@/lib/supabase/client";
-import { savePlan, loadPlan, syncUserProfile } from "@/lib/api/plans";
+import { savePlan, loadPlan, syncUserProfile, deletePlan } from "@/lib/api/plans";
 // ── Types ─────────────────────────────────────────────────────────────────────
 
 type PlannedCourses = Record<string, string[]>;
@@ -1180,6 +1180,8 @@ export default function PlannerClient() {
   const [apSatisfiedGEs, setApSatisfiedGEs] = useState<Set<string>>(new Set());
   const [apSectionOpen, setApSectionOpen] = useState(false);
   const [apSearch, setApSearch] = useState("");
+  const [showClearConfirm, setShowClearConfirm] = useState(false);
+  const [clearSuccess, setClearSuccess] = useState(false);
 
   const supabase = useMemo(() => createClient(), []);
   const saveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -1893,8 +1895,56 @@ export default function PlannerClient() {
                 <><span>✦</span> Auto-fill Plan</>
               )}
             </button>
+
+            <button
+              onClick={() => setShowClearConfirm(true)}
+              className="w-full mt-1.5 rounded py-2 text-[11px] font-medium tracking-wide border border-red-900/50 text-red-500 hover:bg-red-950/30 hover:border-red-700/60 transition-all"
+            >
+              Clear Schedule
+            </button>
+
+            {clearSuccess && (
+              <p className="mt-1.5 text-center text-[10px] text-green-500">Schedule cleared</p>
+            )}
           </div>
         </aside>
+
+        {/* ── Clear Schedule confirmation dialog ───────────────────────────── */}
+        {showClearConfirm && (
+          <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm">
+            <div className="w-80 rounded-xl border border-white/[0.1] bg-[#1a1a1a] p-6 shadow-2xl">
+              <h2 className="text-sm font-semibold text-white mb-2">Clear Schedule?</h2>
+              <p className="text-xs text-zinc-400 leading-relaxed mb-5">
+                This will clear your entire schedule and AP scores. This cannot be undone.
+              </p>
+              <div className="flex gap-2">
+                <button
+                  onClick={() => setShowClearConfirm(false)}
+                  className="flex-1 rounded-lg border border-white/[0.1] py-2 text-xs font-medium text-zinc-300 hover:bg-white/[0.06] transition-colors"
+                >
+                  Cancel
+                </button>
+                <button
+                  onClick={async () => {
+                    setShowClearConfirm(false);
+                    setPlannedCourses({});
+                    setApScores({});
+                    setLockedCourses(new Set());
+                    setSummerYears(new Set());
+                    setGradQuarter("2028_spring");
+                    setMaxUnits(19);
+                    await deletePlan().catch(() => {});
+                    setClearSuccess(true);
+                    setTimeout(() => setClearSuccess(false), 2500);
+                  }}
+                  className="flex-1 rounded-lg bg-red-600 hover:bg-red-500 py-2 text-xs font-medium text-white transition-colors"
+                >
+                  Clear Schedule
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
 
         {/* ── Main ─────────────────────────────────────────────────────────── */}
         <main className="flex-1 flex flex-col overflow-hidden bg-[#111]">
