@@ -1186,6 +1186,9 @@ export default function PlannerClient() {
   const supabase = useMemo(() => createClient(), []);
   const saveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const saveEnabledRef = useRef(false);
+  const courseInfoMapRef = useRef<Record<string, CourseDetail>>({});
+  courseInfoMapRef.current = courseInfoMap;
+  const [globalResults, setGlobalResults] = useState<CourseDetail[]>([]);
 
   // ── Derived ────────────────────────────────────────────────────────────────
   const placedSet = useMemo(() => {
@@ -1300,6 +1303,49 @@ export default function PlannerClient() {
     }, 500);
     return () => { if (saveTimerRef.current) clearTimeout(saveTimerRef.current); };
   }, [plannedCourses, selectedMajorId, selectedDisplayName, gradQuarter, maxUnits, lockedCourses, apScores, summerYears]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // ── Auto-fetch details for placed courses not in courseInfoMap ────────────
+  useEffect(() => {
+    const placed = [...new Set(Object.values(plannedCourses).flat())];
+    const missing = placed.filter((id) => !courseInfoMapRef.current[id]);
+    if (missing.length === 0) return;
+    fetchCourseDetails(missing).then((details) => {
+      if (!details.length) return;
+      setCourseInfoMap((prev) => {
+        const next = { ...prev };
+        for (const c of details) next[c.id] = c;
+        return next;
+      });
+      fetchDifficulties(missing);
+    }).catch(() => {});
+  }, [plannedCourses, fetchDifficulties]);
+
+  // ── Global course search (any course, not just requirements) ──────────────
+  useEffect(() => {
+    const q = searchQuery.trim();
+    if (q.length < 2) { setGlobalResults([]); return; }
+    const timer = setTimeout(async () => {
+      try {
+        const qNorm = q.replace(/\s+/g, "").toUpperCase();
+        const { data } = await supabase
+          .from("courses")
+          .select("id, title, min_units, description, course_level, terms, avg_gpa")
+          .or(`id.ilike.${qNorm}%,title.ilike.%${q}%`)
+          .limit(20);
+        const results = (data ?? []) as CourseDetail[];
+        setGlobalResults(results);
+        if (results.length > 0) {
+          setCourseInfoMap((prev) => {
+            const next = { ...prev };
+            for (const c of results) next[c.id] = c;
+            return next;
+          });
+          fetchDifficulties(results.map((c) => c.id));
+        }
+      } catch { setGlobalResults([]); }
+    }, 250);
+    return () => clearTimeout(timer);
+  }, [searchQuery, supabase, fetchDifficulties]);
 
   // ── Fetch major list ───────────────────────────────────────────────────────
   useEffect(() => {
@@ -1679,6 +1725,29 @@ export default function PlannerClient() {
                       <p className="text-[10px] text-[#333] text-center py-12">
                         Search for your major above
                       </p>
+                    )}
+
+                    {/* ── Global search results ── */}
+                    {searchQuery.trim().length >= 2 && globalResults.length > 0 && (
+                      <div className="mx-1 mt-2 mb-1">
+                        <p className="text-[8px] font-bold uppercase tracking-[0.15em] text-[#444] px-1 pb-1">
+                          All Courses
+                        </p>
+                        <div className="grid grid-cols-3 gap-1 p-1.5 bg-[#0f0f0f] rounded">
+                          {globalResults.map((c) => (
+                            <CoursePill
+                              key={c.id}
+                              courseId={c.id}
+                              title={c.title}
+                              units={c.min_units}
+                              isPlaced={placedSet.has(c.id)}
+                              isApCredit={apCreditedSet.has(c.id)}
+                              unavailable={false}
+                              diffScore={difficultyMap[c.id] ?? null}
+                            />
+                          ))}
+                        </div>
+                      </div>
                     )}
                   </>
                 )}

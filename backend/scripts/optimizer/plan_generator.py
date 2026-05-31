@@ -77,10 +77,13 @@ class GenerationResult:
     # requirement_group → list of course IDs selected from that group
     group_map:          dict[str, list[str]] = field(default_factory=dict)
     # Courses that could not be scheduled even after dynamic window extension.
-    # Frontend should display these as "could not be scheduled within 4 years."
     overflow_courses:   list[str] = field(default_factory=list)
     # How many extra quarters were appended beyond graduation_quarter (0 = none needed).
     extended_by:        int = 0
+    # Course IDs satisfied by AP credit (excluded from the plan).
+    ap_credited_courses: list[str] = field(default_factory=list)
+    # Total UCI units awarded via AP credit.
+    ap_units_awarded:    int = 0
 
 
 # ── Quarter helpers ───────────────────────────────────────────────────────────
@@ -213,21 +216,90 @@ def _get_prereq_depths(client, norm_ids: list[str]) -> dict[str, int]:
 
 # ── Requirement loading ───────────────────────────────────────────────────────
 
+def _resolve_ap_credits(
+    client,
+    ap_scores: dict[str, int],
+    completed_norm: set[str],
+) -> tuple[list[str], int]:
+    """
+    Look up ap_credits rows for the given ap_scores dict.
+    Returns (credited_course_ids, total_units_awarded).
+
+    A score of N grants credit from all rows where ap_score <= N, so a user
+    with score 5 automatically inherits the 3-row and 4-row equivalencies too.
+    Credited courses are added to completed_norm in-place.
+    """
+    if not ap_scores:
+        return [], 0
+
+    exam_names = list(ap_scores.keys())
+    try:
+        rows = (
+            client.table("ap_credits")
+            .select("ap_course_name,ap_score,units_awarded,course_equivalencies")
+            .in_("ap_course_name", exam_names)
+            .execute()
+            .data
+        ) or []
+    except Exception as exc:
+        print(f"[AP credits] WARNING: fetch failed: {exc}")
+        return [], 0
+
+    credited: list[str] = []
+    total_units = 0
+    seen_units: set[str] = set()  # track per-exam to avoid double-counting units
+
+    for row in rows:
+        exam   = row["ap_course_name"]
+        needed = ap_scores.get(exam)
+        if needed is None or row["ap_score"] > needed:
+            continue
+
+        # Count units for the highest qualifying row only (one entry per exam)
+        units_key = f"{exam}:{row['ap_score']}"
+        if units_key not in seen_units:
+            seen_units.add(units_key)
+            total_units += row.get("units_awarded") or 0
+
+        for cid in (row.get("course_equivalencies") or []):
+            norm = _norm(cid)
+            if norm not in completed_norm:
+                completed_norm.add(norm)
+                credited.append(cid)
+
+    if credited:
+        print(f"[AP credits] {len(credited)} courses credited from {len(ap_scores)} exams "
+              f"(~{total_units} units): {credited}")
+
+    return credited, total_units
+
+
 def _collect_courses(
     client,
     major_id: str,
     completed_norm: set[str],
     waived_ges: list[str],
-) -> tuple[list[str], dict[str, list[str]]]:
-    """Return (flat_list, group_map) of courses still needed.
+    specialization_id: str | None = None,
+    ap_scores: dict[str, int] | None = None,
+) -> tuple[list[str], dict[str, list[str]], list[str], int]:
+    """Return (flat_list, group_map, ap_credited, ap_units) of courses still needed.
 
     Queries both the major's own requirements and the university-wide GE rows
     (major_id = "ALL_MAJORS").  GE groups whose requirement_group appears in
     waived_ges are skipped entirely.
 
+    Also merges rows from catalogue_requirements (scraped directly from the UCI
+    catalogue) when available.  Catalogue rows with the same group_name as an
+    API row take precedence; new group_names are appended.
+
+    AP scores are resolved first: their course equivalencies are added to
+    completed_norm so the planner treats them as already satisfied.
+
     group_map maps requirement_group → list of course IDs selected from it,
     which callers can use to audit GE coverage.
     """
+    # Resolve AP credit before loading requirements so equivalencies are excluded
+    ap_credited, ap_units = _resolve_ap_credits(client, ap_scores or {}, completed_norm)
     major_rows = (
         client.table("major_requirements")
         .select("requirement_group,group_name,requirement_type,courses,courses_needed,waivable")
@@ -265,6 +337,100 @@ def _collect_courses(
         )
     else:
         print(f"[FIX 1] {major_id!r}: {len(major_rows)} rows (no parent merge needed)")
+
+    # Catalogue merge — supplement/override API rows with scraped catalogue data.
+    # The catalogue scraper uses its own major_id values that may differ from the
+    # Anteater API IDs (e.g. Applied Math stores all specs under "BS-0K6C" while
+    # the API uses "BS-0K6A" for Data Science).  Resolve dynamically:
+    #   1. Look up major_name + specialization_name for this major_id
+    #   2. Find which sibling major_id (same major_name) has catalogue rows
+    #   3. Derive the spec slug from specialization_name (e.g. "Data Science" → "data-science")
+    try:
+        # ── Step 1: resolve catalogue major_id and spec slug ──────────────────
+        cat_major_id = major_id
+        cat_spec_id: str | None = None
+
+        name_meta = (
+            client.table("major_requirements")
+            .select("major_name,specialization_name")
+            .eq("major_id", major_id)
+            .limit(1)
+            .execute()
+            .data
+        )
+        if name_meta:
+            major_name = (name_meta[0].get("major_name") or "").strip()
+            spec_name  = (name_meta[0].get("specialization_name") or "").strip()
+            if spec_name:
+                cat_spec_id = spec_name.lower().replace(" ", "-")
+
+            # Find all major_ids sharing this program name, then probe catalogue
+            sibling_rows = (
+                client.table("major_requirements")
+                .select("major_id")
+                .eq("major_name", major_name)
+                .execute()
+                .data
+            )
+            sibling_ids = sorted({r["major_id"] for r in sibling_rows})
+            for sid in sibling_ids:
+                probe = (
+                    client.table("catalogue_requirements")
+                    .select("major_id")
+                    .eq("major_id", sid)
+                    .limit(1)
+                    .execute()
+                    .data
+                )
+                if probe:
+                    cat_major_id = sid
+                    break
+
+        # ── Step 2: fetch core + spec catalogue rows ──────────────────────────
+        cat_core = (
+            client.table("catalogue_requirements")
+            .select("group_name,requirement_type,courses,courses_needed")
+            .eq("major_id", cat_major_id)
+            .is_("specialization_id", "null")
+            .execute()
+            .data
+        ) or []
+
+        cat_spec: list[dict] = []
+        if cat_spec_id:
+            cat_spec = (
+                client.table("catalogue_requirements")
+                .select("group_name,requirement_type,courses,courses_needed")
+                .eq("major_id", cat_major_id)
+                .eq("specialization_id", cat_spec_id)
+                .execute()
+                .data
+            ) or []
+
+        cat_rows = cat_core + cat_spec
+        if cat_rows:
+            cat_shaped = [
+                {
+                    "requirement_group": r["group_name"],
+                    "group_name":        r["group_name"],
+                    "requirement_type":  r["requirement_type"],
+                    "courses":           r["courses"],
+                    "courses_needed":    r["courses_needed"],
+                    "waivable":          False,
+                }
+                for r in cat_rows
+            ]
+            cat_names = {r["group_name"] for r in cat_rows}
+            major_rows = [r for r in major_rows if r.get("group_name") not in cat_names]
+            major_rows.extend(cat_shaped)
+            print(
+                f"[catalogue] {major_id!r} → cat={cat_major_id!r}: merged {len(cat_rows)} rows "
+                f"({len(cat_core)} core + {len(cat_spec)} spec={cat_spec_id!r})"
+            )
+        else:
+            print(f"[catalogue] {major_id!r} → cat={cat_major_id!r}: no catalogue rows found")
+    except Exception as _cat_exc:
+        print(f"[catalogue] WARNING: catalogue_requirements fetch failed: {_cat_exc}")
 
     ge_rows = (
         client.table("major_requirements")
@@ -386,7 +552,7 @@ def _collect_courses(
             entries = group_map[rg]
             print(f"  {rg}: {len(entries)} course(s) → {entries}")
 
-    return selected, group_map
+    return selected, group_map, ap_credited, ap_units
 
 
 # ── Feasibility check ─────────────────────────────────────────────────────────
@@ -858,6 +1024,8 @@ def generate(
     graduation_quarter: str,
     units_per_quarter: int = 16,
     waived_ges: list[str] | None = None,
+    specialization_id: str | None = None,
+    ap_scores: dict[str, int] | None = None,
 ) -> GenerationResult:
     """Generate up to 3 optimized plan variants for a major.
 
@@ -879,9 +1047,11 @@ def generate(
     _load_aliases(client)  # FIX 6: build alias map before any _norm() calls
     completed_norm = {_norm(c) for c in completed_courses}
 
-    # 1. Collect courses still needed (major + GE)
-    courses_to_plan, group_map = _collect_courses(
-        client, major_id, completed_norm, waived_ges
+    # 1. Collect courses still needed (major + GE + catalogue supplement)
+    # AP scores are resolved inside _collect_courses; their equivalencies are
+    # added to completed_norm so they are excluded from the plan automatically.
+    courses_to_plan, group_map, ap_credited, ap_units = _collect_courses(
+        client, major_id, completed_norm, waived_ges, specialization_id, ap_scores
     )
     if not courses_to_plan:
         return GenerationResult(variants=[])
@@ -957,9 +1127,13 @@ def generate(
 
     # graduation_year: use the last quarter in the working window
     grad_year = int(working_quarters[-1].split("_")[0])
+    # AP-credited courses were added to completed_norm (used by the scheduler) but
+    # CoursePlan.completed_courses is what prereqs_satisfied checks.  Include them
+    # so the optimizer and prereq screener see AP courses as already completed.
+    effective_completed = list(completed_courses) + ap_credited
     base_plan = CoursePlan(
         major_id=major_id,
-        completed_courses=completed_courses,
+        completed_courses=effective_completed,
         planned_courses={q: cs for q, cs in plan_dict.items() if cs},
         graduation_year=grad_year,
         units_per_quarter=units_per_quarter,
@@ -1006,5 +1180,7 @@ def generate(
         group_map=group_map,
         overflow_courses=list(overflow),
         extended_by=extended_by,
+        ap_credited_courses=ap_credited,
+        ap_units_awarded=ap_units,
     )
 
