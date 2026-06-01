@@ -110,7 +110,7 @@ def suggest_swaps(
     effective_norm = completed_norm | scheduled_norm
 
     # Unscheduled required courses (major + GE, respecting group sizes)
-    raw_candidates, _ = _collect_courses(client, major_id, effective_norm, [])
+    raw_candidates, _, _, _ = _collect_courses(client, major_id, effective_norm, [])
     # Drop course_id itself (it's still "needed" because we excluded it above)
     candidates = [c for c in raw_candidates if _norm(c) != norm_target]
     if not candidates:

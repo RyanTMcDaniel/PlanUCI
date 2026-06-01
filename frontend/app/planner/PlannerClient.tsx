@@ -14,6 +14,7 @@ import {
 } from "@dnd-kit/core";
 import { CSS } from "@dnd-kit/utilities";
 import { type MajorOption, fetchMajors } from "@/lib/api/majors";
+import { type MinorOption, fetchMinors, fetchMinorRequirements } from "@/lib/api/minors";
 import {
   type ReqGroup,
   type CourseDetail,
@@ -72,8 +73,11 @@ function abbrevQuarter(q: string): string {
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
+// Calendar anchor for the qkey scheme — keeps plannedCourses keys (e.g.
+// "2026_fall") stable.  The planner is now purely structural: years are
+// labelled "Year 1..N" and the calendar year only feeds the quarter key.
 const START_YEAR = 2026;
-const YEARS = [1, 2, 3, 4];
+const DEFAULT_YEARS = 4;
 const BASE_QUARTERS = [
   { key: "fall",   label: "Fall"   },
   { key: "winter", label: "Winter" },
@@ -88,35 +92,9 @@ function qkey(year: number, q: string) {
   return `${calYear}_${q}`;
 }
 
-function generateGradOptions() {
-  const out: { value: string; label: string }[] = [];
-  // Emit quarters in chronological academic-year order:
-  // Fall(N) → Winter(N+1) → Spring(N+1)  for each planner year
-  const seasons: Array<{ key: string; offset: number }> = [
-    { key: "fall",   offset: 0 },
-    { key: "winter", offset: 1 },
-    { key: "spring", offset: 1 },
-  ];
-  for (let yr = 1; yr <= 8; yr++) {
-    const fallYear = START_YEAR + yr - 1;
-    for (const { key, offset } of seasons) {
-      const calYear = fallYear + offset;
-      out.push({
-        value: `${calYear}_${key}`,
-        label: `${key[0].toUpperCase() + key.slice(1)} ${calYear}`,
-      });
-    }
-    if (fallYear >= 2033) break;
-  }
-  return out;
-}
-
-const GRAD_OPTIONS = generateGradOptions();
-
 const UNIT_PRESETS: { label: string; value: number; warning: boolean }[] = [
-  { label: "Standard", value: 19, warning: false },
-  { label: "Heavy",    value: 20, warning: true  },
-  { label: "Overload", value: 22, warning: true  },
+  { label: "Standard 16 Units", value: 16, warning: false },
+  { label: "Heavy 20 Units",    value: 20, warning: true  },
 ];
 
 function diffColor(level: string | null | undefined): string {
@@ -221,6 +199,31 @@ function calculateQuarterDifficulty(courses: CourseWithDifficulty[]): QuarterDif
   const combined = Math.min(10, adjustedDifficulty * 0.6 + unitComponent * 0.4);
 
   return { combined, difficultyComponent: adjustedDifficulty, unitComponent, totalUnits };
+}
+
+// ── Lock conflict helpers ──────────────────────────────────────────────────────
+
+function fmtCourse(id: string): string {
+  // "MATH2D" → "MATH 2D",  "PHYSICS7C" → "PHYSICS 7C",  "I&CSCI31" → "I&CSCI 31"
+  return id.replace(/^([A-Za-z&]+)(\d.*)$/, "$1 $2");
+}
+
+function parseLockConflict(conflict: string): string {
+  if (conflict.includes(" missing prereq: ")) {
+    const [cid, req] = conflict.split(" missing prereq: ");
+    return `${fmtCourse(cid.trim())} requires ${fmtCourse(req.trim())} to be scheduled first`;
+  }
+  const courseId = conflict.split(" locked to")[0]?.trim() ?? "";
+  const afterColon = conflict.split(": ").slice(1).join(": ");
+  const blocker = afterColon
+    .replace(" must be placed in an earlier quarter", "")
+    .split(",")[0]
+    .split(" (")[0]
+    .trim();
+  if (blocker && !blocker.startsWith("a ")) {
+    return `${fmtCourse(courseId)} requires ${fmtCourse(blocker)} to be scheduled first`;
+  }
+  return `${fmtCourse(courseId)} has a prerequisite ordering conflict`;
 }
 
 // ── Icons ─────────────────────────────────────────────────────────────────────
@@ -336,6 +339,99 @@ function MajorCombobox({
               className="w-full text-left px-2.5 py-[7px] text-[11px] text-[#bbb] hover:bg-[#252525] hover:text-[#f0f0f0] transition-colors"
             >
               {opt.display_name}
+            </button>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ── Minor combobox ────────────────────────────────────────────────────────────
+// Mirrors MajorCombobox but minors are flat (no specializations).
+
+function MinorCombobox({
+  options, selectedMinorId, onSelect, loading,
+}: {
+  options: MinorOption[];
+  selectedMinorId: string;
+  onSelect: (minorId: string) => void;
+  loading: boolean;
+}) {
+  const [query, setQuery] = useState("");
+  const [open, setOpen] = useState(false);
+  const containerRef = useRef<HTMLDivElement>(null);
+  const inputRef = useRef<HTMLInputElement>(null);
+
+  const selectedName = useMemo(
+    () => options.find((o) => o.minor_id === selectedMinorId)?.name ?? "",
+    [options, selectedMinorId],
+  );
+
+  useEffect(() => {
+    if (!open) setQuery(selectedName);
+  }, [selectedName, open]);
+
+  useEffect(() => {
+    function onMouseDown(e: MouseEvent) {
+      if (containerRef.current && !containerRef.current.contains(e.target as Node)) {
+        setOpen(false);
+        setQuery(selectedName);
+      }
+    }
+    document.addEventListener("mousedown", onMouseDown);
+    return () => document.removeEventListener("mousedown", onMouseDown);
+  }, [selectedName]);
+
+  const filtered = useMemo(() => {
+    const q = query.trim().toLowerCase();
+    return options
+      .filter((o) => !q || o.name.toLowerCase().includes(q))
+      .slice(0, 40);
+  }, [options, query]);
+
+  function handleSelect(opt: MinorOption) {
+    onSelect(opt.minor_id);
+    setQuery(opt.name);
+    setOpen(false);
+  }
+
+  function handleKeyDown(e: React.KeyboardEvent) {
+    if (e.key === "Escape") {
+      setOpen(false);
+      setQuery(selectedName);
+      inputRef.current?.blur();
+    }
+    if (e.key === "Enter" && filtered.length > 0) handleSelect(filtered[0]);
+  }
+
+  return (
+    <div ref={containerRef} className="relative">
+      <div className="relative">
+        <input
+          ref={inputRef}
+          type="text"
+          value={query}
+          onChange={(e) => { setQuery(e.target.value); setOpen(true); }}
+          onFocus={() => setOpen(true)}
+          onKeyDown={handleKeyDown}
+          placeholder={loading ? "Loading minors…" : "Search for a minor..."}
+          disabled={loading && options.length === 0}
+          className="w-full bg-[#111] border border-[#2a2a2a] rounded px-2.5 py-1.5 text-[11px] text-[#f0f0f0] placeholder-[#444] focus:outline-none focus:border-[#3b82f6]/60 disabled:opacity-50 pr-6"
+        />
+        <svg className="absolute right-2 top-1/2 -translate-y-1/2 w-3 h-3 text-[#444] pointer-events-none" viewBox="0 0 12 12" fill="none">
+          <path d="M2 4l4 4 4-4" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round"/>
+        </svg>
+      </div>
+      {open && filtered.length > 0 && (
+        <div className="absolute z-50 top-full left-0 right-0 mt-px bg-[#1a1a1a] border border-[#2a2a2a] rounded max-h-52 overflow-y-auto shadow-xl">
+          {filtered.map((opt) => (
+            <button
+              key={opt.minor_id}
+              onMouseDown={() => handleSelect(opt)}
+              className="w-full text-left px-2.5 py-[7px] text-[11px] text-[#bbb] hover:bg-[#252525] hover:text-[#f0f0f0] transition-colors"
+            >
+              {opt.name}
             </button>
           ))}
         </div>
@@ -713,7 +809,7 @@ function QuarterCell({
           return (
             <span
               className={`text-[9px] ml-auto mr-1 ${overload ? "text-amber-500 font-semibold" : "text-[#555]"}`}
-              title={overload ? `⚠ Exceeds ${maxUnitsPerQuarter ?? 19}-unit cap` : undefined}
+              title={overload ? `⚠ Exceeds ${maxUnitsPerQuarter ?? 16}-unit cap` : undefined}
             >
               {overload && "⚠ "}{units} UNITS
             </span>
@@ -1146,6 +1242,8 @@ export default function PlannerClient() {
   const [majorList, setMajorList] = useState<MajorOption[]>([]);
   const [requirements, setRequirements] = useState<ReqGroup[]>([]);
   const [geRequirements, setGeRequirements] = useState<ReqGroup[]>([]);
+  const [minorList, setMinorList] = useState<MinorOption[]>([]);
+  const [minorRequirements, setMinorRequirements] = useState<ReqGroup[]>([]);
   const [courseInfoMap, setCourseInfoMap] = useState<Record<string, CourseDetail>>({});
   // programNames removed — spec names now come from MajorOption.specialization_name
 
@@ -1156,13 +1254,19 @@ export default function PlannerClient() {
   const [majorListRetry, setMajorListRetry] = useState(0);
   const [reqRetry, setReqRetry] = useState(0);
   const [geRetry, setGeRetry] = useState(0);
+  const [minorListError, setMinorListError] = useState<string | null>(null);
+  const [minorReqError, setMinorReqError] = useState<string | null>(null);
+  const [minorListRetry, setMinorListRetry] = useState(0);
+  const [minorReqRetry, setMinorReqRetry] = useState(0);
+  const [loadingMinorReqs, setLoadingMinorReqs] = useState(false);
 
   // ── UI state ───────────────────────────────────────────────────────────────
-  const [sidebarTab, setSidebarTab] = useState<"major" | "ge">("major");
+  const [sidebarTab, setSidebarTab] = useState<"major" | "ge" | "minor">("major");
   const [selectedDisplayName, setSelectedDisplayName] = useState("");
   const [selectedMajorId, setSelectedMajorId] = useState("");
-  const [gradQuarter, setGradQuarter]   = useState("2028_spring");
-  const [maxUnits,    setMaxUnits]      = useState(19);
+  const [selectedMinorId, setSelectedMinorId] = useState("");
+  const [numYears,    setNumYears]      = useState(DEFAULT_YEARS);
+  const [maxUnits,    setMaxUnits]      = useState(16);
   const [plannedCourses, setPlannedCourses] = useState<PlannedCourses>({});
   const [activeData, setActiveData] = useState<DragData | null>(null);
   const [loadingReqs, setLoadingReqs] = useState(false);
@@ -1181,6 +1285,8 @@ export default function PlannerClient() {
   const [apSectionOpen, setApSectionOpen] = useState(false);
   const [apSearch, setApSearch] = useState("");
   const [showClearConfirm, setShowClearConfirm] = useState(false);
+  const [lockConflictErrors, setLockConflictErrors] = useState<string[] | null>(null);
+  const [pendingLock, setPendingLock] = useState<{ courseId: string; warnings: string[] } | null>(null);
   const [clearSuccess, setClearSuccess] = useState(false);
 
   const supabase = useMemo(() => createClient(), []);
@@ -1191,6 +1297,11 @@ export default function PlannerClient() {
   const [globalResults, setGlobalResults] = useState<CourseDetail[]>([]);
 
   // ── Derived ────────────────────────────────────────────────────────────────
+  // Graduation quarter is structural, no longer a user input: the Spring of the
+  // last displayed year. Kept so optimizer/profile/save calls remain valid until
+  // the optimizer is rewired separately.
+  const gradQuarter = useMemo(() => qkey(numYears, "spring"), [numYears]);
+
   const placedSet = useMemo(() => {
     const s = new Set<string>();
     for (const ids of Object.values(plannedCourses)) ids.forEach((id) => s.add(id));
@@ -1242,6 +1353,17 @@ export default function PlannerClient() {
     [placedSet, requirements],
   );
 
+  const minorTotalRequired = useMemo(
+    () => minorRequirements.reduce((s, r) => s + r.courses_needed, 0),
+    [minorRequirements],
+  );
+
+  const minorPlacedRequired = useMemo(
+    () =>
+      [...placedSet].filter((id) => minorRequirements.some((r) => r.courses.includes(id))).length,
+    [placedSet, minorRequirements],
+  );
+
   // Programs API (anteaterapi.com/v2/rest/programs) is IP-banned until the
   // Cloudflare block from rate-limit abuse clears. Spec names fall back to
   // raw major_id codes until then.
@@ -1270,7 +1392,8 @@ export default function PlannerClient() {
         setPlannedCourses(plan.plannedCourses);
         setSelectedMajorId(plan.selectedMajorId);
         setSelectedDisplayName(plan.selectedDisplayName);
-        setGradQuarter(plan.gradQuarter);
+        setSelectedMinorId(plan.selectedMinorId ?? "");
+        setNumYears(plan.numYears ?? DEFAULT_YEARS);
         setMaxUnits(plan.maxUnits);
         setLockedCourses(new Set(plan.lockedCourses));
         setApScores(plan.apScores);
@@ -1279,8 +1402,8 @@ export default function PlannerClient() {
       saveEnabledRef.current = true;
       syncUserProfile({
         majorCode: plan?.selectedMajorId ?? "",
-        gradQuarter: plan?.gradQuarter ?? "2028_spring",
-        preferredMaxUnits: plan?.maxUnits ?? 19,
+        gradQuarter: qkey(plan?.numYears ?? DEFAULT_YEARS, "spring"),
+        preferredMaxUnits: plan?.maxUnits ?? 16,
       }).catch(() => {});
     }).catch(() => { saveEnabledRef.current = true; });
   }, [supabase]); // eslint-disable-line react-hooks/exhaustive-deps
@@ -1294,7 +1417,9 @@ export default function PlannerClient() {
         plannedCourses,
         selectedMajorId,
         selectedDisplayName,
-        gradQuarter,
+        selectedMinorId,
+        numYears,
+        gradQuarter,         // derived (Spring of last year); kept for /plans + optimizer
         maxUnits,
         lockedCourses: [...lockedCourses],
         apScores,
@@ -1302,7 +1427,7 @@ export default function PlannerClient() {
       }).catch(() => {});
     }, 500);
     return () => { if (saveTimerRef.current) clearTimeout(saveTimerRef.current); };
-  }, [plannedCourses, selectedMajorId, selectedDisplayName, gradQuarter, maxUnits, lockedCourses, apScores, summerYears]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [plannedCourses, selectedMajorId, selectedDisplayName, selectedMinorId, numYears, gradQuarter, maxUnits, lockedCourses, apScores, summerYears]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // ── Auto-fetch details for placed courses not in courseInfoMap ────────────
   useEffect(() => {
@@ -1354,6 +1479,14 @@ export default function PlannerClient() {
       .then(setMajorList)
       .catch((e: Error) => setMajorListError(e.message));
   }, [majorListRetry]);
+
+  // ── Fetch minor list ───────────────────────────────────────────────────────
+  useEffect(() => {
+    setMinorListError(null);
+    fetchMinors()
+      .then(setMinorList)
+      .catch((e: Error) => setMinorListError(e.message));
+  }, [minorListRetry]);
 
   // ── Fetch AP exam names once on mount ──────────────────────────────────────
   useEffect(() => {
@@ -1418,6 +1551,30 @@ export default function PlannerClient() {
       .catch((e: Error) => setReqError(e.message))
       .finally(() => setLoadingReqs(false));
   }, [selectedMajorId, reqRetry, fetchDifficulties]);
+
+  // ── Fetch minor requirements + course details ───────────────────────────────
+  useEffect(() => {
+    if (!selectedMinorId) {
+      setMinorRequirements([]);
+      return;
+    }
+    setLoadingMinorReqs(true);
+    setMinorReqError(null);
+    fetchMinorRequirements(selectedMinorId)
+      .then(async (reqs) => {
+        setMinorRequirements(reqs);
+        const allIds = [...new Set(reqs.flatMap((r) => r.courses))];
+        const details = await fetchCourseDetails(allIds);
+        setCourseInfoMap((prev) => {
+          const next = { ...prev };
+          for (const c of details) next[c.id] = c;
+          return next;
+        });
+        fetchDifficulties(allIds);
+      })
+      .catch((e: Error) => setMinorReqError(e.message))
+      .finally(() => setLoadingMinorReqs(false));
+  }, [selectedMinorId, minorReqRetry, fetchDifficulties]);
 
   // ── Prereq validation ──────────────────────────────────────────────────────
   const validatePlan = useCallback(async (placed: PlannedCourses) => {
@@ -1540,13 +1697,52 @@ export default function PlannerClient() {
     [majorList],
   );
 
-  const toggleLock = useCallback((id: string) => {
-    setLockedCourses((prev) => {
-      const next = new Set(prev);
-      next.has(id) ? next.delete(id) : next.add(id);
-      return next;
-    });
-  }, []);
+  const toggleLock = useCallback(async (id: string) => {
+    // Unlocking — always immediate, no validation needed
+    if (lockedCourses.has(id)) {
+      setLockedCourses((prev) => { const n = new Set(prev); n.delete(id); return n; });
+      return;
+    }
+
+    // Find which quarter this course currently lives in
+    const quarter = Object.entries(plannedCourses).find(([, cs]) => cs.includes(id))?.[0];
+    if (!quarter) {
+      setLockedCourses((prev) => new Set([...prev, id]));
+      return;
+    }
+
+    // Build locked_courses: the new course + already-locked courses
+    const toValidate: Record<string, string> = { [id]: quarter };
+    for (const [q, cs] of Object.entries(plannedCourses)) {
+      for (const c of cs) {
+        if (lockedCourses.has(c)) toValidate[c] = q;
+      }
+    }
+
+    try {
+      const res = await fetch("/api/validate-plan", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ locked_courses: toValidate, completed_courses: [], ap_scores: apScores }),
+      });
+      if (!res.ok) {
+        setLockedCourses((prev) => new Set([...prev, id]));
+        return;
+      }
+      const data = await res.json() as { valid: boolean; conflicts: string[] };
+      const myConflicts = (data.conflicts ?? []).filter(
+        (c) => c.startsWith(id + " missing prereq:") || c.startsWith(id + " locked to")
+      );
+      if (!myConflicts.length) {
+        setLockedCourses((prev) => new Set([...prev, id]));
+        return;
+      }
+      setPendingLock({ courseId: id, warnings: myConflicts });
+    } catch {
+      // Validation offline — lock anyway
+      setLockedCourses((prev) => new Set([...prev, id]));
+    }
+  }, [lockedCourses, plannedCourses, apScores]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const removeCourse = useCallback((id: string, qKey: string) => {
     setPlannedCourses((prev) => {
@@ -1585,6 +1781,8 @@ export default function PlannerClient() {
     });
   }, []);
 
+  const addYear = useCallback(() => setNumYears((n) => n + 1), []);
+
   // Classify requirements into logical display buckets
   const bucketed = useMemo(() => {
     const lower: ReqGroup[] = [], upper: ReqGroup[] = [], choice: ReqGroup[] = [], elective: ReqGroup[] = [];
@@ -1606,6 +1804,27 @@ export default function PlannerClient() {
     ) ?? null;
   }, [bucketed, placedSet]);
 
+  // Minor requirements pooled into the same display buckets as the major
+  const minorBucketed = useMemo(() => {
+    const lower: ReqGroup[] = [], upper: ReqGroup[] = [], choice: ReqGroup[] = [], elective: ReqGroup[] = [];
+    for (const req of minorRequirements) {
+      switch (classifyGroup(req)) {
+        case "lower":    lower.push(req);    break;
+        case "upper":    upper.push(req);    break;
+        case "choice":   choice.push(req);   break;
+        case "elective": elective.push(req); break;
+      }
+    }
+    return { lower, upper, choice, elective };
+  }, [minorRequirements]);
+
+  const firstIncompleteMinorBucket = useMemo(() => {
+    const order: BucketKey[] = ["lower", "upper", "choice", "elective"];
+    return order.find((k) =>
+      minorBucketed[k].some((r) => r.courses.filter((c) => placedSet.has(c)).length < r.courses_needed),
+    ) ?? null;
+  }, [minorBucketed, placedSet]);
+
   const firstIncompleteGE = geRequirements.findIndex(
     (r) => r.courses.filter((c) => placedSet.has(c)).length < r.courses_needed,
   );
@@ -1620,7 +1839,7 @@ export default function PlannerClient() {
 
           {/* Tabs */}
           <div className="flex border-b border-[#2a2a2a] shrink-0">
-            {(["major", "ge"] as const).map((tab) => (
+            {(["major", "ge", "minor"] as const).map((tab) => (
               <button
                 key={tab}
                 onClick={() => setSidebarTab(tab)}
@@ -1629,28 +1848,30 @@ export default function PlannerClient() {
                     ? "text-[#f0f0f0] border-b-2 border-[#3b82f6]"
                     : "text-[#444] hover:text-[#666]"}`}
               >
-                {tab === "major" ? "Major" : "GE"}
+                {tab === "major" ? "Major" : tab === "ge" ? "GE" : "Minor"}
               </button>
             ))}
           </div>
 
           {/* Fixed top */}
           <div className="px-2 pt-2 flex flex-col gap-1.5 shrink-0">
-            {majorListError ? (
-              <ErrorBanner
-                message="Failed to load majors"
-                onRetry={() => setMajorListRetry((n) => n + 1)}
-              />
-            ) : (
-              <MajorCombobox
-                options={parentMajors}
-                selectedDisplayName={selectedDisplayName}
-                onSelect={handleMajorNameChange}
-                loading={majorList.length === 0 && !majorListError}
-              />
+            {sidebarTab !== "minor" && (
+              majorListError ? (
+                <ErrorBanner
+                  message="Failed to load majors"
+                  onRetry={() => setMajorListRetry((n) => n + 1)}
+                />
+              ) : (
+                <MajorCombobox
+                  options={parentMajors}
+                  selectedDisplayName={selectedDisplayName}
+                  onSelect={handleMajorNameChange}
+                  loading={majorList.length === 0 && !majorListError}
+                />
+              )
             )}
 
-            {specializations.length > 0 && (
+            {sidebarTab !== "minor" && specializations.length > 0 && (
               <select
                 value={selectedMajorId}
                 onChange={(e) => setSelectedMajorId(e.target.value)}
@@ -1662,6 +1883,22 @@ export default function PlannerClient() {
                   </option>
                 ))}
               </select>
+            )}
+
+            {sidebarTab === "minor" && (
+              minorListError ? (
+                <ErrorBanner
+                  message="Failed to load minors"
+                  onRetry={() => setMinorListRetry((n) => n + 1)}
+                />
+              ) : (
+                <MinorCombobox
+                  options={minorList}
+                  selectedMinorId={selectedMinorId}
+                  onSelect={setSelectedMinorId}
+                  loading={minorList.length === 0 && !minorListError}
+                />
+              )
             )}
 
             <div className="relative">
@@ -1681,11 +1918,20 @@ export default function PlannerClient() {
               />
             </div>
 
-            {selectedMajorId && !loadingReqs && !reqError && (
+            {sidebarTab !== "minor" && selectedMajorId && !loadingReqs && !reqError && (
               <p className="text-[9px] text-[#444] pb-0.5">
                 <span className="text-[#666] font-semibold">{placedRequired}</span>
                 {" "}of{" "}
                 <span className="text-[#666] font-semibold">{totalRequired}</span>
+                {" "}courses placed
+              </p>
+            )}
+
+            {sidebarTab === "minor" && selectedMinorId && !loadingMinorReqs && !minorReqError && (
+              <p className="text-[9px] text-[#444] pb-0.5">
+                <span className="text-[#666] font-semibold">{minorPlacedRequired}</span>
+                {" "}of{" "}
+                <span className="text-[#666] font-semibold">{minorTotalRequired}</span>
                 {" "}courses placed
               </p>
             )}
@@ -1780,6 +2026,42 @@ export default function PlannerClient() {
                     ))}
                     {geRequirements.length === 0 && (
                       <p className="text-[10px] text-[#333] text-center py-12">Loading…</p>
+                    )}
+                  </>
+                )}
+              </>
+            )}
+
+            {sidebarTab === "minor" && (
+              <>
+                {loadingMinorReqs && (
+                  <p className="text-[10px] text-[#444] text-center py-8">Loading requirements…</p>
+                )}
+                {minorReqError && (
+                  <ErrorBanner
+                    message="Failed to load courses"
+                    onRetry={() => setMinorReqRetry((n) => n + 1)}
+                  />
+                )}
+                {!loadingMinorReqs && !minorReqError && (
+                  <>
+                    {(["lower", "upper", "choice", "elective"] as const).map((key) => (
+                      <BucketSection
+                        key={`minor-${key}-${selectedMinorId}`}
+                        bucketKey={key}
+                        groups={minorBucketed[key]}
+                        placedSet={placedSet}
+                        apCreditedSet={apCreditedSet}
+                        courseInfoMap={courseInfoMap}
+                        difficultyMap={difficultyMap}
+                        searchQuery={searchQuery}
+                        defaultOpen={firstIncompleteMinorBucket === key}
+                      />
+                    ))}
+                    {!selectedMinorId && (
+                      <p className="text-[10px] text-[#333] text-center py-12">
+                        Search for a minor above
+                      </p>
                     )}
                   </>
                 )}
@@ -1885,7 +2167,6 @@ export default function PlannerClient() {
                         : "bg-[#1a1a1a] border border-[#2a2a2a] text-[#444] hover:text-[#666]"}`}
                   >
                     <span className="block text-[9px] font-bold">{p.label}</span>
-                    <span className="block text-[8px] font-normal opacity-70">{p.value}u</span>
                   </button>
                 ))}
               </div>
@@ -1907,6 +2188,32 @@ export default function PlannerClient() {
                 </button>
               </div>
             )}
+
+            {lockConflictErrors && (
+              <div className="mb-2 px-2 py-2 rounded border border-amber-700/40 bg-amber-950/20">
+                <div className="flex items-start justify-between mb-1.5">
+                  <span className="text-[8.5px] font-semibold text-amber-400 leading-snug">
+                    Locked courses have missing prerequisites:
+                  </span>
+                  <button
+                    onClick={() => setLockConflictErrors(null)}
+                    className="text-amber-600 hover:text-amber-400 text-[11px] leading-none shrink-0 ml-1"
+                  >
+                    ×
+                  </button>
+                </div>
+                <ul className="space-y-1 mb-1.5">
+                  {lockConflictErrors.map((c, i) => (
+                    <li key={i} className="text-[8px] text-amber-300/80 leading-snug">
+                      · {parseLockConflict(c)}
+                    </li>
+                  ))}
+                </ul>
+                <p className="text-[7.5px] text-amber-500/70 leading-snug">
+                  Unlock these courses or add their prerequisites to continue.
+                </p>
+              </div>
+            )}
             <button
               disabled={!selectedMajorId || autoFillLoading}
               onClick={async () => {
@@ -1914,26 +2221,60 @@ export default function PlannerClient() {
                 setAutoFillLoading(true);
                 setToast(null);
                 try {
-                  const res = await fetch("/api/optimizer", {
+                  // Build locked course→quarter map from the current plan
+                  const lockedMap: Record<string, string> = {};
+                  for (const [quarter, courses] of Object.entries(plannedCourses)) {
+                    for (const cid of courses) {
+                      if (lockedCourses.has(cid)) lockedMap[cid] = quarter;
+                    }
+                  }
+                  const hasLocks = Object.keys(lockedMap).length > 0;
+
+                  const res = await fetch(hasLocks ? "/api/whatif" : "/api/optimizer", {
                     method: "POST",
                     headers: { "Content-Type": "application/json" },
-                    body: JSON.stringify({
-                      major_id: selectedMajorId,
-                      completed_courses: [],
-                      graduation_quarter: gradQuarter,
-                      units_per_quarter: maxUnits,
-                      waived_ges: [],
-                      ap_scores: apScores,
-                    }),
+                    body: hasLocks
+                      ? JSON.stringify({
+                          plan: {
+                            major_id: selectedMajorId,
+                            completed_courses: [],
+                            planned_courses: plannedCourses,
+                            graduation_year: parseInt(gradQuarter.split("_")[0]),
+                            units_per_quarter: maxUnits,
+                          },
+                          locked_courses: lockedMap,
+                          major_id: selectedMajorId,
+                          graduation_quarter: gradQuarter,
+                          units_per_quarter: maxUnits,
+                          waived_ges: [],
+                          ap_scores: apScores,
+                        })
+                      : JSON.stringify({
+                          major_id: selectedMajorId,
+                          completed_courses: [],
+                          graduation_quarter: gradQuarter,
+                          units_per_quarter: maxUnits,
+                          waived_ges: [],
+                          ap_scores: apScores,
+                        }),
                   });
                   const data = await res.json();
                   if (!res.ok) {
-                    const msg =
-                      typeof data?.detail === "object"
-                        ? (data.detail.message ?? JSON.stringify(data.detail))
-                        : (data?.detail ?? data?.error ?? "Optimizer error");
-                    setToast(String(msg));
+                    if (
+                      data?.detail?.error === "lock_conflict" &&
+                      Array.isArray(data.detail.conflicts) &&
+                      data.detail.conflicts.length > 0
+                    ) {
+                      setLockConflictErrors(data.detail.conflicts as string[]);
+                    } else {
+                      const msg =
+                        typeof data?.detail === "object"
+                          ? (data.detail.message ?? JSON.stringify(data.detail))
+                          : (data?.detail ?? data?.error ?? "Optimizer error");
+                      setToast(String(msg));
+                    }
                   } else {
+                    setLockConflictErrors(null);
                     const plan = data?.variants?.[0]?.planned_courses as PlannedCourses | undefined;
                     if (plan) {
                       setPlannedCourses(plan);
@@ -1979,6 +2320,38 @@ export default function PlannerClient() {
         </aside>
 
         {/* ── Clear Schedule confirmation dialog ───────────────────────────── */}
+        {pendingLock && (
+          <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm">
+            <div className="w-80 rounded-xl border border-white/[0.1] bg-[#1a1a1a] p-6 shadow-2xl">
+              <h2 className="text-sm font-semibold text-white mb-3">Lock this course?</h2>
+              <div className="mb-4 space-y-2">
+                {pendingLock.warnings.map((c, i) => (
+                  <p key={i} className="text-xs text-amber-400/90 leading-relaxed">
+                    ⚠ {parseLockConflict(c)}
+                  </p>
+                ))}
+              </div>
+              <div className="flex gap-2">
+                <button
+                  onClick={() => setPendingLock(null)}
+                  className="flex-1 rounded-lg border border-white/[0.1] py-2 text-xs font-medium text-zinc-300 hover:bg-white/[0.06] transition-colors"
+                >
+                  Cancel
+                </button>
+                <button
+                  onClick={() => {
+                    setLockedCourses((prev) => new Set([...prev, pendingLock.courseId]));
+                    setPendingLock(null);
+                  }}
+                  className="flex-1 rounded-lg bg-amber-600 hover:bg-amber-500 py-2 text-xs font-medium text-white transition-colors"
+                >
+                  Lock Anyway
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
+
         {showClearConfirm && (
           <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm">
             <div className="w-80 rounded-xl border border-white/[0.1] bg-[#1a1a1a] p-6 shadow-2xl">
@@ -2000,7 +2373,8 @@ export default function PlannerClient() {
                     setApScores({});
                     setLockedCourses(new Set());
                     setSummerYears(new Set());
-                    setGradQuarter("2028_spring");
+                    setSelectedMinorId("");
+                    setNumYears(DEFAULT_YEARS);
                     setMaxUnits(19);
                     await deletePlan().catch(() => {});
                     setClearSuccess(true);
@@ -2024,19 +2398,6 @@ export default function PlannerClient() {
               {selectedLabel || <span className="text-[#333]">No major selected</span>}
             </span>
             <div className="flex-1" />
-            <div className="flex items-center gap-1.5">
-              <span className="text-[9px] font-bold uppercase tracking-widest text-[#333]">Grad</span>
-              <select
-                value={gradQuarter}
-                onChange={(e) => setGradQuarter(e.target.value)}
-                className="h-6 rounded border border-[#2a2a2a] bg-[#1a1a1a] px-1.5 text-[10px] text-[#999] focus:outline-none focus:border-[#3b82f6]/60"
-              >
-                {GRAD_OPTIONS.map((o) => (
-                  <option key={o.value} value={o.value}>{o.label}</option>
-                ))}
-              </select>
-            </div>
-            <div className="flex-1" />
             <span className="text-[10px] font-bold text-[#666]">
               {totalUnits} <span className="text-[#444] font-normal">UNITS</span>
             </span>
@@ -2054,7 +2415,7 @@ export default function PlannerClient() {
           {/* Grid */}
           <div className="flex-1 overflow-auto p-4">
             <div className="border border-[#2a2a2a] rounded-lg overflow-hidden">
-              {YEARS.map((year) => {
+              {Array.from({ length: numYears }, (_, i) => i + 1).map((year) => {
                 const hasSummer = summerYears.has(year);
                 const summerQk = qkey(year, "summer");
 
@@ -2066,7 +2427,7 @@ export default function PlannerClient() {
                         className="text-[6px] font-bold uppercase tracking-[0.15em] text-[#2a2a2a] select-none"
                         style={{ writingMode: "vertical-rl", transform: "rotate(180deg)" }}
                       >
-                        {`Y${year} ${START_YEAR + year - 1}–${(START_YEAR + year).toString().slice(2)}`}
+                        {`Year ${year}`}
                       </span>
                     </div>
 
@@ -2131,6 +2492,14 @@ export default function PlannerClient() {
                 );
               })}
             </div>
+
+            {/* Add Year */}
+            <button
+              onClick={addYear}
+              className="mt-3 w-full flex items-center justify-center gap-1.5 rounded-lg border border-dashed border-[#2a2a2a] py-2.5 text-[10px] font-bold uppercase tracking-widest text-[#444] hover:text-[#888] hover:border-[#3a3a3a] transition-colors"
+            >
+              <span className="text-[13px] leading-none">+</span> Add Year
+            </button>
           </div>
         </main>
       </div>

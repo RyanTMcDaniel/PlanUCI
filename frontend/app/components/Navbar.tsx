@@ -7,7 +7,6 @@ import { createClient } from "@/lib/supabase/client";
 import type { User } from "@supabase/supabase-js";
 
 const TABS = [
-  { label: "Scheduler", href: "/scheduler" },
   { label: "Planner", href: "/planner" },
 ];
 
@@ -75,25 +74,7 @@ export default function Navbar() {
         </Link>
       </div>
 
-      {/* Center — tabs */}
-      <div className="flex items-center gap-1 bg-white/[0.06] rounded-lg p-1">
-        {TABS.map((tab) => {
-          const active = pathname.startsWith(tab.href);
-          return (
-            <Link
-              key={tab.href}
-              href={tab.href}
-              className={`px-4 py-1.5 rounded-md text-sm font-medium transition-colors ${
-                active
-                  ? "bg-white/[0.12] text-white"
-                  : "text-zinc-400 hover:text-white"
-              }`}
-            >
-              {tab.label}
-            </Link>
-          );
-        })}
-      </div>
+      {/* Center — tabs (hidden: only Planner remains, no switching needed) */}
 
       {/* Right — auth */}
       <div className="flex-1 flex justify-end">

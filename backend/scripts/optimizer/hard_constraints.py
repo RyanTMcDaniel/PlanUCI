@@ -100,7 +100,14 @@ def _eval_item(
             return cid in available or cid in same_quarter
         return cid in available
     if prereq_type == "exam":
-        return False  # treat placement exams as not satisfied
+        # Check whether _resolve_ap_credits encoded a satisfaction token in
+        # available.  Token: "EXAMOK:<normed_exam_name>:<score_threshold>"
+        exam_name = item.get("examName", "")
+        try:
+            min_grade = int(item.get("minGrade", "3"))
+        except (ValueError, TypeError):
+            min_grade = 3
+        return f"EXAMOK:{_norm(exam_name)}:{min_grade}" in available
     return _eval_tree(item, available, same_quarter)
 
 
@@ -241,7 +248,7 @@ def major_requirements_met(plan: CoursePlan, client) -> tuple[bool, list[str]]:
     for courses_in_q in plan.planned_courses.values():
         all_courses.update(_norm(c) for c in courses_in_q)
 
-    # Check major-specific requirements
+    # Check major-specific requirements (API rows, then merged with catalogue rows)
     rows = (
         client.table("major_requirements")
         .select("requirement_type,courses,courses_needed,group_name")
@@ -249,6 +256,24 @@ def major_requirements_met(plan: CoursePlan, client) -> tuple[bool, list[str]]:
         .execute()
         .data
     )
+
+    # Merge catalogue_requirements: fetch core rows (specialization_id IS NULL)
+    # and let them override API rows with the same group_name.
+    try:
+        cat_rows = (
+            client.table("catalogue_requirements")
+            .select("requirement_type,courses,courses_needed,group_name")
+            .eq("major_id", plan.major_id)
+            .is_("specialization_id", "null")
+            .execute()
+            .data
+        ) or []
+        if cat_rows:
+            cat_names = {r["group_name"] for r in cat_rows}
+            rows = [r for r in rows if r.get("group_name") not in cat_names]
+            rows.extend(cat_rows)
+    except Exception:
+        pass  # catalogue table missing or query failed — fall back to API rows only
 
     if not rows:
         return True, [f"No requirements found for major {plan.major_id!r} — skipping"]
