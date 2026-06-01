@@ -6,7 +6,10 @@ export interface PlanData {
   plannedCourses:      Record<string, string[]>;
   selectedMajorId:     string;
   selectedDisplayName: string;
-  gradQuarter:         string;
+  selectedMinorId?:    string;            // optional — absent on plans saved before minors
+  numYears?:           number;            // structural year count (default 4); absent on older plans
+  gradQuarter?:        string;            // derived (Spring of last year); kept for display/optimizer
+
   maxUnits:            number;
   lockedCourses:       string[];          // Set<string> serialized as array
   apScores:            Record<string, number>;

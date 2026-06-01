@@ -261,6 +261,13 @@ def _resolve_ap_credits(
             seen_units.add(units_key)
             total_units += row.get("units_awarded") or 0
 
+        # Encode exam satisfaction so _eval_item can check it via `available`.
+        # Token format: "EXAMOK:<normed_exam_name>:<ap_score_threshold>"
+        # A user with score N satisfies all rows where row ap_score <= N, so we
+        # add one token per qualifying row.  _eval_item checks the minGrade in
+        # the prereq tree against these tokens.
+        completed_norm.add(f"EXAMOK:{_norm(exam)}:{row['ap_score']}")
+
         for cid in (row.get("course_equivalencies") or []):
             norm = _norm(cid)
             if norm not in completed_norm:
@@ -796,10 +803,18 @@ def _asap_schedule(
                 if n not in remaining_norm_to_raw:
                     remaining_norm_to_raw[n] = raw
 
-            eligible_idx: int | None = None
-            coreqs_to_place: list[str] = []  # raw IDs to co-place in this quarter
+            # Collect all eligible candidates for this quarter slot, then pick
+            # the highest-priority one.  Lower-division courses (course number
+            # < 100) are always preferred so they unlock their upper-div
+            # successors as early as possible.
+            def _lower_div_key(course_id: str) -> tuple[int, str]:
+                m = re.search(r'\d+', course_id)
+                num = int(m.group(0)) if m else 9999
+                return (0 if num < 100 else 1, course_id)
 
-            for i, c in enumerate(remaining):
+            eligible_candidates: list[tuple[str, list[str]]] = []
+
+            for c in remaining:
                 tree = prereq_trees.get(_norm(c))
 
                 # Identify coreqs that aren't yet satisfied (prior or current quarter)
@@ -844,15 +859,14 @@ def _asap_schedule(
                 if q_units + _course_units(c) + extra_units > units_per_quarter:
                     continue
 
-                eligible_idx = i
-                coreqs_to_place = candidate_coreqs
-                break
+                eligible_candidates.append((c, candidate_coreqs))
 
-            if eligible_idx is None:
+            if not eligible_candidates:
                 break  # nothing eligible this quarter; advance to next
 
-            # Save the main course's raw ID before any list mutations.
-            main_course = remaining[eligible_idx]
+            # Sort: lower-div first, then alphabetically to keep output stable.
+            eligible_candidates.sort(key=lambda t: _lower_div_key(t[0]))
+            main_course, coreqs_to_place = eligible_candidates[0]
 
             # Place coreqs first so they're in the quarter when validation runs.
             for coreq_raw in coreqs_to_place:
@@ -860,10 +874,74 @@ def _asap_schedule(
                     remaining.remove(coreq_raw)
                     plan[quarter].append(coreq_raw)
 
-            # Remove and place the main course by value (eligible_idx may have
-            # shifted if a coreq appeared before it in the list).
             remaining.remove(main_course)
             plan[quarter].append(main_course)
+
+        # Minimum-units pass: if the quarter is under 12 units but still has
+        # room, do one more sweep for any eligible course that fits.  This
+        # catches edge cases where the primary while-loop exited early (e.g.
+        # the first eligible candidate was too large to fit but a smaller one
+        # exists later in the sorted order).  Prereqs are never violated here.
+        MIN_UNITS_PER_QUARTER = 12
+        q_units_now = sum(_course_units(c) for c in plan[quarter])
+        if q_units_now < MIN_UNITS_PER_QUARTER and remaining:
+            same_q_norms_fill: frozenset[str] = frozenset(_norm(x) for x in plan[quarter])
+            remaining_norm_fill: dict[str, str] = {}
+            for raw in remaining:
+                n = _norm(raw)
+                if n not in remaining_norm_fill:
+                    remaining_norm_fill[n] = raw
+            fill_candidates: list[tuple[str, list[str]]] = []
+            for c in remaining:
+                tree = prereq_trees.get(_norm(c))
+                required_coreqs = _collect_and_coreq_norms(tree)
+                unresolved = [
+                    n for n in required_coreqs
+                    if n not in available and n not in same_q_norms_fill
+                ]
+                hypothetical_q = same_q_norms_fill | set(unresolved)
+                if tree and not _eval_tree(tree, available, hypothetical_q):
+                    continue
+                if not _offered_in_quarter(c, quarter):
+                    continue
+                candidate_coreqs: list[str] = []
+                ok = True
+                extra_units = 0
+                for n in unresolved:
+                    raw_coreq = remaining_norm_fill.get(n)
+                    if raw_coreq is None or raw_coreq == c:
+                        ok = False
+                        break
+                    coreq_tree = prereq_trees.get(n)
+                    if coreq_tree and not _eval_tree(coreq_tree, available, hypothetical_q):
+                        ok = False
+                        break
+                    if not _offered_in_quarter(raw_coreq, quarter):
+                        ok = False
+                        break
+                    candidate_coreqs.append(raw_coreq)
+                    extra_units += _course_units(raw_coreq)
+                if not ok:
+                    continue
+                if q_units_now + _course_units(c) + extra_units > units_per_quarter:
+                    continue
+                fill_candidates.append((c, candidate_coreqs))
+            fill_candidates.sort(key=lambda t: _lower_div_key(t[0]))
+            for fill_course, fill_coreqs in fill_candidates:
+                if fill_course not in remaining:
+                    continue
+                q_units_now = sum(_course_units(c) for c in plan[quarter])
+                if q_units_now >= units_per_quarter:
+                    break
+                extra = sum(_course_units(r) for r in fill_coreqs if r in remaining)
+                if q_units_now + _course_units(fill_course) + extra > units_per_quarter:
+                    continue
+                for coreq_raw in fill_coreqs:
+                    if coreq_raw in remaining:
+                        remaining.remove(coreq_raw)
+                        plan[quarter].append(coreq_raw)
+                remaining.remove(fill_course)
+                plan[quarter].append(fill_course)
 
         # Make this quarter's courses available to all subsequent quarters.
         available.update(_norm(c) for c in plan[quarter])

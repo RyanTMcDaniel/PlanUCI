@@ -97,6 +97,7 @@ class GenerateRequest(BaseModel):
     graduation_quarter: str
     units_per_quarter:  int = 19   # UCI standard max (12–19); Heavy=20, Overload=22
     waived_ges:         list[str] = []
+    ap_scores:          dict[str, int] = {}  # {"AP Calculus AB": 4, "AP Statistics": 5}
 
 
 @router.post("/generate")
@@ -107,6 +108,7 @@ def optimizer_generate(req: GenerateRequest):
         graduation_quarter = req.graduation_quarter,
         units_per_quarter  = req.units_per_quarter,
         waived_ges         = req.waived_ges,
+        ap_scores          = req.ap_scores,
     )
     client = _supabase_client()
     cached = optimizer_cache.get(client, cache_key)
@@ -121,6 +123,7 @@ def optimizer_generate(req: GenerateRequest):
             graduation_quarter = req.graduation_quarter,
             units_per_quarter  = req.units_per_quarter,
             waived_ges         = req.waived_ges,
+            ap_scores          = req.ap_scores,
         )
     except FeasibilityError as e:
         raise HTTPException(
@@ -138,15 +141,17 @@ def optimizer_generate(req: GenerateRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
     response = {
-        "variants":           [_variant_dict(v) for v in result.variants],
-        "tight_timeline":     result.tight_timeline,
-        "quarters_available": result.quarters_available,
-        "quarters_needed":    result.quarters_needed,
-        "overflow_count":     result.overflow_count,
-        "overflow_courses":   result.overflow_courses,
-        "extended_by":        result.extended_by,
-        "group_map":          result.group_map,
-        "cached":             False,
+        "variants":             [_variant_dict(v) for v in result.variants],
+        "tight_timeline":       result.tight_timeline,
+        "quarters_available":   result.quarters_available,
+        "quarters_needed":      result.quarters_needed,
+        "overflow_count":       result.overflow_count,
+        "overflow_courses":     result.overflow_courses,
+        "extended_by":          result.extended_by,
+        "group_map":            result.group_map,
+        "ap_credited_courses":  result.ap_credited_courses,
+        "ap_units_awarded":     result.ap_units_awarded,
+        "cached":               False,
     }
     optimizer_cache.set(client, cache_key, response)
     return response
@@ -161,6 +166,7 @@ class WhatIfRequest(BaseModel):
     graduation_quarter: str
     units_per_quarter:  int = 16
     waived_ges:         list[str] = []
+    ap_scores:          dict[str, int] = {}  # {"AP Calculus BC": 4, ...}
 
 
 @router.post("/whatif")
@@ -173,6 +179,7 @@ def optimizer_whatif(req: WhatIfRequest):
             graduation_quarter = req.graduation_quarter,
             units_per_quarter  = req.units_per_quarter,
             waived_ges         = req.waived_ges,
+            ap_scores          = req.ap_scores,
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -241,14 +248,19 @@ def optimizer_move(req: MoveRequest):
 # ── /optimizer/validate_locks ─────────────────────────────────────────────────
 
 class ValidateLocksRequest(BaseModel):
-    locked_courses:    dict[str, str]   # {course_id: quarter}
+    locked_courses:    dict[str, str]        # {course_id: quarter}
     completed_courses: list[str] = []
+    ap_scores:         dict[str, int] = {}   # {"AP Calculus BC": 4, ...}
 
 
 @router.post("/validate_locks")
 def optimizer_validate_locks(req: ValidateLocksRequest):
     try:
-        valid, conflicts = validate_locks(req.locked_courses, req.completed_courses)
+        valid, conflicts = validate_locks(
+            req.locked_courses,
+            req.completed_courses,
+            req.ap_scores or None,
+        )
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 

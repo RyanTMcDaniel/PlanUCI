@@ -2,7 +2,8 @@ import { createClient } from "@/lib/supabase/client";
 
 export interface MajorOption {
   major_id: string;
-  display_name: string;
+  display_name: string;           // cleaned major_name (used for grouping)
+  specialization_name: string | null; // null = parent/standalone, set = specialization row
 }
 
 function cleanDisplayName(raw: string | null, fallback: string): string {
@@ -13,16 +14,16 @@ function cleanDisplayName(raw: string | null, fallback: string): string {
   );
 }
 
-/** Fetch all distinct majors with cleaned display names. Paginates automatically. */
+/** Fetch all majors and specializations with cleaned display names. */
 export async function fetchMajors(): Promise<MajorOption[]> {
   const supabase = createClient();
   const PAGE = 1000;
-  const allRows: { major_id: string; major_name: string | null }[] = [];
+  const allRows: { major_id: string; major_name: string | null; specialization_name: string | null }[] = [];
 
   for (let from = 0; ; from += PAGE) {
     const { data, error } = await supabase
       .from("major_requirements")
-      .select("major_id, major_name")
+      .select("major_id, major_name, specialization_name")
       .neq("major_id", "ALL_MAJORS")
       .range(from, from + PAGE - 1);
 
@@ -32,19 +33,23 @@ export async function fetchMajors(): Promise<MajorOption[]> {
     if (data.length < PAGE) break;
   }
 
-  const allIds = new Set(allRows.map((r) => r.major_id));
-  const seen = new Map<string, string>();
+  // Deduplicate by major_id, keeping the first occurrence
+  const seen = new Map<string, MajorOption>();
   for (const row of allRows) {
     if (seen.has(row.major_id)) continue;
-    // Skip parent IDs — an ID is a parent if another ID in the list equals it + one letter
-    // (e.g. skip "BS-0K6" when "BS-0K6A" exists; keep "BS-201E" since "BS-201EA" doesn't)
-    const isParent = [...allIds].some(
-      (id) => id !== row.major_id && id.startsWith(row.major_id) && /^[A-Z]$/.test(id.slice(row.major_id.length)),
-    );
-    if (!isParent) seen.set(row.major_id, cleanDisplayName(row.major_name, row.major_id));
+    seen.set(row.major_id, {
+      major_id: row.major_id,
+      display_name: cleanDisplayName(row.major_name, row.major_id),
+      specialization_name: row.specialization_name ?? null,
+    });
   }
 
-  return Array.from(seen.entries())
-    .map(([major_id, display_name]) => ({ major_id, display_name }))
-    .sort((a, b) => a.display_name.localeCompare(b.display_name));
+  return Array.from(seen.values()).sort((a, b) => {
+    const cmp = a.display_name.localeCompare(b.display_name);
+    if (cmp !== 0) return cmp;
+    // specs after their parent, sorted by spec name
+    if (!a.specialization_name && b.specialization_name) return -1;
+    if (a.specialization_name && !b.specialization_name) return 1;
+    return (a.specialization_name ?? "").localeCompare(b.specialization_name ?? "");
+  });
 }

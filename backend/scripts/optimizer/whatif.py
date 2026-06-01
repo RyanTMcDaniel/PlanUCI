@@ -36,6 +36,7 @@ from .plan_generator import (
     _collect_courses,
     _fetch_prereq_trees,
     _generate_quarters,
+    _resolve_ap_credits,
 )
 from .soft_constraints import _load_course_meta, _load_difficulty_scores
 
@@ -67,12 +68,14 @@ class WhatIfResult:
 # ── Lock validation ───────────────────────────────────────────────────────────
 
 def _eval_locked_item(
-    item: dict, avail: set[str], locked_norm: set[str], completed_norm: set[str]
+    item: dict, avail: set[str], locked_norm: set[str], completed_norm: set[str],
+    same_q_norm: set[str] | None = None,
 ) -> bool | None:
     """Eval one prereq item. Returns True/False for locked/completed courses; None for unknowns.
 
-    - locked course in avail → True (satisfied)
-    - locked course NOT in avail → False (definitely wrong)
+    - locked course in avail (prior quarter) → True (satisfied)
+    - locked course is a coreq AND in same_q_norm (same quarter) → True (coreq satisfied)
+    - locked course NOT in avail and not a valid coreq → False (definitely wrong)
     - completed course → True (satisfied)
     - unlocked/non-completed course or exam → None (unknown; caller decides)
     """
@@ -80,18 +83,33 @@ def _eval_locked_item(
     if t == "course":
         cid = _norm(item.get("courseId", ""))
         if cid in locked_norm:
-            return cid in avail
+            if cid in avail:
+                return True
+            # Corequisite: same-quarter placement is acceptable
+            if item.get("coreq") and same_q_norm is not None and cid in same_q_norm:
+                return True
+            return False
         if cid in completed_norm:
             return True
         return None  # not locked, not completed — unknown
     if t == "exam":
-        return None  # can't verify
+        # If _resolve_ap_credits encoded a satisfaction token, treat as satisfied.
+        exam_name = item.get("examName", "")
+        try:
+            min_grade = int(item.get("minGrade", "3"))
+        except (ValueError, TypeError):
+            min_grade = 3
+        token = f"EXAMOK:{_norm(exam_name)}:{min_grade}"
+        if token in completed_norm:
+            return True
+        return None  # exam not in completed_norm — can't verify
     # nested AND/OR/NOT subtree — always returns bool
-    return _eval_locked_tree(item, avail, locked_norm, completed_norm)
+    return _eval_locked_tree(item, avail, locked_norm, completed_norm, same_q_norm)
 
 
 def _eval_locked_tree(
-    node: dict, avail: set[str], locked_norm: set[str], completed_norm: set[str]
+    node: dict, avail: set[str], locked_norm: set[str], completed_norm: set[str],
+    same_q_norm: set[str] | None = None,
 ) -> bool:
     """AND/OR/NOT prereq tree eval — only flags conflicts caused by locked courses.
 
@@ -106,10 +124,10 @@ def _eval_locked_tree(
             continue
         items = node[key]
         if key == "AND":
-            results = [_eval_locked_item(i, avail, locked_norm, completed_norm) for i in items]
+            results = [_eval_locked_item(i, avail, locked_norm, completed_norm, same_q_norm) for i in items]
             return not any(r is False for r in results)
         if key == "OR":
-            results = [_eval_locked_item(i, avail, locked_norm, completed_norm) for i in items]
+            results = [_eval_locked_item(i, avail, locked_norm, completed_norm, same_q_norm) for i in items]
             if any(r is True for r in results):
                 return True
             if any(r is False for r in results):
@@ -182,6 +200,7 @@ def _missing_leaf_norms(item: dict, all_norm: set[str]) -> set[str]:
 def validate_locks(
     locked_courses: dict[str, str],
     completed_courses: list[str] | None = None,
+    ap_scores: dict[str, int] | None = None,
 ) -> tuple[bool, list[str]]:
     """Check locked quarter assignments for prereq ordering conflicts and missing prereqs.
 
@@ -190,14 +209,18 @@ def validate_locks(
        quarter, but B is pinned to the same or later quarter.
     2. Missing: a course in the plan requires a prereq that is not in the plan at all.
 
-    completed_courses are treated as already satisfied.
+    completed_courses and AP-credited courses are treated as already satisfied.
     """
     if not locked_courses:
         return True, []
 
     completed_norm = {_norm(c) for c in (completed_courses or [])}
 
-    client      = create_client(os.getenv("SUPABASE_URL"), os.getenv("SUPABASE_SERVICE_KEY"))
+    client = create_client(os.getenv("SUPABASE_URL"), os.getenv("SUPABASE_SERVICE_KEY"))
+
+    # Resolve AP credits — adds equivalencies to completed_norm in-place
+    if ap_scores:
+        _resolve_ap_credits(client, ap_scores, completed_norm)
     course_ids  = list(locked_courses.keys())
     trees       = _prereq_trees(client, course_ids)
     locked_norm = {_norm(c) for c in locked_courses}
@@ -217,8 +240,12 @@ def validate_locks(
                 n for n, q in norm_to_quarter.items()
                 if _qkey(q) < _qkey(quarter)
             }
+            same_q_norm = {
+                n for n, q in norm_to_quarter.items()
+                if _qkey(q) == _qkey(quarter)
+            }
 
-            if not _eval_locked_tree(tree, avail, locked_norm, completed_norm):
+            if not _eval_locked_tree(tree, avail, locked_norm, completed_norm, same_q_norm):
                 blocking = [
                     f"{c} (locked to {q})"
                     for c, q in locked_courses.items()
@@ -384,6 +411,7 @@ def run_whatif(
     graduation_quarter: str,
     units_per_quarter: int = 16,
     waived_ges:        list[str] | None = None,
+    ap_scores:         dict[str, int] | None = None,
 ) -> WhatIfResult:
     """Generate plan variants with locked_courses pinned to their quarters.
 
@@ -400,8 +428,11 @@ def run_whatif(
     if waived_ges is None:
         waived_ges = []
 
-    # ── 1. Validate locks ─────────────────────────────────────────────────────
-    lock_valid, lock_conflicts = validate_locks(locked_courses)
+    # ── 1. Validate locks (pass ap_scores so AP-credited courses count as completed) ──
+    lock_valid, lock_conflicts = validate_locks(
+        locked_courses, completed_courses=list(plan.completed_courses),
+        ap_scores=ap_scores or None,
+    )
     if not lock_valid:
         return WhatIfResult(variants=[], lock_conflicts=lock_conflicts)
 
@@ -416,9 +447,15 @@ def run_whatif(
     locked_norm    = {_norm(c) for c in locked_courses}
     completed_norm = {_norm(c) for c in plan.completed_courses}
 
+    # Resolve AP credits so equivalencies are excluded from courses to plan
+    # and are treated as already satisfied during scheduling.
+    if ap_scores:
+        from .plan_generator import _resolve_ap_credits
+        _resolve_ap_credits(client, ap_scores, completed_norm)
+
     # ── 3. Collect remaining required courses (excluding locked + completed) ──
     effective_norm = completed_norm | locked_norm
-    remaining, _   = _collect_courses(client, major_id, effective_norm, waived_ges)
+    remaining, _, _, _ = _collect_courses(client, major_id, effective_norm, waived_ges)
 
     # ── 4. Feasibility ────────────────────────────────────────────────────────
     total      = len(locked_courses) + len(remaining)
