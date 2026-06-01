@@ -29,7 +29,7 @@ from scripts.optimizer.hard_constraints import (
 from scripts.optimizer.optimizer import _soft_score
 from scripts.optimizer.soft_constraints import _load_difficulty_scores, _load_course_meta
 from scripts.optimizer.plan_generator import generate, FeasibilityError
-from scripts.optimizer.whatif import validate_locks, run_whatif
+from scripts.optimizer.whatif import validate_locks, optimize_around_locks
 
 
 # ── Fixtures ──────────────────────────────────────────────────────────────────
@@ -175,32 +175,36 @@ def test_generate_variants_sorted_by_score():
     )
 
 
-# ── 9. whatif respects locked courses ────────────────────────────────────────
+# ── 9. optimize_around_locks keeps locks fixed, repositions unlocked ─────────
 
-def test_whatif_locked_course_pinned():
-    """COMPSCI161 locked to 2027_fall must appear there in all returned variants."""
-    result = generate(
-        major_id="BS-201G",
+def test_optimize_around_locks_respects_locks():
+    """Locked ICS31/ICS33 stay put; unlocked courses may move; all plans hard-valid."""
+    plan = _make_plan(
         completed_courses=[],
-        graduation_quarter="2029_spring",
+        planned_courses={
+            "2025_fall":   ["I&CSCI31", "WRITING39A", "WRITING39B", "I&CSCI6D"],
+            "2026_winter": ["I&CSCI32"],
+            "2026_spring": ["I&CSCI33"],
+        },
+        units_per_quarter=16,
     )
-    base_plan = result.variants[0].plan
+    res = optimize_around_locks(plan, ["I&CSCI31", "I&CSCI33"], top_n=3)
+    assert res["status"] == "ok", res
+    for p in res["plans"]:
+        pos = {_norm(c): q for q, cs in p["planned_courses"].items() for c in cs}
+        assert pos[_norm("I&CSCI31")] == "2025_fall"
+        assert pos[_norm("I&CSCI33")] == "2026_spring"
 
-    locked = {"COMPSCI161": "2027_fall"}
 
-    wif = run_whatif(
-        plan               = base_plan,
-        locked_courses     = locked,
-        major_id           = "BS-201G",
-        graduation_quarter = "2029_spring",
+def test_optimize_around_locks_infeasible_conflicting_locks():
+    """ICS32 pinned before its prereq ICS31 → infeasible with a conflict reason."""
+    plan = _make_plan(
+        completed_courses=[],
+        planned_courses={"2025_fall": ["I&CSCI32"], "2026_fall": ["I&CSCI31"]},
+        units_per_quarter=16,
     )
-    assert not wif.lock_conflicts, f"Unexpected lock conflicts: {wif.lock_conflicts}"
-    for i, v in enumerate(wif.variants):
-        courses_in_q = [_norm(c) for c in v.planned_courses.get("2027_fall", [])]
-        assert _norm("COMPSCI161") in courses_in_q, (
-            f"Variant {i}: COMPSCI161 not found in 2027_fall. "
-            f"Contents: { {q: v.planned_courses[q] for q in v.planned_courses} }"
-        )
+    res = optimize_around_locks(plan, ["I&CSCI32", "I&CSCI31"])
+    assert res["status"] == "infeasible" and res["conflicts"], res
 
 
 # ── 10. validate_locks catches intra-lock conflict ───────────────────────────

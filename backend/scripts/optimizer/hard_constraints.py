@@ -26,6 +26,38 @@ def _qkey(qstr: str) -> tuple[int, int]:
     return (int(year), QUARTER_ORDER.get(quarter.lower(), 99))
 
 
+def _pretty_quarter(qstr: str) -> str:
+    """'2026_fall' → 'Fall 2026' for human-readable reason strings."""
+    try:
+        year, quarter = qstr.rsplit("_", 1)
+        return f"{quarter.capitalize()} {year}"
+    except ValueError:
+        return qstr
+
+
+# ── Structured check result ───────────────────────────────────────────────────
+# Constraint checks return one of these instead of a bare bool so the UI can tell
+# the user *why* a placement is invalid.  `reason` is a human-readable,
+# course-specific message; `code` is a short machine tag.  `reason` is None only
+# when `valid` is True.
+
+@dataclass
+class CheckResult:
+    valid: bool
+    reason: str | None
+    code: str
+
+    def as_dict(self) -> dict:
+        return {"valid": self.valid, "reason": self.reason, "code": self.code}
+
+
+# Machine tags for each hard constraint.
+CODE_PREREQ_ORDER  = "PREREQ_ORDER"
+CODE_UNIT_CAP      = "UNIT_CAP"
+CODE_DUPLICATE     = "DUPLICATE"
+CODE_REQ_UNCOVERED = "REQ_UNCOVERED"
+
+
 # ── CSE ↔ ICS alias map (FIX 6) ─────────────────────────────────────────────
 # CSE was the old department prefix; current catalog uses I&CSCI / ICS after norm.
 # Hardcoded known aliases; _load_aliases() extends this from the DB at runtime.
@@ -142,6 +174,59 @@ def _eval_tree(
     return True  # empty node — no prereqs
 
 
+def _representative_unmet(
+    node: dict,
+    available: set[str],
+    same_quarter: frozenset[str] = frozenset(),
+) -> str | None:
+    """Return one normalized course id that is an unmet prerequisite of `node`.
+
+    Best-effort, for building a human-readable reason only — the authoritative
+    pass/fail decision is made by _eval_tree.  Walks AND children for the first
+    unsatisfied leaf; for an unsatisfied OR, returns the first course alternative.
+    """
+    for logic_key in ("AND", "OR", "NOT"):
+        if logic_key not in node:
+            continue
+        items = node[logic_key]
+        if logic_key == "AND":
+            for item in items:
+                if not _eval_item(item, available, same_quarter):
+                    leaf = _representative_unmet_leaf(item, available, same_quarter)
+                    if leaf:
+                        return leaf
+            return None
+        if logic_key == "OR":
+            if any(_eval_item(i, available, same_quarter) for i in items):
+                return None
+            for item in items:
+                leaf = _representative_unmet_leaf(item, available, same_quarter)
+                if leaf:
+                    return leaf
+            return None
+        if logic_key == "NOT":
+            return None
+    return None
+
+
+def _representative_unmet_leaf(
+    item: dict, available: set[str], same_quarter: frozenset[str]
+) -> str | None:
+    if item.get("prereqType") == "course":
+        return _norm(item.get("courseId", ""))
+    if item.get("prereqType") == "exam":
+        return None
+    return _representative_unmet(item, available, same_quarter)
+
+
+def _where_scheduled(norm_id: str, plan: "CoursePlan") -> str | None:
+    """Pretty-quarter where `norm_id` is planned, or None if absent from the plan."""
+    for quarter, courses in plan.planned_courses.items():
+        if any(_norm(c) == norm_id for c in courses):
+            return _pretty_quarter(quarter)
+    return None
+
+
 def _probe_group_column(client) -> str | None:
     """Return the first grouping column found in prereq_edges, or None."""
     for col in ("group_id", "alternative_group"):
@@ -155,7 +240,7 @@ def _probe_group_column(client) -> str | None:
 
 # ── Validators ───────────────────────────────────────────────────────────────
 
-def prereqs_satisfied(plan: CoursePlan, client) -> tuple[bool, list[str]]:
+def prereqs_satisfied(plan: CoursePlan, client) -> tuple[bool, list[CheckResult]]:
     # FIX 6 — ensure alias map is populated before any _norm() comparisons
     _load_aliases(client)
     """Every planned course must have its prerequisites completed or planned earlier.
@@ -163,8 +248,11 @@ def prereqs_satisfied(plan: CoursePlan, client) -> tuple[bool, list[str]]:
     OR logic is handled by evaluating the prerequisite_tree JSON from the
     courses table.  If prereq_edges has a group_id / alternative_group column
     we use that instead (rows in the same group are treated as OR alternatives).
+
+    Returns (all_passed, violations) where each violation is a CheckResult with
+    code PREREQ_ORDER and a course-specific reason.
     """
-    violations: list[str] = []
+    violations: list[CheckResult] = []
 
     all_planned_ids = list({c for courses in plan.planned_courses.values() for c in courses})
     if not all_planned_ids:
@@ -199,10 +287,15 @@ def prereqs_satisfied(plan: CoursePlan, client) -> tuple[bool, list[str]]:
                     if not any(p in available for p in prereqs):
                         sample = prereqs[:3]
                         ellipsis = "…" if len(prereqs) > 3 else ""
-                        violations.append(
-                            f"{course} in {quarter}: need one of {sample}{ellipsis} "
-                            f"(OR group {gkey!r}) — none satisfied"
-                        )
+                        violations.append(CheckResult(
+                            valid=False,
+                            reason=(
+                                f"Can't place {course} in {_pretty_quarter(quarter)} — "
+                                f"needs one of {sample}{ellipsis} (OR group {gkey!r}) "
+                                f"scheduled earlier; none is."
+                            ),
+                            code=CODE_PREREQ_ORDER,
+                        ))
             available.update(_norm(c) for c in plan.planned_courses[quarter])
 
     else:
@@ -230,19 +323,35 @@ def prereqs_satisfied(plan: CoursePlan, client) -> tuple[bool, list[str]]:
                 nc = _norm(course)
                 tree = prereq_trees.get(nc)
                 if tree and not _eval_tree(tree, available, same_q):
-                    violations.append(
-                        f"{course} in {quarter}: prerequisites not satisfied "
-                        f"(evaluated prerequisite_tree for {course})"
-                    )
+                    unmet = _representative_unmet(tree, available, same_q)
+                    if unmet:
+                        where = _where_scheduled(unmet, plan)
+                        whenc = (f"isn't scheduled until {where}" if where
+                                 else "isn't in your plan")
+                        detail = f"prerequisite {unmet} {whenc}"
+                    else:
+                        detail = "its prerequisites aren't satisfied yet"
+                    violations.append(CheckResult(
+                        valid=False,
+                        reason=(
+                            f"Can't place {course} in {_pretty_quarter(quarter)} — "
+                            f"{detail}."
+                        ),
+                        code=CODE_PREREQ_ORDER,
+                    ))
             available.update(_norm(c) for c in plan.planned_courses[quarter])
 
     return len(violations) == 0, violations
 
 
-def major_requirements_met(plan: CoursePlan, client) -> tuple[bool, list[str]]:
-    """Required, elective, and GE requirement rows must be covered by the plan."""
+def major_requirements_met(plan: CoursePlan, client) -> tuple[bool, list[CheckResult]]:
+    """Required, elective, and GE requirement rows must be covered by the plan.
+
+    Returns (all_passed, violations) where each violation is a CheckResult with
+    code REQ_UNCOVERED.
+    """
     _load_aliases(client)  # FIX 6
-    violations: list[str] = []
+    violations: list[CheckResult] = []
 
     all_courses = {_norm(c) for c in plan.completed_courses}
     for courses_in_q in plan.planned_courses.values():
@@ -276,7 +385,9 @@ def major_requirements_met(plan: CoursePlan, client) -> tuple[bool, list[str]]:
         pass  # catalogue table missing or query failed — fall back to API rows only
 
     if not rows:
-        return True, [f"No requirements found for major {plan.major_id!r} — skipping"]
+        print(f"[major_requirements_met] No requirements found for "
+              f"major {plan.major_id!r} — skipping")
+        return True, []
 
     for req in rows:
         course_list: list[str] = req.get("courses") or []
@@ -291,10 +402,14 @@ def major_requirements_met(plan: CoursePlan, client) -> tuple[bool, list[str]]:
         if covered < needed:
             short = course_list[:4]
             ellipsis = "…" if len(course_list) > 4 else ""
-            violations.append(
-                f"[{req_type}] {group_name!r}: need {needed} of "
-                f"{short}{ellipsis}, have {covered}"
-            )
+            violations.append(CheckResult(
+                valid=False,
+                reason=(
+                    f"Requirement {group_name!r} ({req_type}) needs {needed} of "
+                    f"{short}{ellipsis} — only {covered} scheduled."
+                ),
+                code=CODE_REQ_UNCOVERED,
+            ))
 
     # FIX 3: Also validate university-wide GE requirements (major_id = "ALL_MAJORS").
     # A plan fails if any GE group has fewer courses than courses_needed.
@@ -318,32 +433,48 @@ def major_requirements_met(plan: CoursePlan, client) -> tuple[bool, list[str]]:
         if covered < needed:
             short = course_list[:4]
             ellipsis = "…" if len(course_list) > 4 else ""
-            violations.append(
-                f"[GE] {group_name!r}: need {needed} of "
-                f"{short}{ellipsis}, have {covered}"
-            )
+            violations.append(CheckResult(
+                valid=False,
+                reason=(
+                    f"GE requirement {group_name!r} needs {needed} of "
+                    f"{short}{ellipsis} — only {covered} scheduled."
+                ),
+                code=CODE_REQ_UNCOVERED,
+            ))
 
     return len(violations) == 0, violations
 
 
-def units_valid(plan: CoursePlan, client=None) -> tuple[bool, list[str]]:
-    """No quarter may exceed units_per_quarter."""
-    violations: list[str] = []
+def units_valid(plan: CoursePlan, client=None) -> tuple[bool, list[CheckResult]]:
+    """No quarter may exceed units_per_quarter.
+
+    Returns (all_passed, violations) where each violation is a CheckResult with
+    code UNIT_CAP.
+    """
+    violations: list[CheckResult] = []
 
     for quarter, courses in plan.planned_courses.items():
         total = len(courses) * UNITS_PER_COURSE
         if total > plan.units_per_quarter:
-            violations.append(
-                f"{quarter}: {len(courses)} courses = {total} units "
-                f"(cap is {plan.units_per_quarter})"
-            )
+            violations.append(CheckResult(
+                valid=False,
+                reason=(
+                    f"{_pretty_quarter(quarter)} would reach {total} units "
+                    f"({len(courses)} courses) — cap is {plan.units_per_quarter}."
+                ),
+                code=CODE_UNIT_CAP,
+            ))
 
     return len(violations) == 0, violations
 
 
-def no_duplicate_courses(plan: CoursePlan, client=None) -> tuple[bool, list[str]]:
-    """No course may appear in completed_courses and planned_courses, or twice in planned."""
-    violations: list[str] = []
+def no_duplicate_courses(plan: CoursePlan, client=None) -> tuple[bool, list[CheckResult]]:
+    """No course may appear in completed_courses and planned_courses, or twice in planned.
+
+    Returns (all_passed, violations) where each violation is a CheckResult with
+    code DUPLICATE.
+    """
+    violations: list[CheckResult] = []
     completed_set = {_norm(c) for c in plan.completed_courses}
     seen: set[str] = set()
 
@@ -351,9 +482,19 @@ def no_duplicate_courses(plan: CoursePlan, client=None) -> tuple[bool, list[str]
         for course in courses:
             nc = _norm(course)
             if nc in completed_set:
-                violations.append(f"{course} in {quarter} is already in completed_courses")
+                violations.append(CheckResult(
+                    valid=False,
+                    reason=(f"{course} in {_pretty_quarter(quarter)} is already "
+                            f"in your completed courses."),
+                    code=CODE_DUPLICATE,
+                ))
             if nc in seen:
-                violations.append(f"{course} in {quarter} appears more than once in planned_courses")
+                violations.append(CheckResult(
+                    valid=False,
+                    reason=(f"{course} appears more than once in the plan "
+                            f"(again in {_pretty_quarter(quarter)})."),
+                    code=CODE_DUPLICATE,
+                ))
             seen.add(nc)
 
     return len(violations) == 0, violations
@@ -361,8 +502,12 @@ def no_duplicate_courses(plan: CoursePlan, client=None) -> tuple[bool, list[str]
 
 # ── Combined validator ────────────────────────────────────────────────────────
 
-def validate(plan: CoursePlan) -> tuple[bool, list[str]]:
-    """Run all hard constraints. Returns (all_passed, all_violations)."""
+def validate(plan: CoursePlan) -> tuple[bool, list[CheckResult]]:
+    """Run all hard constraints. Returns (all_passed, all_violations).
+
+    all_violations is a list of CheckResult (each with reason + code); empty
+    when the plan is fully valid.
+    """
     client = create_client(os.getenv("SUPABASE_URL"), os.getenv("SUPABASE_SERVICE_KEY"))
     _load_aliases(client)  # FIX 6
 
@@ -374,7 +519,7 @@ def validate(plan: CoursePlan) -> tuple[bool, list[str]]:
     ]
 
     all_passed = True
-    all_violations: list[str] = []
+    all_violations: list[CheckResult] = []
 
     for name, (passed, violations) in checks:
         if not passed:
@@ -382,4 +527,169 @@ def validate(plan: CoursePlan) -> tuple[bool, list[str]]:
         all_violations.extend(violations)
 
     return all_passed, all_violations
+
+
+# ── Move-level checks + public entry point ────────────────────────────────────
+# These check the placement of ONE course into ONE quarter and return a single
+# CheckResult.  They are the primitives an interactive editor / API layer calls
+# on every drag-and-drop action.
+
+def _simulate_move(plan: CoursePlan, course: str, target_quarter: str) -> CoursePlan:
+    """Return a deep-ish copy of `plan` with `course` placed in `target_quarter`.
+
+    The course is removed from any quarter it currently occupies first, so this
+    models a *move* (not an add) when the course is already scheduled.
+    """
+    nc = _norm(course)
+    new_planned: dict[str, list[str]] = {}
+    for q, courses in plan.planned_courses.items():
+        new_planned[q] = [c for c in courses if _norm(c) != nc]
+    new_planned.setdefault(target_quarter, [])
+    new_planned[target_quarter].append(course)
+    return CoursePlan(
+        major_id          = plan.major_id,
+        completed_courses = list(plan.completed_courses),
+        planned_courses   = new_planned,
+        graduation_year   = plan.graduation_year,
+        units_per_quarter = plan.units_per_quarter,
+    )
+
+
+def check_duplicate(plan: CoursePlan, course: str, target_quarter: str) -> CheckResult:
+    """Reject placing a course that's already completed or already in the plan."""
+    nc = _norm(course)
+    if nc in {_norm(c) for c in plan.completed_courses}:
+        return CheckResult(
+            valid=False,
+            reason=f"{course} is already in your completed courses.",
+            code=CODE_DUPLICATE,
+        )
+    # Already placed in a quarter other than the target → moving is fine; placing
+    # a second copy is not.  _simulate_move removes prior copies, so a duplicate
+    # only remains if the same id appears twice in the source plan.
+    occurrences = sum(
+        1 for courses in plan.planned_courses.values()
+        for c in courses if _norm(c) == nc
+    )
+    if occurrences > 1:
+        return CheckResult(
+            valid=False,
+            reason=f"{course} already appears more than once in the plan.",
+            code=CODE_DUPLICATE,
+        )
+    return CheckResult(valid=True, reason=None, code=CODE_DUPLICATE)
+
+
+def check_unit_cap(plan: CoursePlan, course: str, target_quarter: str) -> CheckResult:
+    """Reject a placement that pushes the target quarter over its unit cap."""
+    sim = _simulate_move(plan, course, target_quarter)
+    total = len(sim.planned_courses.get(target_quarter, [])) * UNITS_PER_COURSE
+    if total > sim.units_per_quarter:
+        return CheckResult(
+            valid=False,
+            reason=(
+                f"{_pretty_quarter(target_quarter)} would reach {total} units "
+                f"with {course} — cap is {sim.units_per_quarter}."
+            ),
+            code=CODE_UNIT_CAP,
+        )
+    return CheckResult(valid=True, reason=None, code=CODE_UNIT_CAP)
+
+
+def check_prereq_order(
+    plan: CoursePlan,
+    course: str,
+    target_quarter: str,
+    trees: dict[str, dict] | None = None,
+    client=None,
+) -> CheckResult:
+    """Reject a placement that leaves any prerequisite chain unsatisfied.
+
+    Evaluates the *resulting* plan (course moved to target_quarter) and reports
+    the first prereq violation — which may be the moved course's own prereq being
+    too late, or a course downstream that depended on the moved course.
+    """
+    sim = _simulate_move(plan, course, target_quarter)
+
+    if trees is None:
+        if client is None:
+            client = create_client(
+                os.getenv("SUPABASE_URL"), os.getenv("SUPABASE_SERVICE_KEY")
+            )
+        _load_aliases(client)
+        all_ids = list({c for cs in sim.planned_courses.values() for c in cs})
+        rows = (
+            client.table("courses")
+            .select("id,prerequisite_tree")
+            .in_("id", all_ids)
+            .execute()
+            .data
+        )
+        trees = {
+            _norm(r["id"]): r["prerequisite_tree"]
+            for r in rows
+            if r.get("prerequisite_tree")
+        }
+
+    sorted_quarters = sorted(sim.planned_courses.keys(), key=_qkey)
+    available: set[str] = {_norm(c) for c in sim.completed_courses}
+
+    for quarter in sorted_quarters:
+        same_q = frozenset(_norm(c) for c in sim.planned_courses[quarter])
+        for c in sim.planned_courses[quarter]:
+            tree = trees.get(_norm(c))
+            if tree and not _eval_tree(tree, available, same_q):
+                unmet = _representative_unmet(tree, available, same_q)
+                if unmet:
+                    where = _where_scheduled(unmet, sim)
+                    whenc = (f"isn't scheduled until {where}" if where
+                             else "isn't in your plan")
+                    detail = f"prerequisite {unmet} {whenc}"
+                else:
+                    detail = "its prerequisites aren't satisfied yet"
+                return CheckResult(
+                    valid=False,
+                    reason=(f"Can't place {c} in {_pretty_quarter(quarter)} — "
+                            f"{detail}."),
+                    code=CODE_PREREQ_ORDER,
+                )
+        available.update(_norm(c) for c in sim.planned_courses[quarter])
+
+    return CheckResult(valid=True, reason=None, code=CODE_PREREQ_ORDER)
+
+
+def validate_move(
+    plan: CoursePlan,
+    course: str,
+    target_quarter: str,
+    trees: dict[str, dict] | None = None,
+    client=None,
+) -> CheckResult:
+    """Single public entry point for an editor / API layer.
+
+    Runs every move-level hard constraint for placing ONE course into ONE quarter
+    and returns the FIRST violation, or a valid CheckResult if the move is legal.
+    Check order: duplicate → unit cap → prerequisite order.
+
+    Note: requirement coverage (REQ_UNCOVERED) is a whole-plan property — placing
+    a single course can only help it — so it is validated via validate(), not here.
+    """
+    if client is None:
+        client = create_client(
+            os.getenv("SUPABASE_URL"), os.getenv("SUPABASE_SERVICE_KEY")
+        )
+
+    dup = check_duplicate(plan, course, target_quarter)
+    if not dup.valid:
+        return dup
+
+    cap = check_unit_cap(plan, course, target_quarter)
+    if not cap.valid:
+        return cap
+
+    pre = check_prereq_order(plan, course, target_quarter, trees=trees, client=client)
+    if not pre.valid:
+        return pre
+
+    return CheckResult(valid=True, reason=None, code="OK")
 

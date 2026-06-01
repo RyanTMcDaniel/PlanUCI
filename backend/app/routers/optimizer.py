@@ -2,10 +2,11 @@
 Optimizer API endpoints.
 
 POST /optimizer/generate      — plan_generator.generate()
-POST /optimizer/whatif        — whatif.run_whatif()
+POST /optimizer/whatif        — whatif.optimize_around_locks()  (rebalance around locks)
 POST /optimizer/swap          — swap_suggester.suggest_swaps()
 POST /optimizer/move          — swap_suggester.suggest_move()
 POST /optimizer/validate_locks — whatif.validate_locks()
+POST /optimizer/requirements_state — plan_generator.get_requirements_state()
 """
 
 import sys
@@ -24,9 +25,14 @@ from pydantic import BaseModel
 from supabase import create_client
 
 from scripts.optimizer.hard_constraints import CoursePlan
-from scripts.optimizer.plan_generator import generate, FeasibilityError
+from scripts.optimizer.plan_generator import generate, FeasibilityError, get_requirements_state
 from scripts.optimizer.swap_suggester import suggest_swaps, suggest_move
-from scripts.optimizer.whatif import validate_locks, run_whatif
+from scripts.optimizer.whatif import (
+    validate_locks,
+    optimize_around_locks,
+    propose_prereq_chain,
+    apply_prereq_chain,
+)
 from scripts.optimizer import cache as optimizer_cache
 
 _ENV = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", ".env")
@@ -61,16 +67,6 @@ def _variant_dict(v) -> dict:
     """Serialise an OptimizationResult to a JSON-safe dict."""
     return {
         "planned_courses": v.plan.planned_courses,
-        "soft_score":      round(v.soft_score, 6),
-        "soft_breakdown":  {k: round(val, 6) for k, val in v.soft_breakdown.items()},
-        "violations":      v.violations,
-    }
-
-
-def _whatif_variant_dict(v) -> dict:
-    return {
-        "planned_courses": v.planned_courses,
-        "locked_courses":  v.locked_courses,
         "soft_score":      round(v.soft_score, 6),
         "soft_breakdown":  {k: round(val, 6) for k, val in v.soft_breakdown.items()},
         "violations":      v.violations,
@@ -151,56 +147,80 @@ def optimizer_generate(req: GenerateRequest):
         "group_map":            result.group_map,
         "ap_credited_courses":  result.ap_credited_courses,
         "ap_units_awarded":     result.ap_units_awarded,
+        "choice_groups":        result.choice_groups,
         "cached":               False,
     }
     optimizer_cache.set(client, cache_key, response)
     return response
 
 
-# ── /optimizer/whatif ─────────────────────────────────────────────────────────
+# ── /optimizer/whatif — rebalance the existing plan around locked courses ─────
 
 class WhatIfRequest(BaseModel):
     plan:               CoursePlanIn
-    locked_courses:     dict[str, str]       # {course_id: quarter}
-    major_id:           str
-    graduation_quarter: str
+    locked_courses:     dict[str, str]       # {course_id: quarter} — locked in the grid
+    major_id:           str = ""             # accepted for backward compat; unused
+    graduation_quarter: str = ""             # accepted for backward compat; unused
     units_per_quarter:  int = 16
     waived_ges:         list[str] = []
-    ap_scores:          dict[str, int] = {}  # {"AP Calculus BC": 4, ...}
+    ap_scores:          dict[str, int] = {}
 
 
 @router.post("/whatif")
 def optimizer_whatif(req: WhatIfRequest):
+    """Rebalance the plan around locked courses (optimize_around_locks).
+
+    Locked courses never move; only unlocked courses already in the plan are
+    repositioned.  The course set is the plan itself (the editor model) — this no
+    longer regenerates from major requirements.  Returns the optimize_around_locks
+    shape: {"status":"ok","plans":[...]} or {"status":"infeasible","conflicts":[...]}.
+    """
     try:
-        result = run_whatif(
-            plan               = req.plan.to_domain(),
-            locked_courses     = req.locked_courses,
-            major_id           = req.major_id,
-            graduation_quarter = req.graduation_quarter,
-            units_per_quarter  = req.units_per_quarter,
-            waived_ges         = req.waived_ges,
-            ap_scores          = req.ap_scores,
+        result = optimize_around_locks(
+            req.plan.to_domain(),
+            list(req.locked_courses.keys()),
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-    if result.lock_conflicts:
-        raise HTTPException(
-            status_code=422,
-            detail={
-                "error":    "lock_conflict",
-                "conflicts": result.lock_conflicts,
-            },
-        )
+    return result
 
-    return {
-        "variants":           [_whatif_variant_dict(v) for v in result.variants],
-        "lock_conflicts":     result.lock_conflicts,
-        "quarters_available": result.quarters_available,
-        "quarters_needed":    result.quarters_needed,
-        "tight_timeline":     result.tight_timeline,
-        "overflow_count":     result.overflow_count,
-    }
+
+# ── /optimizer/propose_prereqs — detect a course's missing prereq chain ───────
+
+class ProposePrereqsRequest(BaseModel):
+    plan:      CoursePlanIn
+    course_id: str
+
+
+@router.post("/propose_prereqs")
+def optimizer_propose_prereqs(req: ProposePrereqsRequest):
+    """Propose (not apply) placements for a course's missing prerequisite chain.
+
+    Returns {missing, proposed_placements, status, conflicts} — the plan is never
+    mutated here; the frontend shows the proposal and the user confirms.
+    """
+    try:
+        return propose_prereq_chain(req.plan.to_domain(), req.course_id)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ── /optimizer/apply_prereqs — commit an accepted prereq proposal ─────────────
+
+class ApplyPrereqsRequest(BaseModel):
+    plan:                CoursePlanIn
+    proposed_placements: list[dict]   # [{course_id, quarter, ...}, ...]
+
+
+@router.post("/apply_prereqs")
+def optimizer_apply_prereqs(req: ApplyPrereqsRequest):
+    """Apply an accepted proposal, returning the updated planned_courses."""
+    try:
+        updated = apply_prereq_chain(req.plan.to_domain(), req.proposed_placements)
+        return {"planned_courses": updated.planned_courses}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 # ── /optimizer/swap ───────────────────────────────────────────────────────────
@@ -251,6 +271,28 @@ class ValidateLocksRequest(BaseModel):
     locked_courses:    dict[str, str]        # {course_id: quarter}
     completed_courses: list[str] = []
     ap_scores:         dict[str, int] = {}   # {"AP Calculus BC": 4, ...}
+
+
+# ── /optimizer/requirements_state ─────────────────────────────────────────────
+
+class RequirementsStateRequest(BaseModel):
+    plan:       CoursePlanIn
+    waived_ges: list[str] = []
+    ap_scores:  dict[str, int] = {}
+
+
+@router.post("/requirements_state")
+def optimizer_requirements_state(req: RequirementsStateRequest):
+    """Return required_placed + unresolved choice_groups (with remaining) for a plan."""
+    try:
+        state = get_requirements_state(
+            req.plan.to_domain(),
+            waived_ges=req.waived_ges,
+            ap_scores=req.ap_scores or None,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    return state
 
 
 @router.post("/validate_locks")
