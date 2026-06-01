@@ -125,7 +125,10 @@ def evaluate(plan: CoursePlan) -> OptimizationResult:
     all_ids = [c for courses in plan.planned_courses.values() for c in courses]
     meta = _load_course_meta(client, all_ids)
 
-    valid, violations = validate(plan)
+    valid, checks = validate(plan)
+    # validate() now returns structured CheckResults; OptimizationResult.violations
+    # is the JSON-facing string list, so surface each check's human-readable reason.
+    violations = [c.reason for c in checks]
     soft_score, breakdown = _soft_score(plan, diff_scores, meta)
 
     return OptimizationResult(
@@ -157,14 +160,15 @@ def optimize(
     meta = _load_course_meta(client, all_ids)
     trees = _prereq_trees(client, all_ids)
 
-    # Full validation for reporting purposes
-    hard_valid, violations = validate(plan)
+    # Full validation for reporting purposes (structured → reason strings)
+    hard_valid, checks = validate(plan)
+    violations = [c.reason for c in checks]
     init_score, init_breakdown = _soft_score(plan, diff_scores, meta)
 
     # major_requirements_met and no_duplicate_courses are invariant under moves
     # (the set of courses never changes), so we only block optimization when
     # prereqs or the unit cap are actually violated.
-    blocking = _check_prereqs(plan, trees) + units_valid(plan)[1]
+    blocking = bool(_check_prereqs(plan, trees)) or not units_valid(plan)[0]
     if blocking:
         return OptimizationResult(
             plan=plan,
