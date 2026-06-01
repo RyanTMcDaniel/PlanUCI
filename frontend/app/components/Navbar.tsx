@@ -68,9 +68,9 @@ export default function Navbar() {
       <div className="flex-1">
         <Link
           href="/planner"
-          className="text-[15px] font-semibold tracking-tight text-white hover:text-white/80 transition-colors"
+          className="text-[18px] font-bold tracking-tight text-white hover:text-white/80 transition-colors"
         >
-          Plan<span className="text-blue-500">UCI</span>
+          Plan<span className="text-[#FFC72C]">UCI</span>
         </Link>
       </div>
 
