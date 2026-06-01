@@ -92,6 +92,15 @@ function qkey(year: number, q: string) {
   return `${calYear}_${q}`;
 }
 
+// Inverse of qkey for display: "2027_winter" → "Year 2 · Winter".
+function formatQuarterKey(qk: string): string {
+  const [yStr, season = ""] = qk.split("_");
+  const calYear = parseInt(yStr, 10);
+  const yearIdx = season === "fall" ? calYear - START_YEAR + 1 : calYear - START_YEAR;
+  const seasonLabel = season ? season.charAt(0).toUpperCase() + season.slice(1) : qk;
+  return `Year ${yearIdx} · ${seasonLabel}`;
+}
+
 const UNIT_PRESETS: { label: string; value: number; warning: boolean }[] = [
   { label: "Standard 16 Units", value: 16, warning: false },
   { label: "Heavy 20 Units",    value: 20, warning: true  },
@@ -172,6 +181,32 @@ interface QuarterDifficultyResult {
   unitComponent: number;
   totalUnits: number;
 }
+
+// Backend requirements_state (POST /optimizer/requirements_state) — the authoritative
+// coverage source. choice_groups.placed/remaining EXCLUDE the mandatory backbone
+// (required + injected prereqs), so required courses appearing in elective pools no
+// longer wrongly mark those pools satisfied.
+interface BackendChoiceGroup {
+  group_id:  string;
+  label:     string;
+  choose_n:  number;
+  placed:    number;
+  remaining: number;
+  options:   { course_id: string }[];
+}
+interface RequirementsState {
+  required_placed: string[];
+  choice_groups:   BackendChoiceGroup[];
+  all_satisfied:   boolean;
+}
+// Unified per-group coverage returned by getCoverage().
+interface Coverage {
+  placed:    number;
+  needed:    number;
+  remaining: number;
+  done:      boolean;
+}
+type GetCoverage = (req: ReqGroup) => Coverage;
 
 function calculateQuarterDifficulty(courses: CourseWithDifficulty[]): QuarterDifficultyResult | null {
   if (courses.length === 0) return null;
@@ -946,7 +981,7 @@ function CoursePill({
 // ── Requirement group ─────────────────────────────────────────────────────────
 
 function RequirementGroup({
-  req, placedSet, apCreditedSet, courseInfoMap, difficultyMap, searchQuery, initialOpen,
+  req, placedSet, apCreditedSet, courseInfoMap, difficultyMap, searchQuery, initialOpen, getCoverage,
 }: {
   req: ReqGroup;
   placedSet: Set<string>;
@@ -955,6 +990,7 @@ function RequirementGroup({
   difficultyMap: Record<string, number>;
   searchQuery: string;
   initialOpen?: boolean;
+  getCoverage: GetCoverage;
 }) {
   const [open, setOpen] = useState(initialOpen ?? false);
 
@@ -970,8 +1006,7 @@ function RequirementGroup({
 
   if (filtered.length === 0) return null;
 
-  const placed = req.courses.filter((c) => placedSet.has(c)).length;
-  const done = placed >= req.courses_needed;
+  const { placed, needed, done } = getCoverage(req);
   const partial = !done && placed > 0;
   const accentColor = done ? "#22c55e" : partial ? "#3b82f6" : "transparent";
 
@@ -996,7 +1031,7 @@ function RequirementGroup({
         </div>
         <div className="flex items-center gap-1.5 shrink-0">
           <span className="text-[10px] px-1.5 py-[2px] rounded bg-[#1e1e1e] font-mono tabular-nums text-[#555]">
-            {placed}/{req.courses_needed}
+            {placed}/{needed}
           </span>
           <ChevronIcon open={open} />
         </div>
@@ -1025,7 +1060,7 @@ function RequirementGroup({
 // ── Flat group (inline pills, no expand) ──────────────────────────────────────
 
 function FlatGroup({
-  req, placedSet, apCreditedSet, courseInfoMap, difficultyMap, searchQuery,
+  req, placedSet, apCreditedSet, courseInfoMap, difficultyMap, searchQuery, getCoverage,
 }: {
   req: ReqGroup;
   placedSet: Set<string>;
@@ -1033,6 +1068,7 @@ function FlatGroup({
   courseInfoMap: Record<string, CourseDetail>;
   difficultyMap: Record<string, number>;
   searchQuery: string;
+  getCoverage: GetCoverage;
 }) {
   const filtered = useMemo(() => {
     if (!searchQuery) return req.courses;
@@ -1044,8 +1080,7 @@ function FlatGroup({
 
   if (filtered.length === 0) return null;
 
-  const placed = req.courses.filter((c) => placedSet.has(c)).length;
-  const done = placed >= req.courses_needed;
+  const { done } = getCoverage(req);
   const isChoice = req.courses_needed < req.courses.length;
   const showLabel = isChoice || req.courses.length > 1;
 
@@ -1082,7 +1117,7 @@ function FlatGroup({
 // ── Bucket section ────────────────────────────────────────────────────────────
 
 function BucketSection({
-  bucketKey, groups, placedSet, apCreditedSet, courseInfoMap, difficultyMap, searchQuery, defaultOpen,
+  bucketKey, groups, placedSet, apCreditedSet, courseInfoMap, difficultyMap, searchQuery, defaultOpen, getCoverage,
 }: {
   bucketKey: BucketKey;
   groups: ReqGroup[];
@@ -1092,21 +1127,18 @@ function BucketSection({
   difficultyMap: Record<string, number>;
   searchQuery: string;
   defaultOpen: boolean;
+  getCoverage: GetCoverage;
 }) {
   const [open, setOpen] = useState(defaultOpen);
 
   if (groups.length === 0) return null;
 
-  const totalNeeded = groups.reduce((s, r) => s + r.courses_needed, 0);
-  const totalPlaced = groups.reduce(
-    (s, r) => s + Math.min(r.courses.filter((c) => placedSet.has(c)).length, r.courses_needed),
-    0,
-  );
+  const covs = groups.map((r) => getCoverage(r));
+  const totalNeeded = covs.reduce((s, c) => s + c.needed, 0);
+  const totalPlaced = covs.reduce((s, c) => s + Math.min(c.placed, c.needed), 0);
   const done = totalPlaced >= totalNeeded;
   const partial = !done && totalPlaced > 0;
-  const firstIncomplete = groups.findIndex(
-    (r) => r.courses.filter((c) => placedSet.has(c)).length < r.courses_needed,
-  );
+  const firstIncomplete = covs.findIndex((c) => !c.done);
 
   return (
     <div className="mb-px">
@@ -1139,6 +1171,7 @@ function BucketSection({
                 difficultyMap={difficultyMap}
                 searchQuery={searchQuery}
                 initialOpen={i === firstIncomplete}
+                getCoverage={getCoverage}
               />
             ) : (
               <FlatGroup
@@ -1149,6 +1182,7 @@ function BucketSection({
                 courseInfoMap={courseInfoMap}
                 difficultyMap={difficultyMap}
                 searchQuery={searchQuery}
+                getCoverage={getCoverage}
               />
             ),
           )}
@@ -1161,7 +1195,7 @@ function BucketSection({
 // ── GE section ─────────────────────────────────────────────────────────────────
 
 function GESection({
-  req, placedSet, apCreditedSet, apSatisfiedGEs, courseInfoMap, difficultyMap, searchQuery, initialOpen,
+  req, placedSet, apCreditedSet, apSatisfiedGEs, courseInfoMap, difficultyMap, searchQuery, initialOpen, getCoverage,
 }: {
   req: ReqGroup;
   placedSet: Set<string>;
@@ -1171,6 +1205,7 @@ function GESection({
   difficultyMap: Record<string, number>;
   searchQuery: string;
   initialOpen?: boolean;
+  getCoverage: GetCoverage;
 }) {
   const [open, setOpen] = useState(initialOpen ?? false);
 
@@ -1189,10 +1224,9 @@ function GESection({
   // AP exam directly satisfies this GE category (e.g. AP World History → GE-VIII)
   const apDirect = apSatisfiedGEs.has(req.requirement_group ?? "");
 
-  const satisfied = apDirect
-    ? req.courses_needed
-    : Math.min(req.courses.filter((c) => placedSet.has(c)).length, req.courses_needed);
-  const done = satisfied >= req.courses_needed;
+  const cov = getCoverage(req);
+  const satisfied = apDirect ? cov.needed : Math.min(cov.placed, cov.needed);
+  const done = apDirect ? true : cov.done;
   const partial = !done && satisfied > 0;
   const accentColor = done ? "#22c55e" : partial ? "#3b82f6" : "transparent";
 
@@ -1220,7 +1254,7 @@ function GESection({
             </span>
           )}
           <span className="text-[9px] px-1.5 py-[2px] rounded bg-[#1e1e1e] font-mono tabular-nums text-[#555]">
-            {satisfied}/{req.courses_needed}
+            {satisfied}/{cov.needed}
           </span>
           <ChevronIcon open={open} />
         </div>
@@ -1298,6 +1332,18 @@ export default function PlannerClient() {
   const [lockConflictErrors, setLockConflictErrors] = useState<string[] | null>(null);
   const [pendingLock, setPendingLock] = useState<{ courseId: string; warnings: string[] } | null>(null);
   const [clearSuccess, setClearSuccess] = useState(false);
+  // Prereq-chain proposal awaiting user confirmation (additive — does not block the
+  // dropped course; only offers to add its missing prerequisites).
+  const [prereqProposal, setPrereqProposal] = useState<{
+    courseId:   string;
+    placements: { course_id: string; quarter: string; reason?: string }[];
+    plan:       PlannedCourses;
+  } | null>(null);
+  const [prereqApplying, setPrereqApplying] = useState(false);
+  // Backend-computed requirement coverage — the authoritative source for badges,
+  // bucket counts and "all satisfied". Null until the first fetch returns; kept at
+  // the previous value while a refetch is in flight (no flicker).
+  const [requirementsState, setRequirementsState] = useState<RequirementsState | null>(null);
 
   const supabase = useMemo(() => createClient(), []);
   const saveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -1352,15 +1398,102 @@ export default function PlannerClient() {
       : selectedDisplayName || selectedMajorId;
   }, [selectedMajorId, selectedDisplayName, specializations]);
 
+  // ── Coverage source of truth ─────────────────────────────────────────────
+  // getCoverage(req) is the SINGLE place coverage is computed. For a choice /
+  // elective / GE pick-N group it reads the backend's backbone-aware numbers; for
+  // a take-all required group (no backend entry) — or before the first backend
+  // response — it falls back to the client count (correct & unchanged for those).
+  const getCoverage = useMemo<GetCoverage>(() => {
+    const byKey = new Map<string, BackendChoiceGroup>();
+    if (requirementsState) {
+      for (const g of requirementsState.choice_groups) {
+        if (g.group_id) byKey.set(g.group_id, g);
+        if (g.label) byKey.set(g.label, g);
+      }
+    }
+    return (req: ReqGroup): Coverage => {
+      const be = byKey.get(req.requirement_group ?? "") ?? byKey.get(req.group_name);
+      if (be) {
+        return {
+          placed: be.placed,
+          needed: be.choose_n,
+          remaining: be.remaining,
+          done: be.remaining === 0,
+        };
+      }
+      const placed = req.courses.filter((c) => placedSet.has(c)).length;
+      return {
+        placed,
+        needed: req.courses_needed,
+        remaining: Math.max(0, req.courses_needed - placed),
+        done: placed >= req.courses_needed,
+      };
+    };
+  }, [requirementsState, placedSet]);
+
+  // Client-only coverage — used for the MINOR tab, which the backend
+  // requirements_state (major-scoped) doesn't cover. Keeps minor behavior identical
+  // and avoids any major/minor group-name collision in the backend lookup.
+  const clientCoverage = useMemo<GetCoverage>(() => {
+    return (req: ReqGroup): Coverage => {
+      const placed = req.courses.filter((c) => placedSet.has(c)).length;
+      return {
+        placed,
+        needed: req.courses_needed,
+        remaining: Math.max(0, req.courses_needed - placed),
+        done: placed >= req.courses_needed,
+      };
+    };
+  }, [placedSet]);
+
+  // Fetch backend coverage AFTER a placement settles (debounced — not mid-drag).
+  // Keep the previous requirementsState while in flight so badges don't flicker.
+  useEffect(() => {
+    if (!selectedMajorId) {
+      setRequirementsState(null);
+      return;
+    }
+    const handle = setTimeout(() => {
+      fetch("/api/requirements-state", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          plan: {
+            major_id: selectedMajorId,
+            completed_courses: [],
+            planned_courses: plannedCourses,
+            graduation_year: parseInt(gradQuarter.split("_")[0]),
+            units_per_quarter: maxUnits,
+          },
+          waived_ges: [],
+          ap_scores: apScores,
+        }),
+      })
+        .then((r) => (r.ok ? r.json() : null))
+        .then((data) => {
+          if (data && Array.isArray(data.choice_groups)) {
+            setRequirementsState(data as RequirementsState);
+          }
+        })
+        .catch(() => {
+          /* keep previous coverage on error */
+        });
+    }, 400);
+    return () => clearTimeout(handle);
+  }, [plannedCourses, selectedMajorId, maxUnits, apScores, gradQuarter]);
+
   const totalRequired = useMemo(
-    () => requirements.reduce((s, r) => s + r.courses_needed, 0),
-    [requirements],
+    () => requirements.reduce((s, r) => s + getCoverage(r).needed, 0),
+    [requirements, getCoverage],
   );
 
   const placedRequired = useMemo(
     () =>
-      [...placedSet].filter((id) => requirements.some((r) => r.courses.includes(id))).length,
-    [placedSet, requirements],
+      requirements.reduce((s, r) => {
+        const cov = getCoverage(r);
+        return s + Math.min(cov.placed, cov.needed);
+      }, 0),
+    [requirements, getCoverage],
   );
 
   const minorTotalRequired = useMemo(
@@ -1670,12 +1803,12 @@ export default function PlannerClient() {
 
     const tq = dst.quarterKey;
     if (src.type === "sidebar") {
-      setPlannedCourses((prev) => {
-        if (prev[tq]?.includes(src.courseId)) return prev;
-        const next = { ...prev, [tq]: [...(prev[tq] ?? []), src.courseId] };
-        validatePlan(next);
-        return next;
-      });
+      if (plannedCourses[tq]?.includes(src.courseId)) return;
+      const next = { ...plannedCourses, [tq]: [...(plannedCourses[tq] ?? []), src.courseId] };
+      setPlannedCourses(next);
+      validatePlan(next);
+      // Additive: offer to add any missing prerequisite chain (does not block the drop).
+      offerPrereqs(next, src.courseId);
     } else if (src.type === "placed" && src.quarterKey && src.quarterKey !== tq) {
       setPlannedCourses((prev) => {
         const next = {
@@ -1686,6 +1819,80 @@ export default function PlannerClient() {
         validatePlan(next);
         return next;
       });
+    }
+  }
+
+  // Detect a just-added course's missing prereq chain and OFFER to add it.
+  // Never mutates the plan — only sets prereqProposal for the user to confirm.
+  async function offerPrereqs(planSnapshot: PlannedCourses, courseId: string) {
+    if (!selectedMajorId) return;
+    try {
+      const res = await fetch("/api/propose-prereqs", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          plan: {
+            major_id: selectedMajorId,
+            completed_courses: [],
+            planned_courses: planSnapshot,
+            graduation_year: parseInt(gradQuarter.split("_")[0]),
+            units_per_quarter: maxUnits,
+          },
+          course_id: courseId,
+        }),
+      });
+      if (!res.ok) return; // best-effort: the course stays placed regardless
+      const data = await res.json();
+      if (data?.status === "infeasible") {
+        const reasons: string[] = Array.isArray(data.conflicts)
+          ? data.conflicts.map((c: { reason?: string }) => c?.reason ?? String(c))
+          : [];
+        if (reasons.length) setToast(`${fmtCourse(courseId)}: ${reasons[0]}`);
+        return;
+      }
+      const placements = Array.isArray(data?.proposed_placements)
+        ? data.proposed_placements
+        : [];
+      if (Array.isArray(data?.missing) && data.missing.length > 0 && placements.length > 0) {
+        setPrereqProposal({ courseId, placements, plan: planSnapshot });
+      }
+    } catch {
+      // offline / network error — skip the offer; the course remains placed
+    }
+  }
+
+  // Commit an accepted prereq proposal (separate from detection).
+  async function applyProposal() {
+    if (!prereqProposal) return;
+    setPrereqApplying(true);
+    try {
+      const res = await fetch("/api/apply-prereqs", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          plan: {
+            major_id: selectedMajorId,
+            completed_courses: [],
+            planned_courses: prereqProposal.plan,
+            graduation_year: parseInt(gradQuarter.split("_")[0]),
+            units_per_quarter: maxUnits,
+          },
+          proposed_placements: prereqProposal.placements,
+        }),
+      });
+      const data = await res.json();
+      const plan = data?.planned_courses as PlannedCourses | undefined;
+      if (res.ok && plan) {
+        setPlannedCourses(plan);
+        validatePlan(plan);
+      } else {
+        setToast("Could not add prerequisites");
+      }
+    } catch (err) {
+      setToast(err instanceof Error ? err.message : "Could not add prerequisites");
+    } finally {
+      setPrereqApplying(false);
+      setPrereqProposal(null);
     }
   }
 
@@ -1809,10 +2016,8 @@ export default function PlannerClient() {
 
   const firstIncompleteBucket = useMemo(() => {
     const order: BucketKey[] = ["lower", "upper", "choice", "elective"];
-    return order.find((k) =>
-      bucketed[k].some((r) => r.courses.filter((c) => placedSet.has(c)).length < r.courses_needed),
-    ) ?? null;
-  }, [bucketed, placedSet]);
+    return order.find((k) => bucketed[k].some((r) => !getCoverage(r).done)) ?? null;
+  }, [bucketed, getCoverage]);
 
   // Minor requirements pooled into the same display buckets as the major
   const minorBucketed = useMemo(() => {
@@ -1830,14 +2035,10 @@ export default function PlannerClient() {
 
   const firstIncompleteMinorBucket = useMemo(() => {
     const order: BucketKey[] = ["lower", "upper", "choice", "elective"];
-    return order.find((k) =>
-      minorBucketed[k].some((r) => r.courses.filter((c) => placedSet.has(c)).length < r.courses_needed),
-    ) ?? null;
-  }, [minorBucketed, placedSet]);
+    return order.find((k) => minorBucketed[k].some((r) => !clientCoverage(r).done)) ?? null;
+  }, [minorBucketed, clientCoverage]);
 
-  const firstIncompleteGE = geRequirements.findIndex(
-    (r) => r.courses.filter((c) => placedSet.has(c)).length < r.courses_needed,
-  );
+  const firstIncompleteGE = geRequirements.findIndex((r) => !getCoverage(r).done);
 
   // ── Render ──────────────────────────────────────────────────────────────────
   return (
@@ -1934,6 +2135,9 @@ export default function PlannerClient() {
                 {" "}of{" "}
                 <span className="text-[#666] font-semibold">{totalRequired}</span>
                 {" "}courses placed
+                {requirementsState?.all_satisfied && (
+                  <span className="text-emerald-500 font-semibold"> · All requirements met</span>
+                )}
               </p>
             )}
 
@@ -1975,6 +2179,7 @@ export default function PlannerClient() {
                         difficultyMap={difficultyMap}
                         searchQuery={searchQuery}
                         defaultOpen={firstIncompleteBucket === key}
+                        getCoverage={getCoverage}
                       />
                     ))}
                     {!selectedMajorId && (
@@ -2032,6 +2237,7 @@ export default function PlannerClient() {
                         courseInfoMap={courseInfoMap} difficultyMap={difficultyMap}
                         searchQuery={searchQuery}
                         initialOpen={i === firstIncompleteGE}
+                        getCoverage={getCoverage}
                       />
                     ))}
                     {geRequirements.length === 0 && (
@@ -2066,6 +2272,7 @@ export default function PlannerClient() {
                         difficultyMap={difficultyMap}
                         searchQuery={searchQuery}
                         defaultOpen={firstIncompleteMinorBucket === key}
+                        getCoverage={clientCoverage}
                       />
                     ))}
                     {!selectedMinorId && (
@@ -2285,12 +2492,41 @@ export default function PlannerClient() {
                     }
                   } else {
                     setLockConflictErrors(null);
-                    const plan = data?.variants?.[0]?.planned_courses as PlannedCourses | undefined;
-                    if (plan) {
-                      setPlannedCourses(plan);
-                      validatePlan(plan);
+                    if (hasLocks) {
+                      // optimize_around_locks: { status, plans | conflicts }
+                      if (data?.status === "infeasible") {
+                        const reasons: string[] = Array.isArray(data.conflicts)
+                          ? data.conflicts.map(
+                              (c: { reason?: string }) => c?.reason ?? String(c),
+                            )
+                          : [];
+                        setToast(
+                          reasons.length
+                            ? `Can't rebalance with these locks — ${reasons.join(" · ")}`
+                            : "Can't rebalance with these locked courses.",
+                        );
+                      } else {
+                        const plan = data?.plans?.[0]?.planned_courses as
+                          | PlannedCourses
+                          | undefined;
+                        if (plan) {
+                          setPlannedCourses(plan);
+                          validatePlan(plan);
+                        } else {
+                          setToast("No plan returned from optimizer");
+                        }
+                      }
                     } else {
-                      setToast("No plan returned from optimizer");
+                      // generate(): { variants: [...] }
+                      const plan = data?.variants?.[0]?.planned_courses as
+                        | PlannedCourses
+                        | undefined;
+                      if (plan) {
+                        setPlannedCourses(plan);
+                        validatePlan(plan);
+                      } else {
+                        setToast("No plan returned from optimizer");
+                      }
                     }
                   }
                 } catch (err) {
@@ -2356,6 +2592,50 @@ export default function PlannerClient() {
                   className="flex-1 rounded-lg bg-amber-600 hover:bg-amber-500 py-2 text-xs font-medium text-white transition-colors"
                 >
                   Lock Anyway
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {prereqProposal && (
+          <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm">
+            <div className="w-96 rounded-xl border border-white/[0.1] bg-[#1a1a1a] p-6 shadow-2xl">
+              <h2 className="text-sm font-semibold text-white mb-1">
+                Add missing prerequisites?
+              </h2>
+              <p className="text-xs text-zinc-400 leading-relaxed mb-3">
+                {fmtCourse(prereqProposal.courseId)} needs{" "}
+                {prereqProposal.placements.length} prerequisite
+                {prereqProposal.placements.length === 1 ? "" : "s"} that aren&apos;t in
+                your plan yet. Add them in valid quarters?
+              </p>
+              <div className="mb-5 max-h-56 overflow-y-auto rounded-lg border border-white/[0.06] bg-[#141414] divide-y divide-white/[0.05]">
+                {prereqProposal.placements.map((p) => (
+                  <div key={p.course_id} className="flex items-center justify-between px-3 py-2">
+                    <span className="text-xs font-medium text-zinc-200">
+                      {fmtCourse(p.course_id)}
+                    </span>
+                    <span className="text-[11px] text-[#3b82f6] tabular-nums">
+                      → {formatQuarterKey(p.quarter)}
+                    </span>
+                  </div>
+                ))}
+              </div>
+              <div className="flex gap-2">
+                <button
+                  onClick={() => setPrereqProposal(null)}
+                  disabled={prereqApplying}
+                  className="flex-1 rounded-lg border border-white/[0.1] py-2 text-xs font-medium text-zinc-300 hover:bg-white/[0.06] transition-colors disabled:opacity-50"
+                >
+                  Not now
+                </button>
+                <button
+                  onClick={applyProposal}
+                  disabled={prereqApplying}
+                  className="flex-1 rounded-lg bg-[#3b82f6] hover:bg-[#2563eb] py-2 text-xs font-medium text-white transition-colors disabled:opacity-50"
+                >
+                  {prereqApplying ? "Adding…" : "Add prerequisites"}
                 </button>
               </div>
             </div>

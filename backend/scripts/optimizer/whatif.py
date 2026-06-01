@@ -1,68 +1,48 @@
 """
-What-if planner: regenerate a course plan with selected courses pinned
-to specific quarters.
+What-if planner: validate locked-course assignments and rebalance a plan
+around them.
 
 validate_locks(locked_courses) → (bool, list[str])
     Quick check that the locked quarter assignments don't conflict with
-    each other prereq-wise.  Fires before the full optimizer runs so the
-    UI can give instant feedback when a student locks a course.
+    each other prereq-wise.  Fires before the optimizer runs so the UI can
+    give instant feedback when a student locks a course.
 
-run_whatif(plan, locked_courses, major_id, graduation_quarter,
-           units_per_quarter=16, waived_ges=[]) → WhatIfResult
-    Builds a new plan with locked courses fixed, ASAP-schedules the
-    remaining required courses around them, then hill-climbs on unlocked
-    courses only.  Returns top 3 variants.
+optimize_around_locks(plan, locked_course_ids) → {"status": ..., ...}
+    The core editor operation: locked courses never move; only the unlocked
+    courses already in the plan are repositioned to improve the soft score.
 """
 
-import math
 import os
 import random
+import re
 from copy import deepcopy
-from dataclasses import dataclass, field
 
 from dotenv import load_dotenv
 from supabase import create_client
 
 from .hard_constraints import (
     CoursePlan,
+    CheckResult,
     UNITS_PER_COURSE,
+    CODE_PREREQ_ORDER,
     _eval_tree,
     _norm,
+    _pretty_quarter,
     _qkey,
+    units_valid,
 )
 from .optimizer import _check_prereqs, _prereq_trees, _soft_score
 from .plan_generator import (
-    _asap_schedule,
-    _collect_courses,
+    _fetch_course_terms,
+    _fetch_course_units,
     _fetch_prereq_trees,
-    _generate_quarters,
     _resolve_ap_credits,
+    _resolve_implicit_prereqs,
 )
 from .soft_constraints import _load_course_meta, _load_difficulty_scores
 
 _ENV = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", ".env")
 load_dotenv(_ENV)
-
-
-# ── Result types ──────────────────────────────────────────────────────────────
-
-@dataclass
-class WhatIfVariant:
-    planned_courses:  dict[str, list[str]]
-    locked_courses:   dict[str, str]        # {course_id: quarter}
-    soft_score:       float
-    soft_breakdown:   dict[str, float]
-    violations:       list[str]
-
-
-@dataclass
-class WhatIfResult:
-    variants:           list[WhatIfVariant]
-    lock_conflicts:     list[str]
-    quarters_available: int  = 0
-    quarters_needed:    int  = 0
-    tight_timeline:     bool = False
-    overflow_count:     int  = 0
 
 
 # ── Lock validation ───────────────────────────────────────────────────────────
@@ -270,54 +250,6 @@ def validate_locks(
 
 # ── What-if scheduling helpers ────────────────────────────────────────────────
 
-def _asap_with_locks(
-    remaining:       list[str],
-    trees:           dict[str, dict],
-    quarters:        list[str],
-    units_per_quarter: int,
-    completed_courses: list[str],
-    locked_by_quarter: dict[str, list[str]],
-) -> tuple[dict[str, list[str]], list[str]]:
-    """ASAP scheduler that treats locked courses as pre-placed.
-
-    Locked courses are added to `available` at the start of their quarter
-    (same as the regular scheduler does within-quarter), giving unlocked
-    courses access to them as prereqs in the same or later quarters.
-    """
-    max_per_q = units_per_quarter // UNITS_PER_COURSE
-    available: set[str] = {_norm(c) for c in completed_courses}
-
-    # Pre-fill plan with locked courses
-    plan: dict[str, list[str]] = {
-        q: list(locked_by_quarter.get(q, [])) for q in quarters
-    }
-
-    for quarter in quarters:
-        # Make locked courses available at the start of their quarter
-        for lc in plan[quarter]:
-            available.add(_norm(lc))
-
-        free = max_per_q - len(plan[quarter])
-        placed = 0
-        while placed < free and remaining:
-            eligible = next(
-                (
-                    i for i, c in enumerate(remaining)
-                    if not trees.get(_norm(c))
-                    or _eval_tree(trees[_norm(c)], available)
-                ),
-                None,
-            )
-            if eligible is None:
-                break
-            course = remaining.pop(eligible)
-            plan[quarter].append(course)
-            available.add(_norm(course))
-            placed += 1
-
-    return plan, remaining  # remaining = overflow
-
-
 def _perturb_unlocked(
     plan:        CoursePlan,
     locked_norm: set[str],
@@ -402,126 +334,349 @@ def _whatif_optimize(
     return best, best_score, best_bd
 
 
-# ── Public API ────────────────────────────────────────────────────────────────
+# ── Primary API: optimize around locked courses ───────────────────────────────
 
-def run_whatif(
-    plan:              CoursePlan,
-    locked_courses:    dict[str, str],
-    major_id:          str,
-    graduation_quarter: str,
-    units_per_quarter: int = 16,
-    waived_ges:        list[str] | None = None,
-    ap_scores:         dict[str, int] | None = None,
-) -> WhatIfResult:
-    """Generate plan variants with locked_courses pinned to their quarters.
-
-    Parameters
-    ----------
-    plan
-        Existing CoursePlan.  completed_courses is used to seed prereq
-        availability; planned_courses is ignored (regenerated from scratch).
-    locked_courses
-        {course_id: quarter_string} — courses the student has fixed.
-    major_id, graduation_quarter, units_per_quarter, waived_ges
-        Same semantics as plan_generator.generate().
-    """
-    if waived_ges is None:
-        waived_ges = []
-
-    # ── 1. Validate locks (pass ap_scores so AP-credited courses count as completed) ──
-    lock_valid, lock_conflicts = validate_locks(
-        locked_courses, completed_courses=list(plan.completed_courses),
-        ap_scores=ap_scores or None,
+def _prettify_quarters(msg: str) -> str:
+    """Rewrite '2027_fall' → 'Fall 2027' inside a conflict message."""
+    return re.sub(
+        r"(\d{4})_(winter|spring|summer|fall)",
+        lambda m: f"{m.group(2).capitalize()} {m.group(1)}",
+        msg,
     )
-    if not lock_valid:
-        return WhatIfResult(variants=[], lock_conflicts=lock_conflicts)
+
+
+def optimize_around_locks(
+    plan: CoursePlan,
+    locked_course_ids: list[str],
+    top_n: int = 3,
+    seed_configs: list[tuple[int, int]] | None = None,
+) -> dict:
+    """Reposition only the UNLOCKED courses of `plan`; locked courses never move.
+
+    This is the core editor operation: the course set is fixed input (everything
+    already in plan.planned_courses).  Courses whose ids are in locked_course_ids
+    stay exactly where the plan places them; every other course may be moved to
+    improve the soft score, subject to all hard constraints (using the structured
+    checks from hard_constraints).
+
+    Returns one of:
+        { "status": "ok", "plans": [ {planned_courses, locked_courses,
+              soft_score, soft_breakdown, valid, violations}, ... ] }
+        { "status": "infeasible", "conflicts": [ {reason, code}, ... ] }
+
+    A locked set is infeasible when the pinned courses can't be satisfied — e.g.
+    two pinned courses violate prerequisite order, or a pinned course's prereq
+    can't be placed before it.  In that case the specific conflict reasons from
+    the hard-constraint layer are returned instead of any plan.
+    """
+    locked_norm = {_norm(c) for c in locked_course_ids}
+
+    # Map every course in the plan to its current quarter; collect ids.
+    course_quarter: dict[str, str] = {}
+    all_ids: list[str] = []
+    for q, courses in plan.planned_courses.items():
+        for c in courses:
+            course_quarter[_norm(c)] = q
+            all_ids.append(c)
+
+    unlocked_ids = [c for c in all_ids if _norm(c) not in locked_norm]
+
+    # locked_map: {raw_course_id: current_quarter} for locked courses present in plan.
+    locked_map: dict[str, str] = {}
+    for c in locked_course_ids:
+        q = course_quarter.get(_norm(c))
+        if q is not None:
+            locked_map[c] = q
 
     client      = create_client(os.getenv("SUPABASE_URL"), os.getenv("SUPABASE_SERVICE_KEY"))
     diff_scores = _load_difficulty_scores()
+    trees       = _prereq_trees(client, all_ids)
+    meta        = _load_course_meta(client, all_ids)
 
-    # ── 2. Quarter window ─────────────────────────────────────────────────────
-    quarters = _generate_quarters(graduation_quarter)
-    if not quarters:
-        return WhatIfResult(variants=[], lock_conflicts=[])
+    # ── Stage A: is the locked set itself feasible? ───────────────────────────
+    # Treat completed + unlocked courses as available so validate_locks flags
+    # ONLY locked-vs-locked ordering conflicts (and prereqs absent from the whole
+    # plan), not prereqs that happen to be unlocked-but-present.
+    if len(locked_map) >= 2:
+        extra_available = list(plan.completed_courses) + unlocked_ids
+        lock_ok, lock_conflicts = validate_locks(
+            locked_map, completed_courses=extra_available
+        )
+        if not lock_ok:
+            return {
+                "status": "infeasible",
+                "conflicts": [
+                    {"reason": _prettify_quarters(c), "code": CODE_PREREQ_ORDER}
+                    for c in lock_conflicts
+                ],
+            }
 
-    locked_norm    = {_norm(c) for c in locked_courses}
-    completed_norm = {_norm(c) for c in plan.completed_courses}
+    # ── Stage B: reposition unlocked courses, keep only hard-valid variants ────
+    base    = deepcopy(plan)
+    configs = seed_configs or [(42, 0), (13, 4), (7, 8), (99, 12), (17, 16)]
 
-    # Resolve AP credits so equivalencies are excluded from courses to plan
-    # and are treated as already satisfied during scheduling.
-    if ap_scores:
-        from .plan_generator import _resolve_ap_credits
-        _resolve_ap_credits(client, ap_scores, completed_norm)
+    candidates: list[tuple[CoursePlan, float, dict]] = []
+    best_attempt: tuple[float, list[str], list] | None = None  # (score, prereq_viols, unit_checks)
 
-    # ── 3. Collect remaining required courses (excluding locked + completed) ──
-    effective_norm = completed_norm | locked_norm
-    remaining, _, _, _ = _collect_courses(client, major_id, effective_norm, waived_ges)
-
-    # ── 4. Feasibility ────────────────────────────────────────────────────────
-    total      = len(locked_courses) + len(remaining)
-    max_per_q  = units_per_quarter // UNITS_PER_COURSE
-    q_avail    = len(quarters)
-    q_needed   = math.ceil(total / max_per_q) if max_per_q else 0
-    tight      = (q_avail - q_needed) <= 1
-
-    # ── 5. Prereq trees + course meta (one round-trip each) ──────────────────
-    all_ids = list(locked_courses.keys()) + remaining
-    trees   = _fetch_prereq_trees(client, all_ids)
-    meta    = _load_course_meta(client, all_ids)
-
-    # ── 6. ASAP schedule unlocked courses around locked slots ─────────────────
-    locked_by_quarter: dict[str, list[str]] = {}
-    for c, q in locked_courses.items():
-        locked_by_quarter.setdefault(q, []).append(c)
-
-    plan_dict, overflow = _asap_with_locks(
-        list(remaining), trees, quarters, units_per_quarter,
-        plan.completed_courses, locked_by_quarter,
-    )
-
-    if overflow:
-        print(f"  [whatif] Warning: {len(overflow)} course(s) could not fit "
-              f"before {graduation_quarter} — omitted.")
-
-    grad_year = int(graduation_quarter.split("_")[0])
-    base = CoursePlan(
-        major_id          = major_id,
-        completed_courses = plan.completed_courses,
-        planned_courses   = {q: cs for q, cs in plan_dict.items() if cs},
-        graduation_year   = grad_year,
-        units_per_quarter = units_per_quarter,
-    )
-
-    # ── 7. Generate 5 variants (perturb unlocked → hill-climb unlocked) ───────
-    configs = [(42, 0), (13, 4), (7, 8), (99, 12), (17, 16)]
-    raw: list[WhatIfVariant] = []
-    base_viols = set(_check_prereqs(base, trees))
-
-    for seed, n_swaps in configs:
-        rng      = random.Random(seed)
-        starting = _perturb_unlocked(base, locked_norm, rng, n_swaps) if n_swaps else base
+    for s, n_swaps in configs:
+        rng   = random.Random(s)
+        start = _perturb_unlocked(base, locked_norm, rng, n_swaps) if n_swaps else base
         opt, score, bd = _whatif_optimize(
-            starting, locked_norm, trees, diff_scores, meta, seed=seed
+            start, locked_norm, trees, diff_scores, meta, seed=s
         )
 
-        # All violations in the optimised plan (include pre-existing for transparency)
-        opt_viols = list(set(_check_prereqs(opt, trees)))
+        # Hard-constraint gate using the structured checks.
+        prereq_viols = _check_prereqs(opt, trees)
+        units_ok, unit_checks = units_valid(opt)
 
-        raw.append(WhatIfVariant(
-            planned_courses = dict(opt.planned_courses),
-            locked_courses  = locked_courses,
-            soft_score      = score,
-            soft_breakdown  = bd,
-            violations      = opt_viols,
-        ))
+        if not prereq_viols and units_ok:
+            candidates.append((opt, score, bd))
+        if best_attempt is None or score < best_attempt[0]:
+            best_attempt = (score, prereq_viols, unit_checks)
 
-    raw.sort(key=lambda v: v.soft_score)
-    return WhatIfResult(
-        variants           = raw[:3],
-        lock_conflicts     = [],
-        quarters_available = q_avail,
-        quarters_needed    = q_needed,
-        tight_timeline     = tight,
-        overflow_count     = len(overflow),
+    if not candidates:
+        # No valid arrangement exists with these locks → infeasible.
+        # Surface the specific conflicts from the closest attempt.
+        _, prereq_viols, unit_checks = best_attempt
+        conflicts: list[dict] = []
+        seen: set[str] = set()
+        for v in prereq_viols:
+            r = _prettify_quarters(v)
+            if r not in seen:
+                seen.add(r)
+                conflicts.append({"reason": r, "code": CODE_PREREQ_ORDER})
+        for chk in unit_checks:
+            if chk.reason not in seen:
+                seen.add(chk.reason)
+                conflicts.append({"reason": chk.reason, "code": chk.code})
+        return {"status": "infeasible", "conflicts": conflicts}
+
+    candidates.sort(key=lambda t: t[1])
+    plans = [
+        {
+            "planned_courses": dict(opt.planned_courses),
+            "locked_courses":  locked_map,
+            "soft_score":      score,
+            "soft_breakdown":  bd,
+            "valid":           True,
+            "violations":      [],
+        }
+        for opt, score, bd in candidates[:top_n]
+    ]
+    return {"status": "ok", "plans": plans}
+
+
+
+# ── Propose-and-autoplace prerequisites when a course is added ────────────────
+
+def _season_of(quarter: str) -> str:
+    """'2026_fall' → 'Fall'."""
+    return quarter.split("_", 1)[1].capitalize()
+
+
+def _offered_in(course: str, quarter: str, terms_by_course: dict[str, list[str]]) -> bool:
+    """True if `course` is historically offered in this quarter's season (or unknown)."""
+    terms = terms_by_course.get(course) or []
+    if not terms:
+        return True
+    qs = _season_of(quarter)
+    return any(
+        len(t.split(" ", 1)) == 2 and t.split(" ", 1)[1].strip().capitalize() == qs
+        for t in terms
     )
 
+
+def _asap_place_missing(
+    missing:           list[str],
+    trees:             dict[str, dict],
+    window:            list[str],
+    units_per_quarter: int,
+    completed_norm:    set[str],
+    locked_by_quarter: dict[str, list[str]],
+    terms_by_course:   dict[str, list[str]],
+    units_by_course:   dict[str, int],
+) -> tuple[dict[str, str], list[str]]:
+    """ASAP-place `missing` courses into `window`, treating existing courses as locked.
+
+    Mirrors the ASAP-around-locks pattern, but additionally (a) enforces term availability
+    and (b) requires each course's prerequisites to sit in a STRICTLY earlier
+    quarter (so chains like ICS31→32→33 span sequential quarters).  Returns
+    (placements {course_id: quarter}, overflow list).
+    """
+    def _units(c: str) -> int:
+        return units_by_course.get(c) or units_by_course.get(_norm(c)) or UNITS_PER_COURSE
+
+    window = sorted(window, key=_qkey)
+    placements: dict[str, str] = {}
+    remaining = list(missing)
+
+    for q in window:
+        # Availability = completed + everything (locked or already-proposed) in
+        # STRICTLY earlier quarters.  Same-quarter placements don't satisfy prereqs.
+        available: set[str] = set(completed_norm)
+        for qq in window:
+            if _qkey(qq) < _qkey(q):
+                available.update(_norm(c) for c in locked_by_quarter.get(qq, []))
+                available.update(_norm(c) for c, cq in placements.items() if cq == qq)
+
+        used = sum(_units(c) for c in locked_by_quarter.get(q, []))
+        used += sum(_units(c) for c, cq in placements.items() if cq == q)
+
+        for c in list(remaining):
+            tree = trees.get(_norm(c))
+            if tree and not _eval_tree(tree, available):
+                continue
+            if not _offered_in(c, q, terms_by_course):
+                continue
+            u = _units(c)
+            if used + u > units_per_quarter:
+                continue
+            placements[c] = q
+            used += u
+            remaining.remove(c)
+
+    return placements, remaining
+
+
+def propose_prereq_chain(plan: CoursePlan, course_id: str) -> dict:
+    """Detect a course's missing prerequisite chain and PROPOSE where to place it.
+
+    Returns (does NOT mutate the plan):
+        {
+          "missing": [course_ids in the prereq chain not already in plan/completed],
+          "proposed_placements": [ {course_id, quarter, reason}, ... ],
+          "status": "ok" | "infeasible",
+          "conflicts": [ {reason, code}, ... ]   # only when infeasible
+        }
+
+    The chain is found with _resolve_implicit_prereqs.  Missing courses are
+    ASAP-placed into quarters strictly BEFORE the dependent course, treating the
+    existing plan as locked (the locked-placement machinery), respecting prereq
+    order, unit caps and term availability.  If the chain can't be placed validly,
+    status is "infeasible" with structured CheckResult reasons.
+    """
+    client = create_client(os.getenv("SUPABASE_URL"), os.getenv("SUPABASE_SERVICE_KEY"))
+    upq = plan.units_per_quarter
+
+    completed_norm = {_norm(c) for c in plan.completed_courses}
+    placed_by_quarter = {q: list(cs) for q, cs in plan.planned_courses.items()}
+    planned_norm = {_norm(c) for cs in placed_by_quarter.values() for c in cs}
+    existing_norm = planned_norm | completed_norm
+
+    # 1. Find the prerequisite chain for course_id (reuse _resolve_implicit_prereqs).
+    trees = _fetch_prereq_trees(client, [course_id])
+    expanded, trees = _resolve_implicit_prereqs(
+        [course_id], trees, existing_norm, client
+    )
+    missing = [
+        c for c in expanded
+        if _norm(c) != _norm(course_id) and _norm(c) not in existing_norm
+    ]
+
+    # 2. Prereqs already satisfied → nothing to propose.
+    if not missing:
+        return {"missing": [], "proposed_placements": [], "status": "ok", "conflicts": []}
+
+    # 3. Deadline = the quarter course_id occupies (prereqs must land strictly before).
+    deadline_q = next(
+        (q for q, cs in placed_by_quarter.items()
+         if any(_norm(c) == _norm(course_id) for c in cs)),
+        None,
+    )
+    quarters = sorted(placed_by_quarter.keys(), key=_qkey)
+    window = [
+        q for q in quarters
+        if deadline_q is None or _qkey(q) < _qkey(deadline_q)
+    ]
+
+    # 4. ASAP-place missing courses around the locked existing plan.
+    terms_by_course = _fetch_course_terms(client, missing)
+    units_by_course = _fetch_course_units(client, missing)
+    placements, overflow = _asap_place_missing(
+        missing, trees, window, upq, completed_norm,
+        placed_by_quarter, terms_by_course, units_by_course,
+    )
+
+    dep_where = _pretty_quarter(deadline_q) if deadline_q else "its target quarter"
+
+    # 5. Infeasible: some prereq couldn't be placed before the dependent course.
+    if overflow:
+        conflicts: list[dict] = []
+        if not window:
+            reason_tail = (
+                f"there is no quarter before {course_id} ({dep_where}) to place it"
+            )
+        else:
+            reason_tail = (
+                f"no quarter before {course_id} ({dep_where}) has room / term "
+                f"availability for it after its own prerequisites"
+            )
+        for m in overflow:
+            conflicts.append(CheckResult(
+                valid=False,
+                reason=f"Can't place prerequisite {m} — {reason_tail}.",
+                code=CODE_PREREQ_ORDER,
+            ).as_dict())
+        return {
+            "missing": missing,
+            "proposed_placements": [],
+            "status": "infeasible",
+            "conflicts": conflicts,
+        }
+
+    # 6. Safety net: validate the combined plan with the structured checks.
+    combined = apply_prereq_chain(
+        plan, [{"course_id": m, "quarter": q} for m, q in placements.items()]
+    )
+    ptrees = _prereq_trees(client, [
+        c for cs in combined.planned_courses.values() for c in cs
+    ])
+    prereq_viols = _check_prereqs(combined, ptrees)
+    units_ok, unit_checks = units_valid(combined)
+    if prereq_viols or not units_ok:
+        conflicts = [
+            {"reason": _prettify_quarters(v), "code": CODE_PREREQ_ORDER}
+            for v in prereq_viols
+        ] + [{"reason": c.reason, "code": c.code} for c in unit_checks]
+        return {
+            "missing": missing,
+            "proposed_placements": [],
+            "status": "infeasible",
+            "conflicts": conflicts,
+        }
+
+    proposed_placements = [
+        {
+            "course_id": m,
+            "quarter":   q,
+            "reason":    (f"Prerequisite of {course_id}; earliest valid quarter "
+                          f"before {dep_where} after its own prerequisites."),
+        }
+        for m, q in sorted(placements.items(), key=lambda kv: _qkey(kv[1]))
+    ]
+    return {
+        "missing": missing,
+        "proposed_placements": proposed_placements,
+        "status": "ok",
+        "conflicts": [],
+    }
+
+
+def apply_prereq_chain(plan: CoursePlan, proposed_placements: list[dict]) -> CoursePlan:
+    """Apply an accepted proposal, returning a NEW CoursePlan (original untouched).
+
+    proposed_placements: [ {course_id, quarter, ...}, ... ] from propose_prereq_chain.
+    Kept separate from propose_prereq_chain so detection and execution don't mix:
+    the frontend shows the proposal, the user confirms, THEN this runs.
+    """
+    new_planned = {q: list(cs) for q, cs in plan.planned_courses.items()}
+    for p in proposed_placements:
+        q = p["quarter"]
+        new_planned.setdefault(q, []).append(p["course_id"])
+    return CoursePlan(
+        major_id          = plan.major_id,
+        completed_courses = list(plan.completed_courses),
+        planned_courses   = new_planned,
+        graduation_year   = plan.graduation_year,
+        units_per_quarter = plan.units_per_quarter,
+    )
