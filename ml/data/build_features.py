@@ -16,9 +16,14 @@ load_dotenv(_ENV)
 
 DATA_DIR = os.path.dirname(os.path.abspath(__file__))
 MODEL_DIR = os.path.join(DATA_DIR, "..", "models", "difficulty_nlp_v2")
+ENSEMBLE_WEIGHTS_PATH = os.path.join(DATA_DIR, "..", "models", "ensemble_weights.json")
 EMBEDDING_DIM = 384
 BATCH_SIZE = 32
 MIN_GRADED = 15  # minimum graded students per section
+
+# Learned ensemble coefficients used to blend the nlp / gpa / rmp signals into a
+# single professor-level difficulty score (replaces the old equal-weight mean).
+ENSEMBLE_WEIGHTS = json.load(open(ENSEMBLE_WEIGHTS_PATH))["coefficients"]
 
 
 def get_client():
@@ -129,7 +134,7 @@ def main() -> None:
 
     # ── Fetch raw tables ────────────────────────────────────────────────────
     print("Fetching courses...")
-    courses_df = pd.DataFrame(fetch_all(client, "courses", "id,description,department"))
+    courses_df = pd.DataFrame(fetch_all(client, "courses", "id,title,description,department"))
     print(f"  {len(courses_df)} courses")
 
     print("Fetching instructors...")
@@ -295,14 +300,28 @@ def main() -> None:
     # ── Convert GPA → difficulty score 1-10 ─────────────────────────────────
     base["gpa_score"] = ((4.0 - base["weighted_gpa"]) / 3.0 * 10.0).clip(1.0, 10.0)
 
-    # ── Weighted combo: equal weights, normalised for missing signals ─────────
+    # ── Weighted combo: learned ensemble weights, renormalised for missing ────
+    # Each signal contributes its learned coefficient. When a signal is absent we
+    # DROP its weight and renormalise the remaining weights to sum to 1, keeping
+    # the blend on the same 1-10 scale regardless of which signals exist.
+    # Example (rmp missing): (nlp*0.358 + gpa*0.291) / (0.358 + 0.291).
     signal_cols = ["nlp_score", "gpa_score", "rmp_score"]
 
     def combined_score(row):
-        vals = [row[c] for c in signal_cols if pd.notna(row[c])]
-        return np.mean(vals) if vals else np.nan
+        num = denom = 0.0
+        for c in signal_cols:
+            v = row[c]
+            if pd.notna(v):
+                w = ENSEMBLE_WEIGHTS[c]
+                num += w * v
+                denom += w
+        return num / denom if denom > 0 else np.nan
 
-    base["difficulty_score"] = base.apply(combined_score, axis=1)
+    # Clip to the 1-10 scale: a few rows carry an invalid rmp_score (-1.25 from
+    # rmp_difficulty=0, i.e. no real RMP rating) that can drag the blend slightly
+    # below 1. Clipping keeps every professor score on-scale (same convention as
+    # gpa_score above). NaN (no signals at all) is preserved.
+    base["difficulty_score"] = base.apply(combined_score, axis=1).clip(1.0, 10.0)
 
     # ── Course-level difficulty: sections_taught-weighted avg ─────────────────
     def course_difficulty(g):
@@ -317,6 +336,34 @@ def main() -> None:
         .apply(course_difficulty, include_groups=False)
         .reset_index(name="difficulty_score")
     )
+
+    # ── NLP-only fallback for instructorless courses ──────────────────────────
+    # Courses with a description (hence an NLP score) but no course_instructors
+    # rows never enter the instructor-centric blend above, so they'd be dropped.
+    # Give each one a course-level raw score equal to its NLP score so the whole
+    # catalogue is covered, then everyone is normalized together below. (The NLP
+    # score is already on the same 1-10 difficulty scale as the blend.)
+    scored_ids = set(course_df["course_id"])
+    fallback = nlp_series[~nlp_series.index.isin(scored_ids)]
+    if len(fallback):
+        fb_df = pd.DataFrame({
+            "course_id": fallback.index,
+            "difficulty_score": fallback.values,
+        })
+        course_df = pd.concat([course_df, fb_df], ignore_index=True)
+        print(f"  NLP-only fallback: added {len(fallback)} instructorless courses")
+
+    # ── Percentile rank-normalize course-level scores across the catalogue ─────
+    # Last transform before the score is served. The raw weighted-average score is
+    # preserved in difficulty_score_raw; the served difficulty_score becomes the
+    # percentile rank mapped to 1-10 (hardest course → 10, easiest → 1). Ties get
+    # the average rank so identical raw scores receive identical normalized values.
+    course_df["difficulty_score_raw"] = course_df["difficulty_score"]
+    valid = course_df["difficulty_score"].notna()
+    n_valid = int(valid.sum())
+    if n_valid > 1:
+        avg_rank = course_df.loc[valid, "difficulty_score"].rank(method="average") - 1.0
+        course_df.loc[valid, "difficulty_score"] = 1.0 + 9.0 * (avg_rank / (n_valid - 1))
 
     # ── Save CSVs ─────────────────────────────────────────────────────────────
     prof_out = base[["course_id", "ucinetid", "nlp_score", "gpa_score",
