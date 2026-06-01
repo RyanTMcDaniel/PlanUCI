@@ -84,6 +84,9 @@ class GenerationResult:
     ap_credited_courses: list[str] = field(default_factory=list)
     # Total UCI units awarded via AP credit.
     ap_units_awarded:    int = 0
+    # Unresolved "choose N of M" decisions surfaced to the user (editor model).
+    # The seed places only required courses; electives/GEs are returned here, NOT placed.
+    choice_groups:       list[dict] = field(default_factory=list)
 
 
 # ── Quarter helpers ───────────────────────────────────────────────────────────
@@ -281,29 +284,19 @@ def _resolve_ap_credits(
     return credited, total_units
 
 
-def _collect_courses(
+def _load_requirement_rows(
     client,
     major_id: str,
     completed_norm: set[str],
-    waived_ges: list[str],
-    specialization_id: str | None = None,
     ap_scores: dict[str, int] | None = None,
-) -> tuple[list[str], dict[str, list[str]], list[str], int]:
-    """Return (flat_list, group_map, ap_credited, ap_units) of courses still needed.
+) -> tuple[list[dict], list[dict], list[str], int]:
+    """Load + merge requirement rows for a major.
 
-    Queries both the major's own requirements and the university-wide GE rows
-    (major_id = "ALL_MAJORS").  GE groups whose requirement_group appears in
-    waived_ges are skipped entirely.
-
-    Also merges rows from catalogue_requirements (scraped directly from the UCI
-    catalogue) when available.  Catalogue rows with the same group_name as an
-    API row take precedence; new group_names are appended.
-
-    AP scores are resolved first: their course equivalencies are added to
-    completed_norm so the planner treats them as already satisfied.
-
-    group_map maps requirement_group → list of course IDs selected from it,
-    which callers can use to audit GE coverage.
+    Returns (major_rows, ge_rows, ap_credited, ap_units).  Resolves AP credit
+    (adding equivalencies to completed_norm in-place), merges the specialization
+    parent rows and scraped catalogue_requirements, and fetches university-wide
+    GE rows (major_id = 'ALL_MAJORS').  Shared by _collect_courses (flat N-pick)
+    and collect_requirements (required/choice split).
     """
     # Resolve AP credit before loading requirements so equivalencies are excluded
     ap_credited, ap_units = _resolve_ap_credits(client, ap_scores or {}, completed_norm)
@@ -447,6 +440,38 @@ def _collect_courses(
         .data
     )
 
+    return major_rows, ge_rows, ap_credited, ap_units
+
+
+def _collect_courses(
+    client,
+    major_id: str,
+    completed_norm: set[str],
+    waived_ges: list[str],
+    specialization_id: str | None = None,
+    ap_scores: dict[str, int] | None = None,
+) -> tuple[list[str], dict[str, list[str]], list[str], int]:
+    """Return (flat_list, group_map, ap_credited, ap_units) of courses still needed.
+
+    Queries both the major's own requirements and the university-wide GE rows
+    (major_id = "ALL_MAJORS").  GE groups whose requirement_group appears in
+    waived_ges are skipped entirely.
+
+    Also merges rows from catalogue_requirements (scraped directly from the UCI
+    catalogue) when available.  Catalogue rows with the same group_name as an
+    API row take precedence; new group_names are appended.
+
+    AP scores are resolved first: their course equivalencies are added to
+    completed_norm so the planner treats them as already satisfied.
+
+    group_map maps requirement_group → list of course IDs selected from it,
+    which callers can use to audit GE coverage.
+    """
+    # Load + merge requirement rows (AP resolve, spec parent, catalogue, GE).
+    major_rows, ge_rows, ap_credited, ap_units = _load_requirement_rows(
+        client, major_id, completed_norm, ap_scores
+    )
+
     selected: list[str] = []
     seen: set[str] = set()
     group_map: dict[str, list[str]] = {}
@@ -560,6 +585,225 @@ def _collect_courses(
             print(f"  {rg}: {len(entries)} course(s) → {entries}")
 
     return selected, group_map, ap_credited, ap_units
+
+
+# ── Required / choice split (editor model) ────────────────────────────────────
+
+_SEASONS = ("Winter", "Spring", "Summer", "Fall")
+
+
+def _seasons_offered(terms: list[str]) -> list[str]:
+    """Reduce a course's historical term list to the distinct seasons it's offered.
+
+    e.g. ['2025 Fall', '2026 Winter', '2026 Fall'] → ['Winter', 'Fall'].
+    """
+    found: set[str] = set()
+    for t in terms or []:
+        parts = t.split(" ", 1)
+        if len(parts) == 2:
+            season = parts[1].strip().capitalize()
+            for s in _SEASONS:
+                if season.startswith(s):
+                    found.add(s)
+                    break
+    return [s for s in _SEASONS if s in found]
+
+
+def _is_choice_row(req: dict) -> bool:
+    """A requirement row is a *choice* when fewer courses are needed than offered.
+
+    courses_needed < len(courses)  → choose N of M  (elective pool, GE pool,
+    "X or Y" alternatives).  Otherwise every listed course must be taken (take-all),
+    which is a hard requirement seeded into the plan.
+    """
+    courses = req.get("courses") or []
+    needed = req.get("courses_needed")
+    if not courses:
+        return False
+    if needed is None:
+        return False  # needed unspecified → take all
+    return needed < len(courses)
+
+
+def collect_requirements(
+    client,
+    major_id: str,
+    completed_norm: set[str],
+    waived_ges: list[str] | None = None,
+    specialization_id: str | None = None,
+    ap_scores: dict[str, int] | None = None,
+) -> tuple[list[str], list[dict], list[str], int]:
+    """Split a major's requirements into REQUIRED courses vs. CHOICE groups.
+
+    Editor model: the system seeds only mandatory courses; "choose N of M" pools
+    (electives, GE categories, "X or Y" alternatives) are surfaced for the user to
+    resolve, NOT auto-picked.
+
+    Returns (required_courses, choice_groups, ap_credited, ap_units):
+
+      required_courses : flat list of take-all course IDs (every student must take),
+                         minus completed / AP-credited, de-duplicated.
+      choice_groups    : list of unresolved decisions, each:
+          { "group_id", "label", "choose_n",
+            "options": [ {course_id, title, units, difficulty, terms_offered,
+                          has_prereqs}, ... ] }
+
+    Choice-group options are NOT placed into any plan.
+    """
+    waived_ges = waived_ges or []
+    _load_aliases(client)  # FIX 6
+
+    major_rows, ge_rows, ap_credited, ap_units = _load_requirement_rows(
+        client, major_id, completed_norm, ap_scores
+    )
+    diff_scores = _load_difficulty_scores()
+
+    required: list[str] = []
+    required_seen: set[str] = set()
+    choice_rows: list[dict] = []
+
+    def _consume(req: dict) -> None:
+        req_group = req.get("requirement_group") or req.get("group_name") or ""
+        if req.get("waivable", False) and req_group in waived_ges:
+            return
+        courses = req.get("courses") or []
+        if not courses:
+            return
+        if _is_choice_row(req):
+            choice_rows.append(req)
+            return
+        # Take-all row: every course is mandatory.
+        for c in courses:
+            nc = _norm(c)
+            if nc in completed_norm or nc in required_seen:
+                continue
+            required.append(c)
+            required_seen.add(nc)
+
+    for req in major_rows:
+        _consume(req)
+    for req in ge_rows:
+        _consume(req)
+
+    # ── Enrich choice options with course metadata (one batched query) ──────────
+    all_option_ids = sorted({
+        c for req in choice_rows for c in (req.get("courses") or [])
+        if _norm(c) not in completed_norm
+    })
+    meta: dict[str, dict] = {}
+    if all_option_ids:
+        rows = (
+            client.table("courses")
+            .select("id,title,min_units,terms,prerequisite_tree")
+            .in_("id", all_option_ids)
+            .execute()
+            .data
+        )
+        meta = {_norm(r["id"]): r for r in rows}
+
+    choice_groups: list[dict] = []
+    for req in choice_rows:
+        courses = req.get("courses") or []
+        needed = req.get("courses_needed") or 1
+        # Drop options already completed / AP-credited; reduce N accordingly.
+        already = sum(1 for c in courses if _norm(c) in completed_norm)
+        choose_n = max(0, needed - already)
+        options_ids = [c for c in courses if _norm(c) not in completed_norm]
+        if choose_n == 0 or not options_ids:
+            continue  # group already satisfied by completed courses
+
+        options = []
+        for c in options_ids:
+            m = meta.get(_norm(c), {})
+            options.append({
+                "course_id":     c,
+                "title":         m.get("title"),
+                "units":         m.get("min_units") or UNITS_PER_COURSE,
+                "difficulty":    diff_scores.get(_norm(c)),  # normalized 1-10 or None
+                "terms_offered": _seasons_offered(m.get("terms") or []),
+                "has_prereqs":   bool(m.get("prerequisite_tree")),
+            })
+
+        choice_groups.append({
+            "group_id":  req.get("requirement_group") or req.get("group_name") or "",
+            "label":     req.get("group_name") or req.get("requirement_group") or "Choice",
+            "choose_n":  choose_n,
+            "options":   options,
+        })
+
+    return required, choice_groups, ap_credited, ap_units
+
+
+def get_requirements_state(
+    plan: CoursePlan,
+    waived_ges: list[str] | None = None,
+    ap_scores: dict[str, int] | None = None,
+) -> dict:
+    """Report what the user still needs to decide for `plan`'s major.
+
+    Returns:
+        {
+          "required_placed": [course_ids in the seed that are mandatory],
+          "choice_groups":   [ each choice group from collect_requirements, plus
+                               "placed" and "remaining" (choose_n minus options
+                               already placed) ],
+          "all_satisfied":   bool  — every group's remaining == 0 AND every
+                               required course is placed.
+        }
+    """
+    client = create_client(os.getenv("SUPABASE_URL"), os.getenv("SUPABASE_SERVICE_KEY"))
+    _load_aliases(client)  # FIX 6
+    completed_norm = {_norm(c) for c in plan.completed_courses}
+
+    required, choice_groups, _, _ = collect_requirements(
+        client, plan.major_id, completed_norm, waived_ges or [], None, ap_scores
+    )
+
+    # Mandatory backbone = required take-all courses + their injected prereq chains.
+    # Backbone courses commonly ALSO appear as options inside elective/GE pools
+    # (e.g. a required upper-div course is listed in "11 Upper-Div Electives"); they
+    # must NOT be counted as the user having "chosen" that elective, else big pools
+    # look satisfied at the seed.  Backbone membership is the source of truth for
+    # what's mandatory vs. a genuine user choice.
+    trees = _fetch_prereq_trees(client, required)
+    backbone, _ = _resolve_implicit_prereqs(list(required), trees, completed_norm, client)
+    backbone_norm = {_norm(c) for c in backbone}
+
+    planned_norm = {
+        _norm(c) for cs in plan.planned_courses.values() for c in cs
+    }
+
+    # Mandatory courses currently placed in the plan.
+    required_placed = [
+        c for cs in plan.planned_courses.values() for c in cs
+        if _norm(c) in backbone_norm
+    ]
+
+    annotated: list[dict] = []
+    for g in choice_groups:
+        # Count only genuine user picks: options placed that are NOT backbone courses.
+        placed = sum(
+            1 for o in g["options"]
+            if _norm(o["course_id"]) in planned_norm
+            and _norm(o["course_id"]) not in backbone_norm
+        )
+        remaining = max(0, g["choose_n"] - placed)
+        annotated.append({**g, "placed": placed, "remaining": remaining})
+
+    required_missing = [
+        c for c in backbone
+        if _norm(c) not in planned_norm and _norm(c) not in completed_norm
+    ]
+    all_satisfied = (
+        not required_missing
+        and all(g["remaining"] == 0 for g in annotated)
+    )
+
+    return {
+        "required_placed": required_placed,
+        "choice_groups":   annotated,
+        "all_satisfied":   all_satisfied,
+    }
 
 
 # ── Feasibility check ─────────────────────────────────────────────────────────
@@ -1125,14 +1369,17 @@ def generate(
     _load_aliases(client)  # FIX 6: build alias map before any _norm() calls
     completed_norm = {_norm(c) for c in completed_courses}
 
-    # 1. Collect courses still needed (major + GE + catalogue supplement)
-    # AP scores are resolved inside _collect_courses; their equivalencies are
+    # 1. Editor model: seed ONLY required (take-all) courses. "Choose N of M"
+    # pools (electives, GE categories, "X or Y") are surfaced as choice_groups for
+    # the user to resolve — they are NOT auto-picked or placed here.
+    # AP scores are resolved inside collect_requirements; their equivalencies are
     # added to completed_norm so they are excluded from the plan automatically.
-    courses_to_plan, group_map, ap_credited, ap_units = _collect_courses(
+    courses_to_plan, choice_groups, ap_credited, ap_units = collect_requirements(
         client, major_id, completed_norm, waived_ges, specialization_id, ap_scores
     )
+    group_map: dict[str, list[str]] = {}  # no auto-picked choices in the seed
     if not courses_to_plan:
-        return GenerationResult(variants=[])
+        return GenerationResult(variants=[], choice_groups=choice_groups)
 
     # 2. Quarters available before graduation
     quarters = _generate_quarters(graduation_quarter)
@@ -1182,8 +1429,11 @@ def generate(
         )
 
     # For any remaining overflow, try swapping elective courses with simpler
-    # alternatives from the same pool.
-    if overflow:
+    # alternatives from the same pool.  Editor model: the seed is required-only
+    # (group_map is empty — no auto-picked electives), so this swap is skipped —
+    # swapping a *required* course for an elective alternative would both drop a
+    # mandatory course and risk introducing an unmet-prereq course into the seed.
+    if overflow and group_map:
         diff_scores = _load_difficulty_scores()
         courses_to_plan, overflow = _try_swap_elective_overflow(
             client, major_id, overflow, courses_to_plan, trees,
@@ -1260,5 +1510,6 @@ def generate(
         extended_by=extended_by,
         ap_credited_courses=ap_credited,
         ap_units_awarded=ap_units,
+        choice_groups=choice_groups,
     )
 

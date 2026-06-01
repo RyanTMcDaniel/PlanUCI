@@ -75,15 +75,53 @@ def _infer_dept(normalized_id: str) -> str:
     return re.sub(r"\d+[A-Za-z]*$", "", normalized_id)
 
 
-def _quarter_avgs(plan: CoursePlan, diff_scores: dict[str, float]) -> list[float]:
-    """Per-quarter average difficulty in chronological order (non-empty quarters only)."""
-    avgs = []
+# Canonical per-quarter difficulty — MUST match the frontend's
+# calculateQuarterDifficulty (PlannerClient.tsx).  Decaying weights make the
+# hardest course in a quarter dominate; a count penalty discourages overloading.
+_DECAY_WEIGHTS = [1.0, 0.85, 0.72, 0.61, 0.52, 0.44]
+_DECAY_TAIL    = 0.4   # weight for the 7th+ hardest course
+
+
+def quarter_difficulty(course_ids: list[str], diff_scores: dict[str, float]) -> float:
+    """Single canonical per-quarter difficulty score, matching the frontend.
+
+    Mirrors `calculateQuarterDifficulty`'s `adjustedDifficulty`:
+      1. Sort course difficulties descending.
+      2. Weighted mean with decaying weights [1.0, 0.85, 0.72, 0.61, 0.52, 0.44]
+         (0.4 for any 7th+ course) so the hardest course dominates.
+      3. Add a count penalty of max(0, (n - 3) * 0.3).
+      4. Clamp to 10.0.
+
+    Courses missing from diff_scores fall back to _DEFAULT_DIFFICULTY (the
+    backend's existing convention); they still count toward the penalty.
+    """
+    if not course_ids:
+        return 0.0
+    scores = sorted(
+        (diff_scores.get(_norm(c), _DEFAULT_DIFFICULTY) for c in course_ids),
+        reverse=True,
+    )
+    weighted_sum = 0.0
+    total_weight = 0.0
+    for i, s in enumerate(scores):
+        w = _DECAY_WEIGHTS[i] if i < len(_DECAY_WEIGHTS) else _DECAY_TAIL
+        weighted_sum += s * w
+        total_weight += w
+    difficulty_component = (
+        weighted_sum / total_weight if total_weight > 0 else _DEFAULT_DIFFICULTY
+    )
+    count_penalty = max(0.0, (len(scores) - 3) * 0.3)
+    return min(10.0, difficulty_component + count_penalty)
+
+
+def _quarter_difficulties(plan: CoursePlan, diff_scores: dict[str, float]) -> list[float]:
+    """Per-quarter canonical difficulty in chronological order (non-empty quarters only)."""
+    out = []
     for q in sorted(plan.planned_courses.keys(), key=_qkey):
         courses = plan.planned_courses[q]
         if courses:
-            vals = [diff_scores.get(_norm(c), _DEFAULT_DIFFICULTY) for c in courses]
-            avgs.append(statistics.mean(vals))
-    return avgs
+            out.append(quarter_difficulty(courses, diff_scores))
+    return out
 
 
 # ── Scorers ───────────────────────────────────────────────────────────────────
@@ -94,7 +132,7 @@ def difficulty_balance(plan: CoursePlan, diff_scores: dict[str, float]) -> float
     A plan where one quarter averages 9.0 and another 2.0 scores near 1.0;
     every quarter at 5.5 scores 0.0.
     """
-    avgs = _quarter_avgs(plan, diff_scores)
+    avgs = _quarter_difficulties(plan, diff_scores)
     if len(avgs) < 2:
         return 0.0
     return min(statistics.variance(avgs) / _MAX_VARIANCE, 1.0)
@@ -135,7 +173,7 @@ def workload_progression(plan: CoursePlan, diff_scores: dict[str, float]) -> flo
     A strongly increasing plan scores 0.0; a strongly decreasing one scores 1.0.
     Max penalized slope is −2.0 points per quarter.
     """
-    avgs = _quarter_avgs(plan, diff_scores)
+    avgs = _quarter_difficulties(plan, diff_scores)
     if len(avgs) < 2:
         return 0.0
 
@@ -202,7 +240,7 @@ def adjacent_smoothing(plan: CoursePlan, diff_scores: dict[str, float]) -> float
 
     Result is averaged over pairs and clamped to [0, 1].
     """
-    avgs = _quarter_avgs(plan, diff_scores)
+    avgs = _quarter_difficulties(plan, diff_scores)
     if len(avgs) < 2:
         return 0.0
 
