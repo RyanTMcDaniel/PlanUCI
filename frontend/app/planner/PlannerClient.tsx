@@ -1789,33 +1789,6 @@ export default function PlannerClient() {
 
           {/* Auto-fill */}
           <div className="px-2.5 py-2.5 border-t border-[#2a2a2a] shrink-0">
-            {/* Unit load selector */}
-            <div className="mb-2.5">
-              <span className="text-[8px] font-bold uppercase tracking-[0.12em] text-[#333] block mb-1.5">
-                Units / Quarter
-              </span>
-              <div className="flex gap-1">
-                {UNIT_PRESETS.map((p) => (
-                  <button
-                    key={p.value}
-                    onClick={() => setMaxUnits(p.value)}
-                    className={`flex-1 rounded py-1 text-center transition-all
-                      ${maxUnits === p.value
-                        ? "bg-[#3b82f6]/15 border border-[#3b82f6]/50 text-[#3b82f6]"
-                        : "bg-[#1a1a1a] border border-[#2a2a2a] text-[#444] hover:text-[#666]"}`}
-                  >
-                    <span className="block text-[9px] font-bold">{p.label}</span>
-                    <span className="block text-[8px] font-normal opacity-70">{p.value}u</span>
-                  </button>
-                ))}
-              </div>
-              {UNIT_PRESETS.find((p) => p.value === maxUnits)?.warning && (
-                <p className="mt-1.5 text-[8.5px] text-amber-500/80 leading-snug">
-                  ⚠ Heavy course loads significantly increase difficulty and dropout risk — only recommended if required for your graduation timeline.
-                </p>
-              )}
-            </div>
-
             {/* AP Credits section */}
             <div className="mb-2.5 border border-[#2a2a2a] rounded">
               <button
@@ -1893,6 +1866,33 @@ export default function PlannerClient() {
                     </button>
                   )}
                 </div>
+              )}
+            </div>
+
+            {/* Unit load selector */}
+            <div className="mb-2.5">
+              <span className="text-[8px] font-bold uppercase tracking-[0.12em] text-[#333] block mb-1.5">
+                Units / Quarter
+              </span>
+              <div className="flex gap-1">
+                {UNIT_PRESETS.map((p) => (
+                  <button
+                    key={p.value}
+                    onClick={() => setMaxUnits(p.value)}
+                    className={`flex-1 rounded py-1 text-center transition-all
+                      ${maxUnits === p.value
+                        ? "bg-[#3b82f6]/15 border border-[#3b82f6]/50 text-[#3b82f6]"
+                        : "bg-[#1a1a1a] border border-[#2a2a2a] text-[#444] hover:text-[#666]"}`}
+                  >
+                    <span className="block text-[9px] font-bold">{p.label}</span>
+                    <span className="block text-[8px] font-normal opacity-70">{p.value}u</span>
+                  </button>
+                ))}
+              </div>
+              {UNIT_PRESETS.find((p) => p.value === maxUnits)?.warning && (
+                <p className="mt-1.5 text-[8.5px] text-amber-500/80 leading-snug">
+                  ⚠ Heavy course loads significantly increase difficulty and dropout risk — only recommended if required for your graduation timeline.
+                </p>
               )}
             </div>
 
