@@ -610,8 +610,8 @@ function PlacedCard({
     <div
       ref={setNodeRef}
       style={style}
-      className={`group/card flex items-center gap-1.5 rounded-r pl-2 pr-1 py-1 select-none
-        bg-[#1e1e1e] border border-l-0 border-[#2a2a2a] transition-colors min-h-[44px]
+      className={`group/card flex items-center gap-1.5 rounded-r-md pl-2 pr-1 py-1 select-none
+        bg-[#1e1e1e] border border-l-0 border-[#2a2a2a] shadow-sm transition-colors min-h-[44px]
         ${isDragging ? "opacity-20" : "hover:bg-[#252525] hover:border-[#333]"}`}
     >
       {/* drag handle */}
@@ -625,7 +625,7 @@ function PlacedCard({
 
       {/* course info */}
       <div className="flex-1 min-w-0">
-        <p className="text-[13px] font-bold text-[#e8e8e8] leading-tight truncate">{courseId}</p>
+        <p className="text-[15px] font-bold text-[#e8e8e8] leading-tight truncate">{courseId}</p>
         {title && (
           <p className="text-[10px] text-[#999] leading-snug truncate">{title}</p>
         )}
@@ -633,10 +633,12 @@ function PlacedCard({
 
       {/* right side */}
       <div className="flex flex-col items-end gap-0.5 shrink-0">
-        {gpa != null && isFinite(gpa) && (
-          <span className="text-[9px] font-mono" style={{ color: "#888" }}>{gpa.toFixed(2)} GPA</span>
+        {gpa != null && isFinite(gpa) ? (
+          <span className="text-[10px] font-mono font-medium" style={{ color: "#9a9a9a" }}>{gpa.toFixed(2)} GPA</span>
+        ) : (
+          <span className="text-[9px] font-mono text-[#5a5a5a] whitespace-nowrap">No GPA Data</span>
         )}
-        <span className="text-[10px] text-[#666]">{units ?? "?"} UNITS</span>
+        <span className="text-[11px] font-medium text-[#888] tabular-nums">{units ?? "?"} <span className="font-normal text-[#5a5a5a]">UNITS</span></span>
         <div className="flex gap-1 opacity-0 group-hover/card:opacity-100 transition-opacity">
           <button
             onPointerDown={(e) => e.stopPropagation()}
@@ -785,8 +787,8 @@ function QuarterCell({
   return (
     <div className={`flex flex-col border-r border-[#2a2a2a] last:border-r-0 ${dim ? "opacity-55" : ""}`}>
       {/* header */}
-      <div className="flex items-center px-2 h-7 border-b border-[#2a2a2a] shrink-0 bg-[#242424]">
-        <span className={`text-[10px] font-semibold ${dim ? "text-[#383838]" : "text-[#666]"}`}>
+      <div className={`flex items-center px-2 h-7 border-b border-[#2a2a2a] shrink-0 bg-[#242424] border-l-2 ${dim ? "border-l-[#FFC72C]/30" : "border-l-[#3b82f6]/40"}`}>
+        <span className={`text-[11px] font-bold tracking-wide ${dim ? "text-[#5a5648]" : "text-[#888]"}`}>
           {label}
         </span>
         {quarterDiff != null && (
@@ -808,10 +810,10 @@ function QuarterCell({
             : units > 19;
           return (
             <span
-              className={`text-[9px] ml-auto mr-1 ${overload ? "text-amber-500 font-semibold" : "text-[#555]"}`}
+              className={`text-[10px] ml-auto mr-1 font-semibold tabular-nums ${overload ? "text-amber-500" : "text-[#777]"}`}
               title={overload ? `⚠ Exceeds ${maxUnitsPerQuarter ?? 16}-unit cap` : undefined}
             >
-              {overload && "⚠ "}{units} UNITS
+              {overload && "⚠ "}{units} <span className="font-normal text-[#555]">UNITS</span>
             </span>
           );
         })()}
@@ -826,11 +828,13 @@ function QuarterCell({
       {/* droppable body */}
       <div
         ref={setNodeRef}
-        className={`flex-1 flex flex-col gap-[4px] p-1.5 min-h-[160px] transition-colors
+        className={`flex-1 flex flex-col gap-[5px] p-2 min-h-[160px] transition-colors
           ${isOver ? "bg-[#0d1a2d]" : "bg-[#1e1e1e]"}`}
       >
         {courseIds.length === 0 && !isOver && (
-          <div className="m-1 flex-1 border border-dashed border-[#242424] rounded" />
+          <div className="m-0.5 flex-1 flex items-center justify-center border border-dashed border-[#2c2c2c] rounded-md">
+            <span className="text-[9px] text-[#3a3a3a] font-medium select-none">Drop courses here</span>
+          </div>
         )}
         {courseIds.map((cid) => (
           <PlacedCardRow
@@ -858,7 +862,7 @@ function QuarterCell({
 // ── Course pill (sidebar grid) ─────────────────────────────────────────────────
 
 function CoursePill({
-  courseId, title, units, isPlaced, isApCredit, unavailable, diffScore,
+  courseId, title, units, isPlaced, isApCredit, unavailable, diffScore, compact,
 }: {
   courseId: string;
   title?: string | null;
@@ -867,7 +871,12 @@ function CoursePill({
   isApCredit?: boolean;
   unavailable?: boolean;
   diffScore?: number | null;
+  compact?: boolean;   // smaller code font for "pick N of X" pools (long lists)
 }) {
+  // Pick-N pools list many courses; keep their codes compact. Everywhere else
+  // uses the larger, easier-to-read size.
+  const codeSize = compact ? "text-[9px]" : "text-[11px]";
+
   const { attributes, listeners, setNodeRef, transform, isDragging } = useDraggable({
     id: `sidebar|${courseId}`,
     data: { type: "sidebar", courseId } satisfies DragData,
@@ -888,11 +897,11 @@ function CoursePill({
     return (
       <div
         title={`${tooltip} — satisfied by AP credit`}
-        className="flex items-center gap-1 rounded-full px-2 py-[3px] bg-emerald-950/40 border border-emerald-700/40 min-w-0 overflow-hidden"
+        className="flex items-center gap-1 rounded-full px-2.5 py-1 bg-emerald-950/40 border border-emerald-700/40 min-w-0 overflow-hidden"
       >
         {dot}
-        <span className="text-[9px] font-medium leading-none truncate text-emerald-400">{courseId}</span>
-        <span className="text-[6.5px] font-bold leading-none text-emerald-500 uppercase tracking-wide shrink-0">AP</span>
+        <span className={`${codeSize} font-medium leading-none truncate text-emerald-400`}>{courseId}</span>
+        <span className="text-[7px] font-bold leading-none text-emerald-500 uppercase tracking-wide shrink-0">AP</span>
       </div>
     );
   }
@@ -901,10 +910,10 @@ function CoursePill({
     return (
       <div
         title={tooltip}
-        className="flex items-center justify-center rounded-full px-2 py-[3px] bg-[#3b82f6]/20 border border-[#3b82f6]/35 min-w-0 overflow-hidden"
+        className="flex items-center justify-center rounded-full px-2.5 py-1 bg-[#3b82f6]/20 border border-[#3b82f6]/35 min-w-0 overflow-hidden"
       >
         {dot}
-        <span className="text-[9px] font-medium leading-none truncate text-[#93c5fd]">
+        <span className={`${codeSize} font-medium leading-none truncate text-[#93c5fd]`}>
           {courseId}
         </span>
       </div>
@@ -918,7 +927,7 @@ function CoursePill({
       {...listeners}
       {...attributes}
       title={tooltip}
-      className={`flex items-center justify-center rounded-full px-2 py-[3px] border cursor-grab active:cursor-grabbing select-none transition-colors min-w-0 overflow-hidden
+      className={`flex items-center justify-center rounded-full px-2.5 py-1 border cursor-grab active:cursor-grabbing select-none transition-colors min-w-0 overflow-hidden
         ${unavailable
           ? "border-dashed border-[#252525] bg-transparent"
           : isDragging
@@ -927,7 +936,7 @@ function CoursePill({
         }`}
     >
       {!unavailable && dot}
-      <span className={`text-[9px] font-medium leading-none truncate ${unavailable ? "text-[#333]" : "text-[#bbb]"}`}>
+      <span className={`${codeSize} font-medium leading-none truncate ${unavailable ? "text-[#333]" : "text-[#bbb]"}`}>
         {courseId}
       </span>
     </div>
@@ -973,27 +982,27 @@ function RequirementGroup({
     >
       <button
         onClick={() => setOpen((o) => !o)}
-        className="w-full flex items-center px-2 py-[7px] hover:bg-[#1c1c1c] transition-colors text-left gap-2 bg-[#141414]"
+        className="w-full flex items-center px-2.5 py-2 hover:bg-[#1c1c1c] transition-colors text-left gap-2 bg-[#141414]"
       >
         <div className="flex-1 min-w-0">
-          <span className="text-[10px] font-normal text-[#ccc] block truncate">
+          <span className="text-[12px] font-normal text-[#ccc] block truncate">
             {req.group_name}
           </span>
           {req.courses_needed < req.courses.length && (
-            <span className="text-[9px] text-amber-500/70 leading-none font-medium">
+            <span className="text-[10px] text-amber-500/70 leading-none font-medium">
               pick {req.courses_needed} of {req.courses.length}
             </span>
           )}
         </div>
         <div className="flex items-center gap-1.5 shrink-0">
-          <span className="text-[9px] px-1.5 py-[2px] rounded bg-[#1e1e1e] font-mono tabular-nums text-[#555]">
+          <span className="text-[10px] px-1.5 py-[2px] rounded bg-[#1e1e1e] font-mono tabular-nums text-[#555]">
             {placed}/{req.courses_needed}
           </span>
           <ChevronIcon open={open} />
         </div>
       </button>
       {open && (
-        <div className="grid grid-cols-3 gap-1 p-1.5 bg-[#0f0f0f]">
+        <div className="grid grid-cols-3 gap-1.5 p-2 bg-[#0f0f0f]">
           {filtered.map((cid) => (
             <CoursePill
               key={cid}
@@ -1004,6 +1013,7 @@ function RequirementGroup({
               isApCredit={apCreditedSet.has(cid)}
               unavailable={!courseInfoMap[cid]}
               diffScore={difficultyMap[cid] ?? null}
+              compact={req.courses_needed < req.courses.length}
             />
           ))}
         </div>
@@ -1040,18 +1050,18 @@ function FlatGroup({
   const showLabel = isChoice || req.courses.length > 1;
 
   return (
-    <div className="px-2 pt-1 pb-1.5">
+    <div className="px-2 pt-1.5 pb-2">
       {showLabel && (
-        <div className="flex items-center gap-1.5 mb-1">
-          <span className="text-[9px] text-[#4a4a4a] flex-1 truncate">{req.group_name}</span>
+        <div className="flex items-center gap-1.5 mb-1.5">
+          <span className="text-[11px] text-[#5a5a5a] flex-1 truncate">{req.group_name}</span>
           {isChoice && (
-            <span className={`text-[8px] font-mono shrink-0 ${done ? "text-[#22c55e]" : "text-[#444]"}`}>
+            <span className={`text-[9px] font-mono shrink-0 ${done ? "text-[#22c55e]" : "text-[#444]"}`}>
               pick {req.courses_needed}
             </span>
           )}
         </div>
       )}
-      <div className="flex flex-wrap gap-1">
+      <div className="flex flex-wrap gap-1.5">
         {filtered.map((cid) => (
           <CoursePill
             key={cid}
@@ -2393,14 +2403,15 @@ export default function PlannerClient() {
         <main className="flex-1 flex flex-col overflow-hidden bg-[#111]">
 
           {/* Top bar */}
-          <div className="h-10 shrink-0 flex items-center px-5 border-b border-[#2a2a2a] bg-[#141414] gap-3">
-            <span className="text-[11px] text-[#666] truncate max-w-[260px]">
-              {selectedLabel || <span className="text-[#333]">No major selected</span>}
+          <div className="h-12 shrink-0 flex items-center px-6 border-b border-[#2a2a2a] bg-[#141414] gap-3">
+            <span className="text-[13px] font-medium text-[#bbb] truncate max-w-[320px]">
+              {selectedLabel || <span className="text-[#555] font-normal">No major selected</span>}
             </span>
             <div className="flex-1" />
-            <span className="text-[10px] font-bold text-[#666]">
-              {totalUnits} <span className="text-[#444] font-normal">UNITS</span>
-            </span>
+            <div className="flex items-baseline gap-1.5">
+              <span className="text-[16px] font-bold text-[#e8e8e8] tabular-nums leading-none">{totalUnits}</span>
+              <span className="text-[10px] font-semibold uppercase tracking-[0.12em] text-[#555]">Units</span>
+            </div>
           </div>
 
           {/* Optimizer offline banner */}
@@ -2422,9 +2433,9 @@ export default function PlannerClient() {
                 return (
                   <div key={year} className="flex border-b border-[#2a2a2a] last:border-b-0">
                     {/* Year label */}
-                    <div className="w-8 shrink-0 flex items-center justify-center border-r border-[#2a2a2a] bg-[#0f0f0f]">
+                    <div className="w-9 shrink-0 flex items-center justify-center border-r border-[#2a2a2a] bg-gradient-to-b from-[#141414] to-[#0d0d0d]">
                       <span
-                        className="text-[6px] font-bold uppercase tracking-[0.15em] text-[#2a2a2a] select-none"
+                        className="text-[9px] font-bold uppercase tracking-[0.2em] text-[#6a6a6a] select-none"
                         style={{ writingMode: "vertical-rl", transform: "rotate(180deg)" }}
                       >
                         {`Year ${year}`}
@@ -2455,7 +2466,7 @@ export default function PlannerClient() {
                       })}
                       {hasSummer && (
                         <QuarterCell
-                          key={summerQk} qKey={summerQk} label="Sum" dim
+                          key={summerQk} qKey={summerQk} label="Summer" dim
                           courseIds={plannedCourses[summerQk] ?? []}
                           courseInfoMap={courseInfoMap}
                           difficultyMap={difficultyMap}
@@ -2476,14 +2487,14 @@ export default function PlannerClient() {
                         <button
                           onClick={() => toggleSummer(year)}
                           title="Add Summer"
-                          className="flex flex-col items-center text-[#252525] hover:text-[#4a4a4a] transition-colors"
+                          className="flex flex-col items-center gap-1 text-[#5a5a5a] hover:text-[#FFC72C]/70 transition-colors"
                         >
-                          <span className="text-[10px] font-bold leading-none">+</span>
+                          <span className="text-[11px] font-bold leading-none">+</span>
                           <span
-                            className="text-[6px] font-bold uppercase leading-none"
+                            className="text-[8px] font-semibold uppercase tracking-[0.15em] leading-none"
                             style={{ writingMode: "vertical-rl" }}
                           >
-                            Sum
+                            Summer
                           </span>
                         </button>
                       )}
@@ -2496,7 +2507,7 @@ export default function PlannerClient() {
             {/* Add Year */}
             <button
               onClick={addYear}
-              className="mt-3 w-full flex items-center justify-center gap-1.5 rounded-lg border border-dashed border-[#2a2a2a] py-2.5 text-[10px] font-bold uppercase tracking-widest text-[#444] hover:text-[#888] hover:border-[#3a3a3a] transition-colors"
+              className="mt-3 w-full flex items-center justify-center gap-1.5 rounded-lg border border-dashed border-[#2a2a2a] py-2.5 text-[10px] font-semibold uppercase tracking-[0.15em] text-[#5a5a5a] hover:text-[#FFC72C]/70 hover:border-[#3a3a3a] transition-colors"
             >
               <span className="text-[13px] leading-none">+</span> Add Year
             </button>
