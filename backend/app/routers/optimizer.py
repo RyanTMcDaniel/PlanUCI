@@ -94,6 +94,7 @@ class GenerateRequest(BaseModel):
     units_per_quarter:  int = 19   # UCI standard max (12–19); Heavy=20, Overload=22
     waived_ges:         list[str] = []
     ap_scores:          dict[str, int] = {}  # {"AP Calculus AB": 4, "AP Statistics": 5}
+    start_quarter:      str = ""   # grid's first quarter (e.g. "2026_fall"); pins the window
 
 
 @router.post("/generate")
@@ -105,6 +106,7 @@ def optimizer_generate(req: GenerateRequest):
         units_per_quarter  = req.units_per_quarter,
         waived_ges         = req.waived_ges,
         ap_scores          = req.ap_scores,
+        start_quarter      = req.start_quarter or None,
     )
     client = _supabase_client()
     cached = optimizer_cache.get(client, cache_key)
@@ -120,6 +122,7 @@ def optimizer_generate(req: GenerateRequest):
             units_per_quarter  = req.units_per_quarter,
             waived_ges         = req.waived_ges,
             ap_scores          = req.ap_scores,
+            start_quarter      = req.start_quarter or None,
         )
     except FeasibilityError as e:
         raise HTTPException(

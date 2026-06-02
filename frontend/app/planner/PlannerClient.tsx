@@ -2481,6 +2481,9 @@ export default function PlannerClient() {
                           units_per_quarter: maxUnits,
                           waived_ges: [],
                           ap_scores: apScores,
+                          // Pin the optimizer window to the grid's first (Fall)
+                          // quarter so it never schedules into off-grid quarters.
+                          start_quarter: qkey(1, "fall"),
                         }),
                   });
                   const data = await res.json();
