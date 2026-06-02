@@ -264,10 +264,13 @@ function parseLockConflict(conflict: string): string {
 // ── Icons ─────────────────────────────────────────────────────────────────────
 
 function LockIcon({ locked }: { locked: boolean }) {
+  // Always-visible: dim outline at rest, solid amber when locked.
   return (
     <svg viewBox="0 0 14 14" fill="none"
-      className={`w-3 h-3 transition-colors ${locked ? "text-amber-400" : "text-[#555] group-hover/card:text-[#e8e8e8]"}`}>
-      <rect x="3" y="6" width="8" height="6" rx="1.2" stroke="currentColor" strokeWidth="1.3"/>
+      className={`w-3.5 h-3.5 transition-colors ${locked ? "text-amber-400" : "text-[#5a5a5a] group-hover/card:text-[#9a9a9a]"}`}>
+      <rect x="3" y="6" width="8" height="6" rx="1.2"
+        stroke="currentColor" strokeWidth="1.3"
+        fill={locked ? "currentColor" : "none"} />
       <path d="M5 6V4.5a2 2 0 014 0V6" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round"/>
     </svg>
   );
@@ -668,29 +671,33 @@ function PlacedCard({
 
       {/* right side */}
       <div className="flex flex-col items-end gap-0.5 shrink-0">
-        {gpa != null && isFinite(gpa) ? (
-          <span className="text-[10px] font-mono font-medium" style={{ color: "#9a9a9a" }}>{gpa.toFixed(2)} GPA</span>
-        ) : (
-          <span className="text-[9px] font-mono text-[#5a5a5a] whitespace-nowrap">No GPA Data</span>
-        )}
-        <span className="text-[11px] font-medium text-[#888] tabular-nums">{units ?? "?"} <span className="font-normal text-[#5a5a5a]">UNITS</span></span>
-        <div className="flex gap-1 opacity-0 group-hover/card:opacity-100 transition-opacity">
+        {/* top row: always-visible lock toggle (separated from Remove) + GPA */}
+        <div className="flex items-center gap-1.5">
           <button
             onPointerDown={(e) => e.stopPropagation()}
             onClick={() => onToggleLock(courseId)}
-            title={isLocked ? "Unlock" : "Lock to quarter"}
+            title={isLocked ? "Unlock from this quarter" : "Lock to this quarter"}
+            aria-pressed={isLocked}
+            className="p-0.5 -my-0.5 rounded hover:bg-white/[0.08] transition-colors leading-none"
           >
             <LockIcon locked={isLocked} />
           </button>
-          <button
-            onPointerDown={(e) => e.stopPropagation()}
-            onClick={() => onRemove(courseId, quarterKey)}
-            title="Remove"
-            className="text-[#555] hover:text-[#e8e8e8] text-[12px] leading-none w-3 text-center transition-colors"
-          >
-            ×
-          </button>
+          {gpa != null && isFinite(gpa) ? (
+            <span className="text-[10px] font-mono font-medium" style={{ color: "#9a9a9a" }}>{gpa.toFixed(2)} GPA</span>
+          ) : (
+            <span className="text-[9px] font-mono text-[#5a5a5a] whitespace-nowrap">No GPA Data</span>
+          )}
         </div>
+        <span className="text-[11px] font-medium text-[#888] tabular-nums">{units ?? "?"} <span className="font-normal text-[#5a5a5a]">UNITS</span></span>
+        {/* bottom: hover-only Remove, vertically separated from the lock to avoid mis-clicks */}
+        <button
+          onPointerDown={(e) => e.stopPropagation()}
+          onClick={() => onRemove(courseId, quarterKey)}
+          title="Remove from plan"
+          className="opacity-0 group-hover/card:opacity-100 text-[#555] hover:text-red-400 text-[13px] leading-none w-4 text-center transition-all"
+        >
+          ×
+        </button>
       </div>
     </div>
   );
