@@ -124,6 +124,60 @@ def _eval_locked_tree(
     return True
 
 
+def _offending_locked_norms(
+    node: dict, avail: set[str], locked_norm: set[str], completed_norm: set[str],
+    same_q_norm: set[str] | None = None,
+) -> set[str]:
+    """Normalized ids of the locked courses that actually cause a tree to fail.
+
+    Mirrors _eval_locked_tree but collects the specific False leaves instead of a
+    bare bool, so a conflict message can name the offending prereq(s) rather than
+    dumping every locked course.
+    """
+    offenders: set[str] = set()
+    for key in ("AND", "OR", "NOT"):
+        if key not in node:
+            continue
+        items = node[key]
+        if key == "AND":
+            for i in items:
+                if _eval_locked_item(i, avail, locked_norm, completed_norm, same_q_norm) is False:
+                    offenders |= _offending_item_norms(i, avail, locked_norm, completed_norm, same_q_norm)
+            return offenders
+        if key == "OR":
+            results = [_eval_locked_item(i, avail, locked_norm, completed_norm, same_q_norm) for i in items]
+            if any(r is True for r in results):
+                return set()  # an alternative is satisfied — no conflict
+            for i, r in zip(items, results):
+                if r is False:
+                    offenders |= _offending_item_norms(i, avail, locked_norm, completed_norm, same_q_norm)
+            return offenders
+        if key == "NOT":
+            for i in items:
+                if (
+                    i.get("prereqType") == "course"
+                    and _norm(i.get("courseId", "")) in locked_norm
+                    and _norm(i.get("courseId", "")) in avail
+                ):
+                    offenders.add(_norm(i.get("courseId", "")))
+            return offenders
+    return offenders
+
+
+def _offending_item_norms(
+    item: dict, avail: set[str], locked_norm: set[str], completed_norm: set[str],
+    same_q_norm: set[str] | None = None,
+) -> set[str]:
+    t = item.get("prereqType")
+    if t == "course":
+        cid = _norm(item.get("courseId", ""))
+        is_false = _eval_locked_item(item, avail, locked_norm, completed_norm, same_q_norm) is False
+        return {cid} if is_false else set()
+    if t == "exam":
+        return set()
+    return _offending_locked_norms(item, avail, locked_norm, completed_norm, same_q_norm)
+
+
 def _missing_prereq_norms(
     tree: dict, locked_norm: set[str], completed_norm: set[str]
 ) -> set[str]:
@@ -206,6 +260,7 @@ def validate_locks(
     locked_norm = {_norm(c) for c in locked_courses}
 
     norm_to_quarter = {_norm(c): q for c, q in locked_courses.items()}
+    norm_to_raw     = {_norm(c): c for c in locked_courses}
 
     conflicts: list[str] = []
     for course_id, quarter in sorted(locked_courses.items(), key=lambda x: _qkey(x[1])):
@@ -226,16 +281,19 @@ def validate_locks(
             }
 
             if not _eval_locked_tree(tree, avail, locked_norm, completed_norm, same_q_norm):
+                # Name the SPECIFIC offending prereq(s), not the full lock list.
+                offenders = _offending_locked_norms(
+                    tree, avail, locked_norm, completed_norm, same_q_norm
+                )
                 blocking = [
-                    f"{c} (locked to {q})"
-                    for c, q in locked_courses.items()
-                    if c != course_id and _norm(c) in locked_norm
-                    and _qkey(locked_courses[c]) >= _qkey(quarter)
+                    f"{norm_to_raw.get(n, n)} (locked to {norm_to_quarter[n]})"
+                    for n in sorted(offenders)
+                    if n in norm_to_quarter
                 ]
                 blocker_str = ", ".join(blocking) if blocking else "a locked prerequisite"
                 conflicts.append(
-                    f"{course_id} locked to {quarter}: {blocker_str} must be "
-                    f"placed in an earlier quarter"
+                    f"{course_id} locked to {quarter}: needs {blocker_str} "
+                    f"in an earlier quarter"
                 )
 
         # 2. Missing prereq: required course is not in the plan at all
@@ -287,6 +345,7 @@ def _whatif_optimize(
     meta:        dict[str, dict],
     max_iter:    int = 150,
     seed:        int | None = None,
+    extra_available: set[str] | None = None,
 ) -> tuple[CoursePlan, float, dict[str, float]]:
     """Hill-climb on unlocked courses only; locked courses never move."""
     rng       = random.Random(seed)
@@ -296,7 +355,7 @@ def _whatif_optimize(
     max_per_q = plan.units_per_quarter // UNITS_PER_COURSE
 
     # Violations that are already present before we start (don't penalise new moves for them)
-    base_viols = set(_check_prereqs(plan, trees))
+    base_viols = set(_check_prereqs(plan, trees, extra_available))
 
     for _ in range(max_iter):
         # Quarters with at least one unlocked course
@@ -323,7 +382,7 @@ def _whatif_optimize(
         candidate.planned_courses[q_to] = candidate.planned_courses.get(q_to, []) + [course]
 
         # Only reject if the move ADDS new violations
-        cand_viols = set(_check_prereqs(candidate, trees))
+        cand_viols = set(_check_prereqs(candidate, trees, extra_available))
         if cand_viols - base_viols:
             continue
 
@@ -350,6 +409,7 @@ def optimize_around_locks(
     locked_course_ids: list[str],
     top_n: int = 3,
     seed_configs: list[tuple[int, int]] | None = None,
+    ap_scores: dict[str, int] | None = None,
 ) -> dict:
     """Reposition only the UNLOCKED courses of `plan`; locked courses never move.
 
@@ -393,6 +453,14 @@ def optimize_around_locks(
     trees       = _prereq_trees(client, all_ids)
     meta        = _load_course_meta(client, all_ids)
 
+    # Resolve AP / completed credit into a normalized baseline of satisfied
+    # tokens (course norms + "EXAMOK:" exam tokens).  These count as satisfied
+    # prereqs everywhere below, so AP-credited courses that are NOT placed in
+    # any quarter still read as satisfied (the reported bug).
+    completed_norm = {_norm(c) for c in plan.completed_courses}
+    if ap_scores:
+        _resolve_ap_credits(client, ap_scores, completed_norm)
+
     # ── Stage A: is the locked set itself feasible? ───────────────────────────
     # Treat completed + unlocked courses as available so validate_locks flags
     # ONLY locked-vs-locked ordering conflicts (and prereqs absent from the whole
@@ -400,7 +468,7 @@ def optimize_around_locks(
     if len(locked_map) >= 2:
         extra_available = list(plan.completed_courses) + unlocked_ids
         lock_ok, lock_conflicts = validate_locks(
-            locked_map, completed_courses=extra_available
+            locked_map, completed_courses=extra_available, ap_scores=ap_scores
         )
         if not lock_ok:
             return {
@@ -422,11 +490,12 @@ def optimize_around_locks(
         rng   = random.Random(s)
         start = _perturb_unlocked(base, locked_norm, rng, n_swaps) if n_swaps else base
         opt, score, bd = _whatif_optimize(
-            start, locked_norm, trees, diff_scores, meta, seed=s
+            start, locked_norm, trees, diff_scores, meta, seed=s,
+            extra_available=completed_norm,
         )
 
         # Hard-constraint gate using the structured checks.
-        prereq_viols = _check_prereqs(opt, trees)
+        prereq_viols = _check_prereqs(opt, trees, completed_norm)
         units_ok, unit_checks = units_valid(opt)
 
         if not prereq_viols and units_ok:

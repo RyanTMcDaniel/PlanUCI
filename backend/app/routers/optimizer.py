@@ -179,6 +179,7 @@ def optimizer_whatif(req: WhatIfRequest):
         result = optimize_around_locks(
             req.plan.to_domain(),
             list(req.locked_courses.keys()),
+            ap_scores=req.ap_scores or None,
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
