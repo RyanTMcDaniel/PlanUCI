@@ -81,11 +81,19 @@ def _prereq_trees(client, course_ids: list[str]) -> dict[str, dict]:
     }
 
 
-def _check_prereqs(plan: CoursePlan, trees: dict[str, dict]) -> list[str]:
-    """Prereq check using pre-loaded trees — no Supabase calls."""
+def _check_prereqs(
+    plan: CoursePlan, trees: dict[str, dict], extra_available: set[str] | None = None
+) -> list[str]:
+    """Prereq check using pre-loaded trees — no Supabase calls.
+
+    extra_available holds already-normalized satisfied tokens (AP-credited course
+    norms and ``EXAMOK:`` exam tokens) that count as satisfied before any quarter.
+    """
     violations: list[str] = []
     sorted_quarters = sorted(plan.planned_courses.keys(), key=_qkey)
     available: set[str] = {_norm(c) for c in plan.completed_courses}
+    if extra_available:
+        available |= extra_available
 
     for quarter in sorted_quarters:
         same_q = frozenset(_norm(c) for c in plan.planned_courses[quarter])
