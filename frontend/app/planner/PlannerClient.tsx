@@ -1318,6 +1318,7 @@ export default function PlannerClient() {
   const [lockedCourses, setLockedCourses] = useState<Set<string>>(new Set());
   const [searchQuery, setSearchQuery] = useState("");
   const [autoFillLoading, setAutoFillLoading] = useState(false);
+  const [optimizeLoading, setOptimizeLoading] = useState(false);
   const [toast, setToast] = useState<string | null>(null);
   const [prereqWarnings, setPrereqWarnings] = useState<Record<string, string>>({});
   const [difficultyMap, setDifficultyMap] = useState<Record<string, number>>({});
@@ -1373,6 +1374,13 @@ export default function PlannerClient() {
         0,
       ),
     [plannedCourses, courseInfoMap],
+  );
+
+  // True when at least one course sits in a quarter — the Optimize button needs
+  // a non-empty plan to rebalance.
+  const hasPlacedCourses = useMemo(
+    () => Object.values(plannedCourses).some((ids) => ids.length > 0),
+    [plannedCourses],
   );
 
   // Parent majors: rows with no specialization_name — these populate the first dropdown
@@ -2549,6 +2557,104 @@ export default function PlannerClient() {
                 </>
               ) : (
                 <><span>✦</span> Auto-fill Plan</>
+              )}
+            </button>
+
+            <button
+              disabled={!selectedMajorId || !hasPlacedCourses || optimizeLoading || autoFillLoading}
+              onClick={async () => {
+                if (!selectedMajorId || !hasPlacedCourses || optimizeLoading || autoFillLoading) return;
+                setOptimizeLoading(true);
+                setToast(null);
+                try {
+                  // Pin only manually-locked courses to their quarter; every other
+                  // placed course is the pool optimize_around_locks repositions.
+                  const lockedMap: Record<string, string> = {};
+                  for (const [quarter, courses] of Object.entries(plannedCourses)) {
+                    for (const cid of courses) {
+                      if (lockedCourses.has(cid)) lockedMap[cid] = quarter;
+                    }
+                  }
+
+                  const res = await fetch("/api/whatif", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({
+                      plan: {
+                        major_id: selectedMajorId,
+                        completed_courses: [],
+                        planned_courses: plannedCourses,
+                        graduation_year: parseInt(gradQuarter.split("_")[0]),
+                        units_per_quarter: maxUnits,
+                      },
+                      locked_courses: lockedMap,
+                      major_id: selectedMajorId,
+                      graduation_quarter: gradQuarter,
+                      units_per_quarter: maxUnits,
+                      waived_ges: [],
+                      ap_scores: apScores,
+                    }),
+                  });
+                  const data = await res.json();
+                  if (!res.ok) {
+                    if (
+                      data?.detail?.error === "lock_conflict" &&
+                      Array.isArray(data.detail.conflicts) &&
+                      data.detail.conflicts.length > 0
+                    ) {
+                      setLockConflictErrors(data.detail.conflicts as string[]);
+                    } else {
+                      const msg =
+                        typeof data?.detail === "object"
+                          ? (data.detail.message ?? JSON.stringify(data.detail))
+                          : (data?.detail ?? data?.error ?? "Optimizer error");
+                      setToast(String(msg));
+                    }
+                  } else {
+                    setLockConflictErrors(null);
+                    if (data?.status === "infeasible") {
+                      const reasons: string[] = Array.isArray(data.conflicts)
+                        ? data.conflicts.map(
+                            (c: { reason?: string }) => c?.reason ?? String(c),
+                          )
+                        : [];
+                      setToast(
+                        reasons.length
+                          ? `Can't optimize with these locks — ${reasons.join(" · ")}`
+                          : "Can't optimize around these locked courses.",
+                      );
+                    } else {
+                      const plan = data?.plans?.[0]?.planned_courses as
+                        | PlannedCourses
+                        | undefined;
+                      if (plan) {
+                        setPlannedCourses(plan);
+                        validatePlan(plan);
+                      } else {
+                        setToast("No plan returned from optimizer");
+                      }
+                    }
+                  }
+                } catch (err) {
+                  setToast(err instanceof Error ? err.message : "Optimizer unavailable");
+                } finally {
+                  setOptimizeLoading(false);
+                }
+              }}
+              className={`w-full mt-1.5 flex items-center justify-center gap-2 rounded py-2.5 text-[11px] font-bold tracking-wide transition-all
+                ${selectedMajorId && hasPlacedCourses && !optimizeLoading && !autoFillLoading
+                  ? "bg-[#7c3aed] hover:bg-[#6d28d9] text-white"
+                  : "bg-[#1a1a1a] text-[#3a3a3a] cursor-not-allowed"}`}
+            >
+              {optimizeLoading ? (
+                <>
+                  <svg className="w-3.5 h-3.5 animate-spin" viewBox="0 0 12 12" fill="none">
+                    <circle cx="6" cy="6" r="4.5" stroke="currentColor" strokeWidth="1.5" strokeDasharray="20 8"/>
+                  </svg>
+                  Optimizing…
+                </>
+              ) : (
+                <><span>⚡</span> Optimize Schedule</>
               )}
             </button>
 
