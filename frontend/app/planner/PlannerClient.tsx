@@ -1317,7 +1317,8 @@ export default function PlannerClient() {
   const [summerYears, setSummerYears] = useState<Set<number>>(new Set());
   const [lockedCourses, setLockedCourses] = useState<Set<string>>(new Set());
   const [searchQuery, setSearchQuery] = useState("");
-  const [autoFillLoading, setAutoFillLoading] = useState(false);
+  // Which plan action is running (null = idle); disables both buttons, spins the active one.
+  const [busyAction, setBusyAction] = useState<null | "draft" | "rebalance">(null);
   const [toast, setToast] = useState<string | null>(null);
   const [prereqWarnings, setPrereqWarnings] = useState<Record<string, string>>({});
   const [difficultyMap, setDifficultyMap] = useState<Record<string, number>>({});
@@ -1329,7 +1330,7 @@ export default function PlannerClient() {
   const [apSectionOpen, setApSectionOpen] = useState(false);
   const [apSearch, setApSearch] = useState("");
   const [showClearConfirm, setShowClearConfirm] = useState(false);
-  const [lockConflictErrors, setLockConflictErrors] = useState<string[] | null>(null);
+  const [showDraftConfirm, setShowDraftConfirm] = useState(false);
   const [pendingLock, setPendingLock] = useState<{ courseId: string; warnings: string[] } | null>(null);
   const [clearSuccess, setClearSuccess] = useState(false);
   // Prereq-chain proposal awaiting user confirmation (additive — does not block the
@@ -1896,6 +1897,115 @@ export default function PlannerClient() {
     }
   }
 
+  // Button A: draft a fresh starting plan from the major's REQUIRED courses only
+  // (electives excluded by design — the user adds those). Always /api/optimizer.
+  async function runDraft() {
+    if (!selectedMajorId || busyAction) return;
+    setBusyAction("draft");
+    setToast(null);
+    try {
+      const res = await fetch("/api/optimizer", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          major_id: selectedMajorId,
+          completed_courses: [],
+          graduation_quarter: gradQuarter,
+          units_per_quarter: maxUnits,
+          waived_ges: [],
+          ap_scores: apScores,
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        const msg =
+          typeof data?.detail === "object"
+            ? (data.detail.message ?? JSON.stringify(data.detail))
+            : (data?.detail ?? data?.error ?? "Optimizer error");
+        setToast(String(msg));
+        return;
+      }
+      const plan = data?.variants?.[0]?.planned_courses as PlannedCourses | undefined;
+      if (plan) {
+        setPlannedCourses(plan);
+        validatePlan(plan);
+      } else {
+        setToast("No plan returned from optimizer");
+      }
+    } catch (err) {
+      setToast(err instanceof Error ? err.message : "Optimizer unavailable");
+    } finally {
+      setBusyAction(null);
+    }
+  }
+
+  // Button B: rebalance the CURRENT grid — hold locked courses fixed, reposition the
+  // rest (optimize_around_locks). Always /api/whatif.
+  async function runRebalance() {
+    if (busyAction) return;
+    const lockedMap: Record<string, string> = {};
+    let placedCount = 0;
+    for (const [quarter, courses] of Object.entries(plannedCourses)) {
+      for (const cid of courses) {
+        placedCount++;
+        if (lockedCourses.has(cid)) lockedMap[cid] = quarter;
+      }
+    }
+    if (placedCount === 0) {
+      setToast("Nothing to rebalance yet — add some courses first.");
+      return;
+    }
+    setBusyAction("rebalance");
+    setToast(null);
+    try {
+      const res = await fetch("/api/whatif", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          plan: {
+            major_id: selectedMajorId,
+            completed_courses: [],
+            planned_courses: plannedCourses,
+            graduation_year: parseInt(gradQuarter.split("_")[0]),
+            units_per_quarter: maxUnits,
+          },
+          locked_courses: lockedMap,
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        const msg =
+          typeof data?.detail === "object"
+            ? (data.detail.message ?? JSON.stringify(data.detail))
+            : (data?.detail ?? data?.error ?? "Optimizer error");
+        setToast(String(msg));
+        return;
+      }
+      if (data?.status === "infeasible") {
+        const reasons: string[] = Array.isArray(data.conflicts)
+          ? data.conflicts.map((c: { reason?: string }) => c?.reason ?? String(c))
+          : [];
+        setToast(
+          reasons.length
+            ? `Can't rebalance with these locks — ${reasons.join(" · ")}`
+            : "Can't rebalance with these locked courses.",
+        );
+        return;
+      }
+      const plan = data?.plans?.[0]?.planned_courses as PlannedCourses | undefined;
+      if (plan) {
+        setPlannedCourses(plan);
+        validatePlan(plan);
+      } else {
+        setToast("No plan returned from optimizer");
+      }
+    } catch (err) {
+      setToast(err instanceof Error ? err.message : "Optimizer unavailable");
+    } finally {
+      setBusyAction(null);
+    }
+  }
+
   // ── Handlers ───────────────────────────────────────────────────────────────
   const handleMajorNameChange = useCallback(
     (displayName: string) => {
@@ -2406,151 +2516,56 @@ export default function PlannerClient() {
               </div>
             )}
 
-            {lockConflictErrors && (
-              <div className="mb-2 px-2 py-2 rounded border border-amber-700/40 bg-amber-950/20">
-                <div className="flex items-start justify-between mb-1.5">
-                  <span className="text-[8.5px] font-semibold text-amber-400 leading-snug">
-                    Locked courses have missing prerequisites:
-                  </span>
-                  <button
-                    onClick={() => setLockConflictErrors(null)}
-                    className="text-amber-600 hover:text-amber-400 text-[11px] leading-none shrink-0 ml-1"
-                  >
-                    ×
-                  </button>
-                </div>
-                <ul className="space-y-1 mb-1.5">
-                  {lockConflictErrors.map((c, i) => (
-                    <li key={i} className="text-[8px] text-amber-300/80 leading-snug">
-                      · {parseLockConflict(c)}
-                    </li>
-                  ))}
-                </ul>
-                <p className="text-[7.5px] text-amber-500/70 leading-snug">
-                  Unlock these courses or add their prerequisites to continue.
-                </p>
-              </div>
-            )}
+            {/* ── Plan actions ──────────────────────────────────────────────── */}
             <button
-              disabled={!selectedMajorId || autoFillLoading}
-              onClick={async () => {
-                if (!selectedMajorId || autoFillLoading) return;
-                setAutoFillLoading(true);
-                setToast(null);
-                try {
-                  // Build locked course→quarter map from the current plan
-                  const lockedMap: Record<string, string> = {};
-                  for (const [quarter, courses] of Object.entries(plannedCourses)) {
-                    for (const cid of courses) {
-                      if (lockedCourses.has(cid)) lockedMap[cid] = quarter;
-                    }
-                  }
-                  const hasLocks = Object.keys(lockedMap).length > 0;
-
-                  const res = await fetch(hasLocks ? "/api/whatif" : "/api/optimizer", {
-                    method: "POST",
-                    headers: { "Content-Type": "application/json" },
-                    body: hasLocks
-                      ? JSON.stringify({
-                          plan: {
-                            major_id: selectedMajorId,
-                            completed_courses: [],
-                            planned_courses: plannedCourses,
-                            graduation_year: parseInt(gradQuarter.split("_")[0]),
-                            units_per_quarter: maxUnits,
-                          },
-                          locked_courses: lockedMap,
-                          major_id: selectedMajorId,
-                          graduation_quarter: gradQuarter,
-                          units_per_quarter: maxUnits,
-                          waived_ges: [],
-                          ap_scores: apScores,
-                        })
-                      : JSON.stringify({
-                          major_id: selectedMajorId,
-                          completed_courses: [],
-                          graduation_quarter: gradQuarter,
-                          units_per_quarter: maxUnits,
-                          waived_ges: [],
-                          ap_scores: apScores,
-                        }),
-                  });
-                  const data = await res.json();
-                  if (!res.ok) {
-                    if (
-                      data?.detail?.error === "lock_conflict" &&
-                      Array.isArray(data.detail.conflicts) &&
-                      data.detail.conflicts.length > 0
-                    ) {
-                      setLockConflictErrors(data.detail.conflicts as string[]);
-                    } else {
-                      const msg =
-                        typeof data?.detail === "object"
-                          ? (data.detail.message ?? JSON.stringify(data.detail))
-                          : (data?.detail ?? data?.error ?? "Optimizer error");
-                      setToast(String(msg));
-                    }
-                  } else {
-                    setLockConflictErrors(null);
-                    if (hasLocks) {
-                      // optimize_around_locks: { status, plans | conflicts }
-                      if (data?.status === "infeasible") {
-                        const reasons: string[] = Array.isArray(data.conflicts)
-                          ? data.conflicts.map(
-                              (c: { reason?: string }) => c?.reason ?? String(c),
-                            )
-                          : [];
-                        setToast(
-                          reasons.length
-                            ? `Can't rebalance with these locks — ${reasons.join(" · ")}`
-                            : "Can't rebalance with these locked courses.",
-                        );
-                      } else {
-                        const plan = data?.plans?.[0]?.planned_courses as
-                          | PlannedCourses
-                          | undefined;
-                        if (plan) {
-                          setPlannedCourses(plan);
-                          validatePlan(plan);
-                        } else {
-                          setToast("No plan returned from optimizer");
-                        }
-                      }
-                    } else {
-                      // generate(): { variants: [...] }
-                      const plan = data?.variants?.[0]?.planned_courses as
-                        | PlannedCourses
-                        | undefined;
-                      if (plan) {
-                        setPlannedCourses(plan);
-                        validatePlan(plan);
-                      } else {
-                        setToast("No plan returned from optimizer");
-                      }
-                    }
-                  }
-                } catch (err) {
-                  setToast(err instanceof Error ? err.message : "Optimizer unavailable");
-                } finally {
-                  setAutoFillLoading(false);
-                }
+              disabled={!selectedMajorId || busyAction !== null}
+              onClick={() => {
+                if (!selectedMajorId || busyAction) return;
+                const hasPlaced = Object.values(plannedCourses).some((a) => a.length > 0);
+                if (hasPlaced) setShowDraftConfirm(true);
+                else runDraft();
               }}
               className={`w-full flex items-center justify-center gap-2 rounded py-2.5 text-[11px] font-bold tracking-wide transition-all
-                ${selectedMajorId && !autoFillLoading
+                ${selectedMajorId && busyAction === null
                   ? "bg-[#3b82f6] hover:bg-[#2563eb] text-white"
                   : "bg-[#1a1a1a] text-[#3a3a3a] cursor-not-allowed"}`}
             >
-              {autoFillLoading ? (
+              {busyAction === "draft" ? (
                 <>
                   <svg className="w-3.5 h-3.5 animate-spin" viewBox="0 0 12 12" fill="none">
                     <circle cx="6" cy="6" r="4.5" stroke="currentColor" strokeWidth="1.5" strokeDasharray="20 8"/>
                   </svg>
-                  Generating…
+                  Drafting…
                 </>
               ) : (
-                <><span>✦</span> Auto-fill Plan</>
+                <><span>✦</span> Draft starting plan</>
               )}
             </button>
+
+            <button
+              disabled={busyAction !== null}
+              onClick={() => runRebalance()}
+              className={`w-full mt-1.5 flex items-center justify-center gap-2 rounded py-2.5 text-[11px] font-bold tracking-wide transition-all
+                ${busyAction === null
+                  ? "bg-[#1e293b] hover:bg-[#243044] text-[#cbd5e1] border border-[#334155]"
+                  : "bg-[#1a1a1a] text-[#3a3a3a] cursor-not-allowed border border-transparent"}`}
+            >
+              {busyAction === "rebalance" ? (
+                <>
+                  <svg className="w-3.5 h-3.5 animate-spin" viewBox="0 0 12 12" fill="none">
+                    <circle cx="6" cy="6" r="4.5" stroke="currentColor" strokeWidth="1.5" strokeDasharray="20 8"/>
+                  </svg>
+                  Rebalancing…
+                </>
+              ) : (
+                <><span>⇄</span> Rebalance</>
+              )}
+            </button>
+
+            <p className="mt-1.5 text-[9px] text-[#555] leading-snug">
+              <span className="text-[#777] font-medium">Draft</span> fills required courses only — add electives yourself, then{" "}
+              <span className="text-[#777] font-medium">Rebalance</span> to smooth the workload around locked courses.
+            </p>
 
             <button
               onClick={() => setShowClearConfirm(true)}
@@ -2636,6 +2651,35 @@ export default function PlannerClient() {
                   className="flex-1 rounded-lg bg-[#3b82f6] hover:bg-[#2563eb] py-2 text-xs font-medium text-white transition-colors disabled:opacity-50"
                 >
                   {prereqApplying ? "Adding…" : "Add prerequisites"}
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {showDraftConfirm && (
+          <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm">
+            <div className="w-80 rounded-xl border border-white/[0.1] bg-[#1a1a1a] p-6 shadow-2xl">
+              <h2 className="text-sm font-semibold text-white mb-2">Replace with a fresh draft?</h2>
+              <p className="text-xs text-zinc-400 leading-relaxed mb-5">
+                This will replace your current plan with a fresh draft of required
+                courses (electives are not added — you place those yourself). Continue?
+              </p>
+              <div className="flex gap-2">
+                <button
+                  onClick={() => setShowDraftConfirm(false)}
+                  className="flex-1 rounded-lg border border-white/[0.1] py-2 text-xs font-medium text-zinc-300 hover:bg-white/[0.06] transition-colors"
+                >
+                  Cancel
+                </button>
+                <button
+                  onClick={() => {
+                    setShowDraftConfirm(false);
+                    runDraft();
+                  }}
+                  className="flex-1 rounded-lg bg-[#3b82f6] hover:bg-[#2563eb] py-2 text-xs font-medium text-white transition-colors"
+                >
+                  Replace plan
                 </button>
               </div>
             </div>
