@@ -53,6 +53,7 @@ def make_key(
     units_per_quarter:  int,
     waived_ges:         list[str] | None = None,
     ap_scores:          dict[str, int] | None = None,
+    start_quarter:      str | None = None,
 ) -> str:
     """Return a deterministic SHA-256 hex key for the given generate() inputs."""
     payload = json.dumps(
@@ -63,6 +64,7 @@ def make_key(
             "units_per_quarter":  units_per_quarter,
             "waived_ges":         sorted(waived_ges or []),
             "ap_scores":          dict(sorted((ap_scores or {}).items())),
+            "start_quarter":      start_quarter or "",
         },
         sort_keys=True,
     )

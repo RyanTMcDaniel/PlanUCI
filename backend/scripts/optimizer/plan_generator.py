@@ -102,14 +102,21 @@ def _current_quarter() -> str:
     return f"{y}_fall"
 
 
-def _generate_quarters(graduation_quarter: str) -> list[str]:
-    """Quarters from the current quarter through graduation_quarter inclusive.
+def _generate_quarters(graduation_quarter: str, start_quarter: str | None = None) -> list[str]:
+    """Quarters from the start quarter through graduation_quarter inclusive.
 
     Uses the standard UCI sequence (winter, spring, fall) and skips summer.
     graduation_quarter must be in 'YYYY_quarter' format, e.g. '2029_spring'.
+
+    start_quarter pins the first quarter of the window (e.g. '2026_fall').  The
+    planner grid is a fixed, Fall-anchored structure, so the caller passes the
+    grid's first quarter here to keep the optimizer window identical to what the
+    grid renders — otherwise courses get scheduled into off-grid quarters (e.g.
+    the real-clock 'YYYY_spring') that have no cell and silently disappear.  When
+    omitted, falls back to the real current quarter (legacy/date-driven callers).
     """
     seq = ["winter", "spring", "fall"]
-    current    = _current_quarter()
+    current    = start_quarter or _current_quarter()
     start_year = int(current.split("_")[0])
     start_q    = current.split("_")[1]
     grad_q     = graduation_quarter.split("_")[1]
@@ -1056,9 +1063,23 @@ def _asap_schedule(
                 num = int(m.group(0)) if m else 9999
                 return (0 if num < 100 else 1, course_id)
 
+            # Norms that are an AND-coreq of some still-unplaced course.  Such a
+            # course (e.g. MATH105LA, the lab coreq of MATH105A) must NEVER be
+            # placed on its own in an earlier quarter — coreqs have to share a
+            # quarter.  It is pulled into its partner's quarter via
+            # coreqs_to_place below, so we skip it as a standalone candidate here.
+            # Once the partner is placed/completed it drops out of this set and
+            # any leftover can be scheduled normally.
+            coreq_target_norms: set[str] = set()
+            for other in remaining:
+                coreq_target_norms |= _collect_and_coreq_norms(prereq_trees.get(_norm(other)))
+
             eligible_candidates: list[tuple[str, list[str]]] = []
 
             for c in remaining:
+                if _norm(c) in coreq_target_norms:
+                    continue  # only placeable alongside its coreq partner
+
                 tree = prereq_trees.get(_norm(c))
 
                 # Identify coreqs that aren't yet satisfied (prior or current quarter)
@@ -1135,8 +1156,13 @@ def _asap_schedule(
                 n = _norm(raw)
                 if n not in remaining_norm_fill:
                     remaining_norm_fill[n] = raw
+            coreq_target_fill: set[str] = set()
+            for other in remaining:
+                coreq_target_fill |= _collect_and_coreq_norms(prereq_trees.get(_norm(other)))
             fill_candidates: list[tuple[str, list[str]]] = []
             for c in remaining:
+                if _norm(c) in coreq_target_fill:
+                    continue  # coreq leaf — only placeable alongside its partner
                 tree = prereq_trees.get(_norm(c))
                 required_coreqs = _collect_and_coreq_norms(tree)
                 unresolved = [
@@ -1348,6 +1374,7 @@ def generate(
     waived_ges: list[str] | None = None,
     specialization_id: str | None = None,
     ap_scores: dict[str, int] | None = None,
+    start_quarter: str | None = None,
 ) -> GenerationResult:
     """Generate up to 3 optimized plan variants for a major.
 
@@ -1382,7 +1409,7 @@ def generate(
         return GenerationResult(variants=[], choice_groups=choice_groups)
 
     # 2. Quarters available before graduation
-    quarters = _generate_quarters(graduation_quarter)
+    quarters = _generate_quarters(graduation_quarter, start_quarter)
     if not quarters:
         return GenerationResult(variants=[])
 
