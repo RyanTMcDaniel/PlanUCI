@@ -26,7 +26,12 @@ import {
   resolveApCredits,
 } from "@/lib/api/courses";
 import { createClient } from "@/lib/supabase/client";
-import { savePlan, loadPlan, syncUserProfile, deletePlan } from "@/lib/api/plans";
+import {
+  savePlan, loadPlan, syncUserProfile, deletePlan,
+  saveNamedPlan, listNamedPlans, deletePlanById, loadPlanById,
+  MAX_SAVED_PLANS, type SavedPlanMeta, type PlanData,
+} from "@/lib/api/plans";
+import { exportScheduleToPDF, type PdfYear } from "@/lib/pdf/exportSchedule";
 // ── Types ─────────────────────────────────────────────────────────────────────
 
 type PlannedCourses = Record<string, string[]>;
@@ -1294,6 +1299,280 @@ function GESection({
   );
 }
 
+// ── Top-bar: AP Credits popover ─────────────────────────────────────────────
+
+function APCreditsMenu({
+  apScores, setApScores, apExamNames,
+}: {
+  apScores: Record<string, number>;
+  setApScores: React.Dispatch<React.SetStateAction<Record<string, number>>>;
+  apExamNames: string[];
+}) {
+  const [open, setOpen] = useState(false);
+  const [query, setQuery] = useState("");
+  const ref = useRef<HTMLDivElement>(null);
+  const count = Object.keys(apScores).length;
+
+  useEffect(() => {
+    if (!open) return;
+    function onDown(e: MouseEvent) {
+      if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false);
+    }
+    document.addEventListener("mousedown", onDown);
+    return () => document.removeEventListener("mousedown", onDown);
+  }, [open]);
+
+  const filtered = apExamNames.filter(
+    (n) => !query || n.toLowerCase().includes(query.toLowerCase()),
+  );
+
+  return (
+    <div ref={ref} className="relative">
+      <button
+        onClick={() => setOpen((o) => !o)}
+        className={`flex items-center gap-1.5 rounded-md border px-2.5 h-7 text-[11px] font-medium transition-colors
+          ${count > 0
+            ? "border-[#3b82f6]/40 bg-[#3b82f6]/10 text-[#93c5fd]"
+            : "border-[#2a2a2a] bg-[#1a1a1a] text-[#999] hover:text-[#e8e8e8] hover:border-[#3a3a3a]"}`}
+      >
+        <svg viewBox="0 0 16 16" className="w-3.5 h-3.5" fill="none">
+          <path d="M8 2L2 5l6 3 6-3-6-3z" stroke="currentColor" strokeWidth="1.2" strokeLinejoin="round"/>
+          <path d="M4 6.5V10c0 1 1.8 2 4 2s4-1 4-2V6.5" stroke="currentColor" strokeWidth="1.2" strokeLinejoin="round"/>
+        </svg>
+        AP Credits
+        {count > 0 && (
+          <span className="ml-0.5 rounded-full bg-[#3b82f6] text-white text-[9px] font-bold leading-none px-1.5 py-0.5 tabular-nums">
+            {count}
+          </span>
+        )}
+        <svg viewBox="0 0 12 12" className={`w-2.5 h-2.5 transition-transform ${open ? "rotate-180" : ""}`} fill="none">
+          <path d="M2 4l4 4 4-4" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round"/>
+        </svg>
+      </button>
+
+      {open && (
+        <div className="absolute right-0 top-full mt-1.5 w-72 rounded-lg border border-[#2a2a2a] bg-[#1a1a1a] shadow-2xl z-50 overflow-hidden">
+          <div className="px-3 py-2.5 border-b border-[#2a2a2a]">
+            <p className="text-[11px] font-semibold text-[#e8e8e8]">AP / Exam Credit</p>
+            <p className="text-[9.5px] text-[#666] mt-0.5 leading-snug">
+              Add your scores so satisfied courses are pre-filled.
+            </p>
+          </div>
+          <div className="px-2.5 pt-2">
+            <input
+              type="text"
+              value={query}
+              onChange={(e) => setQuery(e.target.value)}
+              placeholder="Search AP exams…"
+              className="w-full rounded border border-[#2a2a2a] bg-[#141414] px-2 py-1.5 text-[10px] text-[#ccc] placeholder-[#444] focus:outline-none focus:border-[#3b82f6]/40"
+            />
+          </div>
+          <div className="max-h-64 overflow-y-auto px-2.5 py-2 space-y-0.5">
+            {filtered.map((examName) => {
+              const score = apScores[examName];
+              return (
+                <div key={examName} className="flex items-center justify-between gap-2 py-0.5">
+                  <span className="text-[10px] text-[#aaa] leading-tight flex-1 min-w-0 truncate">
+                    {examName.replace(/^AP /, "")}
+                  </span>
+                  <div className="flex gap-0.5 shrink-0">
+                    {([3, 4, 5] as const).map((s) => (
+                      <button
+                        key={s}
+                        onClick={() =>
+                          setApScores((prev) => {
+                            if (prev[examName] === s) {
+                              const next = { ...prev };
+                              delete next[examName];
+                              return next;
+                            }
+                            return { ...prev, [examName]: s };
+                          })
+                        }
+                        className={`w-6 h-6 rounded text-[9px] font-bold transition-all
+                          ${score === s
+                            ? "bg-[#3b82f6] text-white"
+                            : "bg-[#141414] border border-[#2a2a2a] text-[#555] hover:text-[#ccc] hover:border-[#3a3a3a]"}`}
+                      >
+                        {s}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              );
+            })}
+            {filtered.length === 0 && (
+              <p className="text-[10px] text-[#444] text-center py-4">No exams match</p>
+            )}
+          </div>
+          {count > 0 && (
+            <div className="border-t border-[#2a2a2a] px-2.5 py-2 flex items-center justify-between">
+              <span className="text-[9.5px] text-[#666]">{count} exam{count !== 1 ? "s" : ""} added</span>
+              <button
+                onClick={() => setApScores({})}
+                className="text-[10px] text-[#777] hover:text-red-400 transition-colors"
+              >
+                Clear all
+              </button>
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ── Top-bar: Saved Plans popover ────────────────────────────────────────────
+
+function PlansMenu({
+  signedIn, savedPlans, maxPlans, onSave, onLoad, onDelete, onSignIn,
+}: {
+  signedIn: boolean;
+  savedPlans: SavedPlanMeta[];
+  maxPlans: number;
+  onSave: (name: string) => Promise<{ ok: boolean; reason?: string }>;
+  onLoad: (id: number) => void;
+  onDelete: (id: number) => void;
+  onSignIn: () => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const [name, setName] = useState("");
+  const [saving, setSaving] = useState(false);
+  const [msg, setMsg] = useState<string | null>(null);
+  const ref = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (!open) return;
+    function onDown(e: MouseEvent) {
+      if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false);
+    }
+    document.addEventListener("mousedown", onDown);
+    return () => document.removeEventListener("mousedown", onDown);
+  }, [open]);
+
+  const atCap = savedPlans.length >= maxPlans;
+
+  async function handleSave() {
+    if (!name.trim() || saving) return;
+    setSaving(true);
+    setMsg(null);
+    const res = await onSave(name.trim());
+    setSaving(false);
+    if (res.ok) {
+      setName("");
+      setMsg("Saved");
+      setTimeout(() => setMsg(null), 1800);
+    } else if (res.reason === "cap_reached") {
+      setMsg(`Limit reached — delete a plan to save a new one.`);
+    } else {
+      setMsg("Could not save — try again.");
+    }
+  }
+
+  return (
+    <div ref={ref} className="relative">
+      <button
+        onClick={() => setOpen((o) => !o)}
+        className="flex items-center gap-1.5 rounded-md border border-[#2a2a2a] bg-[#1a1a1a] px-2.5 h-7 text-[11px] font-medium text-[#999] hover:text-[#e8e8e8] hover:border-[#3a3a3a] transition-colors"
+      >
+        <svg viewBox="0 0 16 16" className="w-3.5 h-3.5" fill="none">
+          <path d="M3 3.5A1.5 1.5 0 014.5 2h5.8a1.5 1.5 0 011.06.44l1.2 1.2A1.5 1.5 0 0113 4.7V12.5A1.5 1.5 0 0111.5 14h-7A1.5 1.5 0 013 12.5v-9z" stroke="currentColor" strokeWidth="1.2"/>
+          <path d="M5.5 2.5v3h4v-3M5.5 9.5h5" stroke="currentColor" strokeWidth="1.2" strokeLinecap="round"/>
+        </svg>
+        Plans
+        {signedIn && (
+          <span className="ml-0.5 text-[9px] text-[#555] tabular-nums">{savedPlans.length}/{maxPlans}</span>
+        )}
+        <svg viewBox="0 0 12 12" className={`w-2.5 h-2.5 transition-transform ${open ? "rotate-180" : ""}`} fill="none">
+          <path d="M2 4l4 4 4-4" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round"/>
+        </svg>
+      </button>
+
+      {open && (
+        <div className="absolute right-0 top-full mt-1.5 w-80 rounded-lg border border-[#2a2a2a] bg-[#1a1a1a] shadow-2xl z-50 overflow-hidden">
+          {!signedIn ? (
+            <div className="px-4 py-5 text-center">
+              <p className="text-[12px] font-semibold text-[#e8e8e8] mb-1">Sign in to save plans</p>
+              <p className="text-[10px] text-[#666] leading-snug mb-3">
+                Save up to {maxPlans} schedule versions and switch between them anytime.
+              </p>
+              <button
+                onClick={onSignIn}
+                className="w-full rounded-md bg-[#3b82f6] hover:bg-[#2563eb] text-white text-[11px] font-semibold py-2 transition-colors"
+              >
+                Sign in
+              </button>
+            </div>
+          ) : (
+            <>
+              <div className="px-3 py-2.5 border-b border-[#2a2a2a]">
+                <div className="flex items-center justify-between mb-1.5">
+                  <p className="text-[11px] font-semibold text-[#e8e8e8]">Save current schedule</p>
+                  <span className="text-[9px] text-[#555] tabular-nums">{savedPlans.length}/{maxPlans} saved</span>
+                </div>
+                <div className="flex gap-1.5">
+                  <input
+                    type="text"
+                    value={name}
+                    onChange={(e) => setName(e.target.value)}
+                    onKeyDown={(e) => { if (e.key === "Enter") handleSave(); }}
+                    placeholder="Plan name…"
+                    maxLength={80}
+                    className="flex-1 min-w-0 rounded border border-[#2a2a2a] bg-[#141414] px-2 py-1.5 text-[10px] text-[#ccc] placeholder-[#444] focus:outline-none focus:border-[#3b82f6]/40"
+                  />
+                  <button
+                    onClick={handleSave}
+                    disabled={!name.trim() || saving}
+                    className="rounded bg-[#3b82f6] hover:bg-[#2563eb] disabled:bg-[#222] disabled:text-[#555] text-white text-[10px] font-semibold px-3 transition-colors"
+                  >
+                    {saving ? "…" : "Save"}
+                  </button>
+                </div>
+                {msg && <p className="text-[9.5px] text-[#888] mt-1.5">{msg}</p>}
+                {atCap && !msg && (
+                  <p className="text-[9.5px] text-amber-500/80 mt-1.5">
+                    At the {maxPlans}-plan limit — reusing a name overwrites; delete one to add another.
+                  </p>
+                )}
+              </div>
+              <div className="max-h-64 overflow-y-auto">
+                {savedPlans.length === 0 ? (
+                  <p className="text-[10px] text-[#555] text-center py-6">No saved plans yet</p>
+                ) : (
+                  savedPlans.map((p) => (
+                    <div key={p.id} className="flex items-center gap-2 px-3 py-2 border-b border-[#222] last:border-b-0 hover:bg-[#1f1f1f] transition-colors">
+                      <div className="flex-1 min-w-0">
+                        <p className="text-[11px] text-[#e0e0e0] font-medium truncate">{p.name}</p>
+                        <p className="text-[9px] text-[#555]">
+                          {p.plan_data?.selectedDisplayName || "—"}
+                          {p.updated_at ? ` · ${new Date(p.updated_at).toLocaleDateString()}` : ""}
+                        </p>
+                      </div>
+                      <button
+                        onClick={() => { onLoad(p.id); setOpen(false); }}
+                        className="shrink-0 rounded border border-[#2a2a2a] text-[9.5px] text-[#aaa] hover:text-white hover:border-[#3b82f6]/50 px-2 py-1 transition-colors"
+                      >
+                        Load
+                      </button>
+                      <button
+                        onClick={() => onDelete(p.id)}
+                        title="Delete plan"
+                        className="shrink-0 text-[#444] hover:text-red-400 text-[13px] leading-none w-4 text-center transition-colors"
+                      >
+                        ×
+                      </button>
+                    </div>
+                  ))
+                )}
+              </div>
+            </>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
 // ── Main component ─────────────────────────────────────────────────────────────
 
 export default function PlannerClient() {
@@ -1342,12 +1621,12 @@ export default function PlannerClient() {
   const [apExamNames, setApExamNames] = useState<string[]>([]);
   const [apCreditedSet, setApCreditedSet] = useState<Set<string>>(new Set());
   const [apSatisfiedGEs, setApSatisfiedGEs] = useState<Set<string>>(new Set());
-  const [apSectionOpen, setApSectionOpen] = useState(false);
-  const [apSearch, setApSearch] = useState("");
   const [showClearConfirm, setShowClearConfirm] = useState(false);
   const [lockConflictErrors, setLockConflictErrors] = useState<string[] | null>(null);
   const [pendingLock, setPendingLock] = useState<{ courseId: string; warnings: string[] } | null>(null);
   const [clearSuccess, setClearSuccess] = useState(false);
+  const [signedIn, setSignedIn] = useState(false);
+  const [savedPlans, setSavedPlans] = useState<SavedPlanMeta[]>([]);
   // Prereq-chain proposal awaiting user confirmation (additive — does not block the
   // dropped course; only offers to add its missing prerequisites).
   const [prereqProposal, setPrereqProposal] = useState<{
@@ -1551,22 +1830,28 @@ export default function PlannerClient() {
     } catch {}
   }, []);
 
+  // Apply a serialized plan to all editor state (mount autosave + loading a
+  // saved version both route through here).
+  const applyPlanData = useCallback((plan: PlanData) => {
+    setPlannedCourses(plan.plannedCourses);
+    setSelectedMajorId(plan.selectedMajorId);
+    setSelectedDisplayName(plan.selectedDisplayName);
+    setSelectedMinorId(plan.selectedMinorId ?? "");
+    setNumYears(plan.numYears ?? DEFAULT_YEARS);
+    setMaxUnits(plan.maxUnits);
+    setLockedCourses(new Set(plan.lockedCourses));
+    setApScores(plan.apScores);
+    setSummerYears(new Set(plan.summerYears));
+  }, []);
+
   // ── Load plan + sync profile on mount ─────────────────────────────────────
   useEffect(() => {
     supabase.auth.getUser().then(async ({ data }) => {
       if (!data.user) { saveEnabledRef.current = true; return; }
+      setSignedIn(true);
       const plan = await loadPlan();
-      if (plan) {
-        setPlannedCourses(plan.plannedCourses);
-        setSelectedMajorId(plan.selectedMajorId);
-        setSelectedDisplayName(plan.selectedDisplayName);
-        setSelectedMinorId(plan.selectedMinorId ?? "");
-        setNumYears(plan.numYears ?? DEFAULT_YEARS);
-        setMaxUnits(plan.maxUnits);
-        setLockedCourses(new Set(plan.lockedCourses));
-        setApScores(plan.apScores);
-        setSummerYears(new Set(plan.summerYears));
-      }
+      if (plan) applyPlanData(plan);
+      listNamedPlans().then(setSavedPlans).catch(() => {});
       saveEnabledRef.current = true;
       syncUserProfile({
         majorCode: plan?.selectedMajorId ?? "",
@@ -1574,7 +1859,7 @@ export default function PlannerClient() {
         preferredMaxUnits: plan?.maxUnits ?? 16,
       }).catch(() => {});
     }).catch(() => { saveEnabledRef.current = true; });
-  }, [supabase]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [supabase, applyPlanData]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // ── Auto-save (debounced 500ms) on plan state change ───────────────────────
   useEffect(() => {
@@ -1794,6 +2079,64 @@ export default function PlannerClient() {
       setOptimizerOnline(false);
     }
   }, [apScores]);
+
+  // ── Saved-version handlers (named plans, cap MAX_SAVED_PLANS) ──────────────
+  const handleSaveNamed = useCallback(async (name: string) => {
+    const res = await saveNamedPlan(name, {
+      plannedCourses, selectedMajorId, selectedDisplayName, selectedMinorId,
+      numYears, gradQuarter, maxUnits,
+      lockedCourses: [...lockedCourses], apScores, summerYears: [...summerYears],
+    });
+    if (res.ok) listNamedPlans().then(setSavedPlans).catch(() => {});
+    return res.ok ? { ok: true } : { ok: false, reason: res.reason };
+  }, [plannedCourses, selectedMajorId, selectedDisplayName, selectedMinorId, numYears, gradQuarter, maxUnits, lockedCourses, apScores, summerYears]);
+
+  const handleLoadNamed = useCallback(async (id: number) => {
+    const plan = await loadPlanById(id);
+    if (plan) { applyPlanData(plan); validatePlan(plan.plannedCourses); }
+  }, [applyPlanData, validatePlan]);
+
+  const handleDeleteNamed = useCallback(async (id: number) => {
+    await deletePlanById(id);
+    listNamedPlans().then(setSavedPlans).catch(() => {});
+  }, []);
+
+  const handleSignIn = useCallback(() => {
+    supabase.auth.signInWithOAuth({
+      provider: "google",
+      options: { redirectTo: `${window.location.origin}/auth/callback` },
+    }).catch(() => {});
+  }, [supabase]);
+
+  // ── Export the current schedule grid to a single-page PDF ──────────────────
+  const handleDownloadPDF = useCallback(() => {
+    const seasons = [
+      { key: "fall", label: "Fall" },
+      { key: "winter", label: "Winter" },
+      { key: "spring", label: "Spring" },
+    ];
+    const years: PdfYear[] = Array.from({ length: numYears }, (_, i) => i + 1).map((y) => {
+      const quarters = [...seasons];
+      if (summerYears.has(y)) quarters.push({ key: "summer", label: "Summer" });
+      return {
+        label: `Year ${y}`,
+        quarters: quarters.map((s) => {
+          const ids = plannedCourses[qkey(y, s.key)] ?? [];
+          return {
+            label: s.label,
+            units: ids.reduce((sum, id) => sum + (courseInfoMap[id]?.min_units ?? 4), 0),
+            courses: ids.map((id) => ({
+              code: id,
+              title: courseInfoMap[id]?.title ?? null,
+              units: courseInfoMap[id]?.min_units ?? null,
+              difficulty: difficultyMap[id] ?? null,
+            })),
+          };
+        }),
+      };
+    });
+    exportScheduleToPDF({ majorName: selectedLabel, totalUnits, years });
+  }, [numYears, summerYears, plannedCourses, courseInfoMap, difficultyMap, selectedLabel, totalUnits]);
 
   // ── DnD ────────────────────────────────────────────────────────────────────
   const sensors = useSensors(
@@ -2024,6 +2367,34 @@ export default function PlannerClient() {
   }, []);
 
   const addYear = useCallback(() => setNumYears((n) => n + 1), []);
+
+  // Remove a year: drop its quarters (those courses return to the unplaced pool)
+  // and shift every later year down one slot.  Year 1 can never be removed.
+  const removeYear = useCallback((target: number) => {
+    if (target < 2 || numYears <= 1) return;
+    const seasons = ["fall", "winter", "spring", "summer"] as const;
+    setPlannedCourses((prev) => {
+      const next: PlannedCourses = {};
+      for (let ny = 1; ny < numYears; ny++) {
+        const oldYear = ny < target ? ny : ny + 1;
+        for (const s of seasons) {
+          const oldKey = qkey(oldYear, s);
+          if (prev[oldKey]?.length) next[qkey(ny, s)] = prev[oldKey];
+        }
+      }
+      validatePlan(next);
+      return next;
+    });
+    setSummerYears((prev) => {
+      const next = new Set<number>();
+      prev.forEach((sy) => {
+        if (sy === target) return;            // removed year's summer is dropped
+        next.add(sy < target ? sy : sy - 1);  // shift later summers down
+      });
+      return next;
+    });
+    setNumYears((n) => n - 1);
+  }, [numYears, validatePlan]);
 
   // Classify requirements into logical display buckets
   const bucketed = useMemo(() => {
@@ -2313,85 +2684,6 @@ export default function PlannerClient() {
 
           {/* Auto-fill */}
           <div className="px-2.5 py-2.5 border-t border-[#2a2a2a] shrink-0">
-            {/* AP Credits section */}
-            <div className="mb-2.5 border border-[#2a2a2a] rounded">
-              <button
-                onClick={() => setApSectionOpen((o) => !o)}
-                className="w-full flex items-center justify-between px-2 py-1.5 text-left"
-              >
-                <span className="text-[8px] font-bold uppercase tracking-[0.12em] text-[#333]">
-                  AP Credits
-                </span>
-                <span className="flex items-center gap-1.5">
-                  {Object.keys(apScores).length > 0 && (
-                    <span className="text-[8px] text-[#3b82f6] font-bold">
-                      {Object.keys(apScores).length} exam{Object.keys(apScores).length !== 1 ? "s" : ""}
-                    </span>
-                  )}
-                  <span className="text-[10px] text-[#444]">{apSectionOpen ? "▲" : "▼"}</span>
-                </span>
-              </button>
-              {apSectionOpen && (
-                <div className="border-t border-[#2a2a2a] px-2 pt-1.5 pb-2">
-                  <input
-                    type="text"
-                    value={apSearch}
-                    onChange={(e) => setApSearch(e.target.value)}
-                    placeholder="Search AP exams…"
-                    className="w-full rounded border border-[#2a2a2a] bg-[#141414] px-2 py-1 text-[9px] text-[#aaa] placeholder-[#444] focus:outline-none focus:border-[#3b82f6]/40 mb-1.5"
-                  />
-                  <div className="max-h-40 overflow-y-auto space-y-0.5">
-                    {apExamNames
-                      .filter((n) => !apSearch || n.toLowerCase().includes(apSearch.toLowerCase()))
-                      .map((examName) => {
-                        const score = apScores[examName];
-                        return (
-                          <div key={examName} className="flex items-center justify-between gap-1.5 py-0.5">
-                            <span className="text-[8.5px] text-[#666] leading-tight flex-1 min-w-0 truncate">
-                              {examName.replace(/^AP /, "")}
-                            </span>
-                            <div className="flex gap-0.5 shrink-0">
-                              {([3, 4, 5] as const).map((s) => (
-                                <button
-                                  key={s}
-                                  onClick={() =>
-                                    setApScores((prev) => {
-                                      if (prev[examName] === s) {
-                                        const next = { ...prev };
-                                        delete next[examName];
-                                        return next;
-                                      }
-                                      return { ...prev, [examName]: s };
-                                    })
-                                  }
-                                  className={`w-5 h-5 rounded text-[8px] font-bold transition-all
-                                    ${score === s
-                                      ? "bg-[#3b82f6] text-white"
-                                      : "bg-[#1a1a1a] border border-[#2a2a2a] text-[#444] hover:text-[#999]"
-                                    }`}
-                                >
-                                  {s}
-                                </button>
-                              ))}
-                            </div>
-                          </div>
-                        );
-                      })}
-                    {apExamNames.filter((n) => !apSearch || n.toLowerCase().includes(apSearch.toLowerCase())).length === 0 && (
-                      <p className="text-[8px] text-[#444] text-center py-2">No exams match</p>
-                    )}
-                  </div>
-                  {Object.keys(apScores).length > 0 && (
-                    <button
-                      onClick={() => setApScores({})}
-                      className="mt-1.5 w-full text-[8px] text-[#444] hover:text-[#666] text-center"
-                    >
-                      Clear all
-                    </button>
-                  )}
-                </div>
-              )}
-            </div>
 
             {/* Unit load selector */}
             <div className="mb-2.5">
@@ -2674,7 +2966,7 @@ export default function PlannerClient() {
                   Optimizing…
                 </>
               ) : (
-                <><span>⚡</span> Optimize Schedule</>
+                <>Optimize Schedule</>
               )}
             </button>
 
@@ -2810,10 +3102,37 @@ export default function PlannerClient() {
 
           {/* Top bar */}
           <div className="h-12 shrink-0 flex items-center px-6 border-b border-[#2a2a2a] bg-[#141414] gap-3">
-            <span className="text-[13px] font-medium text-[#bbb] truncate max-w-[320px]">
+            <span className="text-[13px] font-medium text-[#bbb] truncate max-w-[240px]">
               {selectedLabel || <span className="text-[#555] font-normal">No major selected</span>}
             </span>
             <div className="flex-1" />
+
+            <APCreditsMenu apScores={apScores} setApScores={setApScores} apExamNames={apExamNames} />
+
+            <PlansMenu
+              signedIn={signedIn}
+              savedPlans={savedPlans}
+              maxPlans={MAX_SAVED_PLANS}
+              onSave={handleSaveNamed}
+              onLoad={handleLoadNamed}
+              onDelete={handleDeleteNamed}
+              onSignIn={handleSignIn}
+            />
+
+            <button
+              onClick={handleDownloadPDF}
+              title="Download a PDF of this schedule"
+              className="flex items-center gap-1.5 rounded-md border border-[#2a2a2a] bg-[#1a1a1a] px-2.5 h-7 text-[11px] font-medium text-[#999] hover:text-[#e8e8e8] hover:border-[#3a3a3a] transition-colors"
+            >
+              <svg viewBox="0 0 16 16" className="w-3.5 h-3.5" fill="none">
+                <path d="M8 2v8m0 0L5 7m3 3l3-3" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round" strokeLinejoin="round"/>
+                <path d="M3 12.5h10" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round"/>
+              </svg>
+              PDF
+            </button>
+
+            <div className="w-px h-5 bg-[#2a2a2a]" />
+
             <div className="flex items-baseline gap-1.5">
               <span className="text-[16px] font-bold text-[#e8e8e8] tabular-nums leading-none">{totalUnits}</span>
               <span className="text-[10px] font-semibold uppercase tracking-[0.12em] text-[#555]">Units</span>
@@ -2838,14 +3157,23 @@ export default function PlannerClient() {
 
                 return (
                   <div key={year} className="flex border-b border-[#2a2a2a] last:border-b-0">
-                    {/* Year label */}
-                    <div className="w-9 shrink-0 flex items-center justify-center border-r border-[#2a2a2a] bg-gradient-to-b from-[#141414] to-[#0d0d0d]">
+                    {/* Year label + remove */}
+                    <div className="w-9 shrink-0 flex flex-col items-center justify-center gap-1.5 py-1.5 border-r border-[#2a2a2a] bg-gradient-to-b from-[#141414] to-[#0d0d0d]">
                       <span
-                        className="text-[9px] font-bold uppercase tracking-[0.2em] text-[#6a6a6a] select-none"
+                        className="flex-1 flex items-center text-[9px] font-bold uppercase tracking-[0.2em] text-[#6a6a6a] select-none"
                         style={{ writingMode: "vertical-rl", transform: "rotate(180deg)" }}
                       >
                         {`Year ${year}`}
                       </span>
+                      {year > 1 && (
+                        <button
+                          onClick={() => removeYear(year)}
+                          title={`Remove Year ${year} — its courses return to the sidebar`}
+                          className="shrink-0 flex items-center justify-center w-5 h-5 rounded border border-dashed border-[#2a2a2a] text-[10px] leading-none text-[#5a5a5a] hover:text-red-400 hover:border-red-700/50 hover:bg-red-950/30 transition-colors"
+                        >
+                          ✕
+                        </button>
+                      )}
                     </div>
 
                     {/* Quarter grid */}
