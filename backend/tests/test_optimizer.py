@@ -217,3 +217,131 @@ def test_validate_locks_detects_conflict():
     })
     assert not valid, "Expected lock conflict but validate_locks returned valid=True"
     assert len(conflicts) > 0, "Expected at least one conflict message"
+
+
+# ── 11. Corequisites must share a quarter ─────────────────────────────────────
+
+def test_coreq_split_pairs_detects_and_clears():
+    """coreq_split_pairs flags an AND coreq placed in a different quarter, and is
+    empty once the pair shares a quarter.  Edge direction is irrelevant
+    (MATH105A→105LA holds the edge; the helper treats it symmetrically)."""
+    from scripts.optimizer.hard_constraints import coreq_split_pairs
+    trees = {"MATH105A": {"AND": [{"prereqType": "course", "courseId": "MATH 105LA", "coreq": True}]}}
+
+    split = _make_plan(
+        planned_courses={"2026_fall": ["MATH105LA"], "2027_winter": ["MATH105A"]},
+    )
+    assert coreq_split_pairs(split, trees) == {frozenset(("MATH105A", "MATH105LA"))}
+
+    together = _make_plan(planned_courses={"2026_fall": ["MATH105A", "MATH105LA"]})
+    assert coreq_split_pairs(together, trees) == set()
+
+
+def test_generate_keeps_coreqs_same_quarter():
+    """BS-0K6A requires two coreq pairs (105A/105LA, 105B/105LB) with edges encoded
+    in opposite directions.  Every generated variant must keep each pair together."""
+    res = generate(
+        major_id="BS-0K6A",
+        completed_courses=[],
+        graduation_quarter="2030_spring",
+        units_per_quarter=16,
+        start_quarter="2026_fall",
+    )
+    assert res.variants, "expected at least one variant"
+    for v in res.variants:
+        loc = {c: q for q, cs in v.plan.planned_courses.items() for c in cs}
+        for a, b in [("MATH105A", "MATH105LA"), ("MATH105B", "MATH105LB")]:
+            if a in loc and b in loc:
+                assert loc[a] == loc[b], f"{a}@{loc[a]} split from {b}@{loc[b]}"
+
+
+def test_whatif_does_not_split_coreqs():
+    """optimize_around_locks must never introduce a coreq split; given a split
+    input it may fix it, but the output must have no split pairs."""
+    from scripts.optimizer.hard_constraints import coreq_split_pairs
+    from scripts.optimizer.optimizer import _prereq_trees
+
+    plan = _make_plan(
+        completed_courses=["MATH2A", "MATH2B", "MATH9", "MATH3A"],
+        planned_courses={
+            "2026_fall":   ["MATH105LA"],
+            "2027_winter": ["MATH105A"],
+        },
+        units_per_quarter=16,
+    )
+    res = optimize_around_locks(plan, [], top_n=3)
+    assert res["status"] == "ok", res
+    all_ids = [c for cs in plan.planned_courses.values() for c in cs]
+    trees = _prereq_trees(create_client(os.getenv("SUPABASE_URL"), os.getenv("SUPABASE_SERVICE_KEY")), all_ids)
+    for p in res["plans"]:
+        cp = CoursePlan(major_id="x", planned_courses=p["planned_courses"])
+        assert coreq_split_pairs(cp, trees) == set(), p["planned_courses"]
+
+
+# ── 12. Unit cap uses real units + escalation ladder ─────────────────────────
+
+def test_unit_cap_tiers_ladder():
+    from scripts.optimizer.hard_constraints import unit_cap_tiers
+    assert unit_cap_tiers(16) == [16, 20, 24]
+    assert unit_cap_tiers(20) == [20, 24]
+    assert unit_cap_tiers(24) == [24]
+    assert unit_cap_tiers(18) == [18, 20, 24]
+
+
+def test_units_valid_uses_real_units(client):
+    """A quarter of four 5-unit courses is 20 real units — must fail a 16 cap even
+    though it is only four courses (the old count proxy passed it)."""
+    from scripts.optimizer.hard_constraints import units_valid, quarter_units, _course_units_by_norm
+    five_unit = ["FRENCH1C", "GERMAN1C", "ARABIC1B", "ARABIC1C"]  # all 5-unit courses
+    ubc = _course_units_by_norm(client, five_unit)
+    assert quarter_units(five_unit, ubc) == 20, ubc
+    plan = _make_plan(planned_courses={"2026_fall": five_unit}, units_per_quarter=16)
+    ok, viols = units_valid(plan, units_by_course=ubc)
+    assert not ok and viols, "expected a real-unit cap violation"
+    # Same plan passes once the cap is raised to the courses' real total.
+    plan20 = _make_plan(planned_courses={"2026_fall": five_unit}, units_per_quarter=20)
+    assert units_valid(plan20, units_by_course=ubc)[0]
+
+
+def test_whatif_respects_real_unit_cap(client):
+    """optimize_around_locks must not return a plan whose real units exceed the
+    (possibly escalated) cap."""
+    from scripts.optimizer.hard_constraints import quarter_units, _course_units_by_norm
+    r = generate(major_id="BS-201D", completed_courses=[],
+                 graduation_quarter="2030_spring", units_per_quarter=16,
+                 start_quarter="2026_fall")
+    plan = r.variants[0].plan.planned_courses
+    all_ids = [c for cs in plan.values() for c in cs]
+    ubc = _course_units_by_norm(client, all_ids)
+    res = optimize_around_locks(
+        CoursePlan(major_id="BS-201D", planned_courses=plan, units_per_quarter=16), [],
+        top_n=3,
+    )
+    assert res["status"] == "ok", res
+    for p in res["plans"]:
+        for q, cs in p["planned_courses"].items():
+            assert quarter_units(cs, ubc) <= 24, (q, cs, quarter_units(cs, ubc))
+
+
+# ── 13. Minimum-12-units soft constraint ─────────────────────────────────────
+
+def test_min_units_load_penalizes_underloaded_quarters():
+    from scripts.optimizer.soft_constraints import min_units_load, WEIGHTS
+    meta = {"A": {"min_units": 4}, "B": {"min_units": 4}, "C": {"min_units": 4}}
+    # Empty quarters are ignored; a full 12-unit quarter scores 0.
+    assert min_units_load(_make_plan(planned_courses={"2026_fall": ["A", "B", "C"]}), meta) == 0.0
+    assert min_units_load(_make_plan(planned_courses={"2026_fall": []}), meta) == 0.0
+    # An 8-unit quarter has a (12-8)/12 = 1/3 shortfall.
+    assert abs(min_units_load(_make_plan(planned_courses={"2026_fall": ["A", "B"]}), meta) - (1 / 3)) < 1e-9
+    # Registered with a weight so it actually influences the optimizer.
+    assert "min_units_load" in WEIGHTS and WEIGHTS["min_units_load"] > 0
+
+
+def test_min_units_load_in_soft_breakdown():
+    """Both the generate and whatif paths score through _soft_score, which must now
+    include the min_units_load term."""
+    from scripts.optimizer.optimizer import _soft_score
+    from scripts.optimizer.soft_constraints import _load_difficulty_scores
+    plan = _make_plan(planned_courses={"2026_fall": ["I&CSCI31"]})
+    _, breakdown = _soft_score(plan, _load_difficulty_scores(), {})
+    assert "min_units_load" in breakdown

@@ -34,6 +34,8 @@ from .hard_constraints import (
     _load_aliases,  # FIX 6
     _norm,
     _qkey,
+    coreq_split_pairs,
+    unit_cap_tiers,
 )
 from .optimizer import OptimizationResult, optimize, _check_prereqs  # _check_prereqs for prereq-safe _perturb
 from .offering_patterns import is_likely_offered
@@ -1243,12 +1245,16 @@ def _perturb(
         q1, q2 = rng.sample(non_empty, 2)
         c1 = rng.choice(p.planned_courses[q1])
         c2 = rng.choice(p.planned_courses[q2])
+        before_split = coreq_split_pairs(p, trees) if trees else set()
         p.planned_courses[q1].remove(c1)
         p.planned_courses[q2].remove(c2)
         p.planned_courses[q1].append(c2)
         p.planned_courses[q2].append(c1)
-        # Reject swap if it introduces any prereq violation
-        if trees and _check_prereqs(p, trees):
+        # Reject swap if it introduces a prereq violation or splits a coreq pair
+        if trees and (
+            _check_prereqs(p, trees)
+            or (coreq_split_pairs(p, trees) - before_split)
+        ):
             p.planned_courses[q1].remove(c2)
             p.planned_courses[q2].remove(c1)
             p.planned_courses[q1].append(c1)
@@ -1435,17 +1441,35 @@ def generate(
     # overflow exists, up to MAX_QUARTERS total.  The stricter per-quarter prereq
     # enforcement means chains like ICS31→32→33 must span sequential quarters.
     working_quarters = list(quarters)
+    # Unit-cap escalation: try the requested cap, then 20, then 24 — all within
+    # the fixed grid window — before spilling into extra (off-grid) quarters.
+    # A looser cap is adopted only when it actually reduces overflow; overflow
+    # that is bound by prereq-chain depth (not unit capacity) is left for the
+    # quarter-extension step rather than needlessly packing quarters denser.
+    effective_units = units_per_quarter
     plan_dict, overflow = _asap_schedule(
-        courses_to_plan, trees, working_quarters, units_per_quarter,
+        courses_to_plan, trees, working_quarters, effective_units,
         completed_norm, terms_by_course=course_terms, units_by_course=course_units,
     )
+    for cap in unit_cap_tiers(units_per_quarter)[1:]:
+        if not overflow:
+            break
+        trial_plan, trial_overflow = _asap_schedule(
+            courses_to_plan, trees, working_quarters, cap,
+            completed_norm, terms_by_course=course_terms, units_by_course=course_units,
+        )
+        if len(trial_overflow) < len(overflow):
+            effective_units, plan_dict, overflow = cap, trial_plan, trial_overflow
+    if effective_units != units_per_quarter:
+        print(f"  Raised per-quarter cap to {effective_units} units to fit all courses.")
+
     extended_by = 0
 
     while overflow and len(working_quarters) < MAX_QUARTERS:
         working_quarters.append(_next_quarter(working_quarters[-1]))
         extended_by += 1
         plan_dict, overflow = _asap_schedule(
-            courses_to_plan, trees, working_quarters, units_per_quarter,
+            courses_to_plan, trees, working_quarters, effective_units,
             completed_norm, terms_by_course=course_terms, units_by_course=course_units,
         )
 
@@ -1464,7 +1488,7 @@ def generate(
         diff_scores = _load_difficulty_scores()
         courses_to_plan, overflow = _try_swap_elective_overflow(
             client, major_id, overflow, courses_to_plan, trees,
-            working_quarters, units_per_quarter, completed_norm,
+            working_quarters, effective_units, completed_norm,
             course_terms, diff_scores, units_by_course=course_units,
         )
         if overflow:
@@ -1476,7 +1500,7 @@ def generate(
     # Final ASAP run with the (possibly swap-updated) courses_to_plan
     if overflow:
         plan_dict, overflow = _asap_schedule(
-            courses_to_plan, trees, working_quarters, units_per_quarter,
+            courses_to_plan, trees, working_quarters, effective_units,
             completed_norm, terms_by_course=course_terms, units_by_course=course_units,
         )
 
@@ -1491,7 +1515,7 @@ def generate(
         completed_courses=effective_completed,
         planned_courses={q: cs for q, cs in plan_dict.items() if cs},
         graduation_year=grad_year,
-        units_per_quarter=units_per_quarter,
+        units_per_quarter=effective_units,
     )
 
     # 5. Generate variants: perturb then optimize with different seeds

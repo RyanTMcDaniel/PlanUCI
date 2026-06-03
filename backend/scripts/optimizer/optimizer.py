@@ -28,8 +28,11 @@ from .hard_constraints import (
     _eval_tree,
     _norm,
     _qkey,
+    _course_units_by_norm,
+    coreq_split_pairs,
     major_requirements_met,
     no_duplicate_courses,
+    quarter_units,
     units_valid,
     validate,
 )
@@ -41,6 +44,7 @@ from .soft_constraints import (
     difficulty_balance,
     ge_distribution,
     major_clustering,
+    min_units_load,
     workload_progression,
 )
 
@@ -120,6 +124,7 @@ def _soft_score(
         "workload_progression": workload_progression(plan, diff_scores),
         "major_clustering":     major_clustering(plan, meta),
         "adjacent_smoothing":   adjacent_smoothing(plan, diff_scores),
+        "min_units_load":       min_units_load(plan, meta),
     }
     return sum(WEIGHTS[k] * v for k, v in breakdown.items()), breakdown
 
@@ -167,6 +172,7 @@ def optimize(
     all_ids = [c for courses in plan.planned_courses.values() for c in courses]
     meta = _load_course_meta(client, all_ids)
     trees = _prereq_trees(client, all_ids)
+    units_by_course = _course_units_by_norm(client, all_ids)
 
     # Full validation for reporting purposes (structured → reason strings)
     hard_valid, checks = validate(plan)
@@ -176,7 +182,7 @@ def optimize(
     # major_requirements_met and no_duplicate_courses are invariant under moves
     # (the set of courses never changes), so we only block optimization when
     # prereqs or the unit cap are actually violated.
-    blocking = bool(_check_prereqs(plan, trees)) or not units_valid(plan)[0]
+    blocking = bool(_check_prereqs(plan, trees)) or not units_valid(plan, units_by_course=units_by_course)[0]
     if blocking:
         return OptimizationResult(
             plan=plan,
@@ -192,6 +198,12 @@ def optimize(
     quarters = sorted(plan.planned_courses.keys(), key=_qkey)
     improved = False
 
+    # Coreqs must stay in the same quarter.  Reject any move that introduces a
+    # split not already present in the starting plan (the seed is coreq-valid, so
+    # in practice this freezes coreq pairs together).  base-aware so a pre-split
+    # input is never made worse.
+    base_coreq_split = coreq_split_pairs(plan, trees)
+
     for _ in range(max_iter):
         non_empty = [q for q in quarters if best.planned_courses.get(q)]
         if not non_empty:
@@ -205,12 +217,16 @@ def optimize(
         candidate.planned_courses[q_from].remove(course)
         candidate.planned_courses[q_to].append(course)
 
-        # Unit cap
-        if len(candidate.planned_courses[q_to]) * UNITS_PER_COURSE > candidate.units_per_quarter:
+        # Unit cap (real per-course units)
+        if quarter_units(candidate.planned_courses[q_to], units_by_course) > candidate.units_per_quarter:
             continue
 
         # Prereqs (in-memory, no Supabase)
         if _check_prereqs(candidate, trees):
+            continue
+
+        # Coreqs must share a quarter — reject moves that split a pair
+        if coreq_split_pairs(candidate, trees) - base_coreq_split:
             continue
 
         # Soft score

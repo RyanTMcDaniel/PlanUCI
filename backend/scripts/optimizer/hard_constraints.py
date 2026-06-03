@@ -19,6 +19,21 @@ load_dotenv(_ENV)
 QUARTER_ORDER = {"winter": 0, "spring": 1, "summer": 2, "fall": 3}
 UNITS_PER_COURSE = 4  # assumed when per-course unit data is unavailable
 
+# Escalating per-quarter unit caps.  Scheduling/optimization first tries the
+# requested cap; if it can't place everything, it retries at the next tier and
+# only fails once even 24 units/quarter is exceeded.
+UNIT_CAP_LADDER = (20, 24)
+
+
+def unit_cap_tiers(base_cap: int) -> list[int]:
+    """Caps to try, ascending: the requested cap first, then 20 then 24.
+
+    Tiers below the requested cap are dropped (never schedule looser than asked
+    for at the first attempt), and 24 is the ceiling.
+    """
+    tiers = sorted({base_cap, *UNIT_CAP_LADDER})
+    return [t for t in tiers if base_cap <= t <= max(base_cap, 24)] or [base_cap]
+
 
 def _qkey(qstr: str) -> tuple[int, int]:
     """'2024_fall' → (2024, 3) for chronological sorting."""
@@ -172,6 +187,52 @@ def _eval_tree(
                 for i in items
             )
     return True  # empty node — no prereqs
+
+
+# ── Corequisite same-quarter helper ───────────────────────────────────────────
+
+def _collect_coreq_norms(tree: dict | None) -> set[str]:
+    """Normed IDs of AND-linked corequisite course leaves in a prereq tree.
+
+    Only AND-linked coreqs are returned — an OR branch means the coreq is one of
+    several alternatives, so it is not forced.
+    """
+    if not tree:
+        return set()
+    result: set[str] = set()
+    if "AND" in tree:
+        for item in tree["AND"]:
+            if item.get("prereqType") == "course" and item.get("coreq"):
+                result.add(_norm(item.get("courseId", "")))
+            elif "AND" in item or "OR" in item:
+                result |= _collect_coreq_norms(item)
+    return result
+
+
+def coreq_split_pairs(
+    plan: CoursePlan, trees: dict[str, dict]
+) -> set[frozenset[str]]:
+    """Return AND-coreq pairs whose two courses are placed in DIFFERENT quarters.
+
+    Corequisites are bidirectional in reality but stored one-directionally in the
+    data — sometimes the lecture row holds the coreq edge (MATH105A→105LA),
+    sometimes the lab row does (MATH105LB→105B).  We treat the relationship
+    symmetrically: a pair is "split" whenever both courses sit in the plan but in
+    different quarters.  Pairs whose partner is absent from the plan (e.g. already
+    satisfied by completed credit) are ignored — only co-scheduled coreqs are
+    constrained to share a quarter.
+    """
+    quarter_of: dict[str, str] = {}
+    for q, courses in plan.planned_courses.items():
+        for c in courses:
+            quarter_of[_norm(c)] = q
+
+    split: set[frozenset[str]] = set()
+    for c_norm, q in quarter_of.items():
+        for partner in _collect_coreq_norms(trees.get(c_norm)):
+            if partner in quarter_of and quarter_of[partner] != q:
+                split.add(frozenset((c_norm, partner)))
+    return split
 
 
 def _representative_unmet(
@@ -445,16 +506,56 @@ def major_requirements_met(plan: CoursePlan, client) -> tuple[bool, list[CheckRe
     return len(violations) == 0, violations
 
 
-def units_valid(plan: CoursePlan, client=None) -> tuple[bool, list[CheckResult]]:
+def _course_units_by_norm(client, course_ids: list[str]) -> dict[str, int]:
+    """{normed_course_id: min_units} from the courses table (UNITS_PER_COURSE if NULL)."""
+    if not client or not course_ids:
+        return {}
+    rows = (
+        client.table("courses")
+        .select("id,min_units")
+        .in_("id", list({c for c in course_ids}))
+        .execute()
+        .data
+    )
+    out: dict[str, int] = {}
+    for r in rows:
+        out[_norm(r["id"])] = max(1, int(r["min_units"])) if r.get("min_units") else UNITS_PER_COURSE
+    return out
+
+
+def quarter_units(courses: list[str], units_by_course: dict[str, int] | None = None) -> int:
+    """Total units for a quarter's courses.
+
+    Uses real per-course units when `units_by_course` (keyed by normalized id) is
+    supplied; otherwise falls back to the UNITS_PER_COURSE count proxy.
+    """
+    if not units_by_course:
+        return len(courses) * UNITS_PER_COURSE
+    return sum(units_by_course.get(_norm(c), UNITS_PER_COURSE) for c in courses)
+
+
+def units_valid(
+    plan: CoursePlan,
+    client=None,
+    units_by_course: dict[str, int] | None = None,
+) -> tuple[bool, list[CheckResult]]:
     """No quarter may exceed units_per_quarter.
+
+    Uses real per-course units when available — either passed in via
+    `units_by_course` (keyed by normalized id) or loaded from `client`.  Falls
+    back to the UNITS_PER_COURSE count proxy only when neither is provided.
 
     Returns (all_passed, violations) where each violation is a CheckResult with
     code UNIT_CAP.
     """
+    if units_by_course is None and client is not None:
+        all_ids = [c for cs in plan.planned_courses.values() for c in cs]
+        units_by_course = _course_units_by_norm(client, all_ids)
+
     violations: list[CheckResult] = []
 
     for quarter, courses in plan.planned_courses.items():
-        total = len(courses) * UNITS_PER_COURSE
+        total = quarter_units(courses, units_by_course)
         if total > plan.units_per_quarter:
             violations.append(CheckResult(
                 valid=False,
@@ -514,7 +615,7 @@ def validate(plan: CoursePlan) -> tuple[bool, list[CheckResult]]:
     checks = [
         ("prereqs_satisfied",      prereqs_satisfied(plan, client)),
         ("major_requirements_met", major_requirements_met(plan, client)),
-        ("units_valid",            units_valid(plan)),
+        ("units_valid",            units_valid(plan, client)),
         ("no_duplicate_courses",   no_duplicate_courses(plan)),
     ]
 
