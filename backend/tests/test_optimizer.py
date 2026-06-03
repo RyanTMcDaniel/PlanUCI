@@ -276,3 +276,48 @@ def test_whatif_does_not_split_coreqs():
     for p in res["plans"]:
         cp = CoursePlan(major_id="x", planned_courses=p["planned_courses"])
         assert coreq_split_pairs(cp, trees) == set(), p["planned_courses"]
+
+
+# ── 12. Unit cap uses real units + escalation ladder ─────────────────────────
+
+def test_unit_cap_tiers_ladder():
+    from scripts.optimizer.hard_constraints import unit_cap_tiers
+    assert unit_cap_tiers(16) == [16, 20, 24]
+    assert unit_cap_tiers(20) == [20, 24]
+    assert unit_cap_tiers(24) == [24]
+    assert unit_cap_tiers(18) == [18, 20, 24]
+
+
+def test_units_valid_uses_real_units(client):
+    """A quarter of four 5-unit courses is 20 real units — must fail a 16 cap even
+    though it is only four courses (the old count proxy passed it)."""
+    from scripts.optimizer.hard_constraints import units_valid, quarter_units, _course_units_by_norm
+    five_unit = ["FRENCH1C", "GERMAN1C", "ARABIC1B", "ARABIC1C"]  # all 5-unit courses
+    ubc = _course_units_by_norm(client, five_unit)
+    assert quarter_units(five_unit, ubc) == 20, ubc
+    plan = _make_plan(planned_courses={"2026_fall": five_unit}, units_per_quarter=16)
+    ok, viols = units_valid(plan, units_by_course=ubc)
+    assert not ok and viols, "expected a real-unit cap violation"
+    # Same plan passes once the cap is raised to the courses' real total.
+    plan20 = _make_plan(planned_courses={"2026_fall": five_unit}, units_per_quarter=20)
+    assert units_valid(plan20, units_by_course=ubc)[0]
+
+
+def test_whatif_respects_real_unit_cap(client):
+    """optimize_around_locks must not return a plan whose real units exceed the
+    (possibly escalated) cap."""
+    from scripts.optimizer.hard_constraints import quarter_units, _course_units_by_norm
+    r = generate(major_id="BS-201D", completed_courses=[],
+                 graduation_quarter="2030_spring", units_per_quarter=16,
+                 start_quarter="2026_fall")
+    plan = r.variants[0].plan.planned_courses
+    all_ids = [c for cs in plan.values() for c in cs]
+    ubc = _course_units_by_norm(client, all_ids)
+    res = optimize_around_locks(
+        CoursePlan(major_id="BS-201D", planned_courses=plan, units_per_quarter=16), [],
+        top_n=3,
+    )
+    assert res["status"] == "ok", res
+    for p in res["plans"]:
+        for q, cs in p["planned_courses"].items():
+            assert quarter_units(cs, ubc) <= 24, (q, cs, quarter_units(cs, ubc))

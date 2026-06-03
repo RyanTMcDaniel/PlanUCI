@@ -29,7 +29,10 @@ from .hard_constraints import (
     _norm,
     _pretty_quarter,
     _qkey,
+    _course_units_by_norm,
     coreq_split_pairs,
+    quarter_units,
+    unit_cap_tiers,
     units_valid,
 )
 from .optimizer import _check_prereqs, _prereq_trees, _soft_score
@@ -318,9 +321,9 @@ def _perturb_unlocked(
 ) -> CoursePlan:
     """Swap n_swaps random pairs of UNLOCKED courses between quarters.
 
-    When `trees` is provided, a swap that splits a corequisite pair (relative to
-    the pre-swap state) is undone so the optimizer never starts from a coreq-broken
-    plan.
+    When `trees` is provided, a swap that introduces a NEW prereq violation or
+    splits a corequisite pair (relative to the pre-swap state) is undone, so the
+    optimizer never starts from a plan whose prereq ordering it has scrambled.
     """
     p = deepcopy(plan)
     quarters = list(p.planned_courses.keys())
@@ -337,12 +340,16 @@ def _perturb_unlocked(
         if not free1 or not free2:
             continue
         c1, c2 = rng.choice(free1), rng.choice(free2)
+        before_viols = set(_check_prereqs(p, trees)) if trees else set()
         before_split = coreq_split_pairs(p, trees) if trees else set()
         p.planned_courses[q1].remove(c1)
         p.planned_courses[q2].remove(c2)
         p.planned_courses[q1].append(c2)
         p.planned_courses[q2].append(c1)
-        if trees and (coreq_split_pairs(p, trees) - before_split):
+        if trees and (
+            (set(_check_prereqs(p, trees)) - before_viols)
+            or (coreq_split_pairs(p, trees) - before_split)
+        ):
             p.planned_courses[q1].remove(c2)
             p.planned_courses[q2].remove(c1)
             p.planned_courses[q1].append(c1)
@@ -359,13 +366,18 @@ def _whatif_optimize(
     max_iter:    int = 150,
     seed:        int | None = None,
     extra_available: set[str] | None = None,
+    units_by_course: dict[str, int] | None = None,
 ) -> tuple[CoursePlan, float, dict[str, float]]:
-    """Hill-climb on unlocked courses only; locked courses never move."""
+    """Hill-climb on unlocked courses only; locked courses never move.
+
+    The per-quarter unit cap (plan.units_per_quarter) is enforced against REAL
+    course units when units_by_course is supplied (else the count proxy).
+    """
     rng       = random.Random(seed)
     best      = deepcopy(plan)
     best_score, best_bd = _soft_score(plan, diff_scores, meta)
     quarters  = sorted(plan.planned_courses.keys(), key=_qkey)
-    max_per_q = plan.units_per_quarter // UNITS_PER_COURSE
+    cap       = plan.units_per_quarter
 
     # Violations that are already present before we start (don't penalise new moves for them)
     base_viols = set(_check_prereqs(plan, trees, extra_available))
@@ -388,8 +400,9 @@ def _whatif_optimize(
         course   = rng.choice(unlocked)
         q_to     = rng.choice([q for q in quarters if q != q_from])
 
-        # Unit cap — locked courses count against the cap in q_to
-        if len(best.planned_courses.get(q_to, [])) >= max_per_q:
+        # Unit cap (real units) — locked courses count against the cap in q_to
+        prospective = best.planned_courses.get(q_to, []) + [course]
+        if quarter_units(prospective, units_by_course) > cap:
             continue
 
         candidate = deepcopy(best)
@@ -471,6 +484,7 @@ def optimize_around_locks(
     diff_scores = _load_difficulty_scores()
     trees       = _prereq_trees(client, all_ids)
     meta        = _load_course_meta(client, all_ids)
+    units_by_course = _course_units_by_norm(client, all_ids)
 
     # Resolve AP / completed credit into a normalized baseline of satisfied
     # tokens (course norms + "EXAMOK:" exam tokens).  These count as satisfied
@@ -499,31 +513,40 @@ def optimize_around_locks(
             }
 
     # ── Stage B: reposition unlocked courses, keep only hard-valid variants ────
-    base    = deepcopy(plan)
     configs = seed_configs or [(42, 0), (13, 4), (7, 8), (99, 12), (17, 16)]
 
     candidates: list[tuple[CoursePlan, float, dict]] = []
     best_attempt: tuple[float, list[str], list] | None = None  # (score, prereq_viols, unit_checks)
 
-    for s, n_swaps in configs:
-        rng   = random.Random(s)
-        start = _perturb_unlocked(base, locked_norm, rng, n_swaps, trees) if n_swaps else base
-        opt, score, bd = _whatif_optimize(
-            start, locked_norm, trees, diff_scores, meta, seed=s,
-            extra_available=completed_norm,
-        )
+    # Unit-cap escalation: try the requested cap, then 20, then 24.  A looser cap
+    # is used only when no hard-valid arrangement exists at the tighter one, so a
+    # plan that fits at 16 is never needlessly loosened.
+    for cap in unit_cap_tiers(plan.units_per_quarter):
+        base = deepcopy(plan)
+        base.units_per_quarter = cap
 
-        # Hard-constraint gate using the structured checks.
-        prereq_viols = _check_prereqs(opt, trees, completed_norm)
-        units_ok, unit_checks = units_valid(opt)
+        for s, n_swaps in configs:
+            rng   = random.Random(s)
+            start = _perturb_unlocked(base, locked_norm, rng, n_swaps, trees) if n_swaps else base
+            opt, score, bd = _whatif_optimize(
+                start, locked_norm, trees, diff_scores, meta, seed=s,
+                extra_available=completed_norm, units_by_course=units_by_course,
+            )
 
-        if not prereq_viols and units_ok:
-            candidates.append((opt, score, bd))
-        if best_attempt is None or score < best_attempt[0]:
-            best_attempt = (score, prereq_viols, unit_checks)
+            # Hard-constraint gate using the structured checks (real units).
+            prereq_viols = _check_prereqs(opt, trees, completed_norm)
+            units_ok, unit_checks = units_valid(opt, units_by_course=units_by_course)
+
+            if not prereq_viols and units_ok:
+                candidates.append((opt, score, bd))
+            if best_attempt is None or score < best_attempt[0]:
+                best_attempt = (score, prereq_viols, unit_checks)
+
+        if candidates:
+            break  # got hard-valid plans at this cap — don't loosen further
 
     if not candidates:
-        # No valid arrangement exists with these locks → infeasible.
+        # No valid arrangement exists even at 24 units/quarter → infeasible.
         # Surface the specific conflicts from the closest attempt.
         _, prereq_viols, unit_checks = best_attempt
         conflicts: list[dict] = []

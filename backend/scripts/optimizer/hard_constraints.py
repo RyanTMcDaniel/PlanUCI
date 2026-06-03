@@ -19,6 +19,21 @@ load_dotenv(_ENV)
 QUARTER_ORDER = {"winter": 0, "spring": 1, "summer": 2, "fall": 3}
 UNITS_PER_COURSE = 4  # assumed when per-course unit data is unavailable
 
+# Escalating per-quarter unit caps.  Scheduling/optimization first tries the
+# requested cap; if it can't place everything, it retries at the next tier and
+# only fails once even 24 units/quarter is exceeded.
+UNIT_CAP_LADDER = (20, 24)
+
+
+def unit_cap_tiers(base_cap: int) -> list[int]:
+    """Caps to try, ascending: the requested cap first, then 20 then 24.
+
+    Tiers below the requested cap are dropped (never schedule looser than asked
+    for at the first attempt), and 24 is the ceiling.
+    """
+    tiers = sorted({base_cap, *UNIT_CAP_LADDER})
+    return [t for t in tiers if base_cap <= t <= max(base_cap, 24)] or [base_cap]
+
 
 def _qkey(qstr: str) -> tuple[int, int]:
     """'2024_fall' → (2024, 3) for chronological sorting."""
@@ -491,16 +506,56 @@ def major_requirements_met(plan: CoursePlan, client) -> tuple[bool, list[CheckRe
     return len(violations) == 0, violations
 
 
-def units_valid(plan: CoursePlan, client=None) -> tuple[bool, list[CheckResult]]:
+def _course_units_by_norm(client, course_ids: list[str]) -> dict[str, int]:
+    """{normed_course_id: min_units} from the courses table (UNITS_PER_COURSE if NULL)."""
+    if not client or not course_ids:
+        return {}
+    rows = (
+        client.table("courses")
+        .select("id,min_units")
+        .in_("id", list({c for c in course_ids}))
+        .execute()
+        .data
+    )
+    out: dict[str, int] = {}
+    for r in rows:
+        out[_norm(r["id"])] = max(1, int(r["min_units"])) if r.get("min_units") else UNITS_PER_COURSE
+    return out
+
+
+def quarter_units(courses: list[str], units_by_course: dict[str, int] | None = None) -> int:
+    """Total units for a quarter's courses.
+
+    Uses real per-course units when `units_by_course` (keyed by normalized id) is
+    supplied; otherwise falls back to the UNITS_PER_COURSE count proxy.
+    """
+    if not units_by_course:
+        return len(courses) * UNITS_PER_COURSE
+    return sum(units_by_course.get(_norm(c), UNITS_PER_COURSE) for c in courses)
+
+
+def units_valid(
+    plan: CoursePlan,
+    client=None,
+    units_by_course: dict[str, int] | None = None,
+) -> tuple[bool, list[CheckResult]]:
     """No quarter may exceed units_per_quarter.
+
+    Uses real per-course units when available — either passed in via
+    `units_by_course` (keyed by normalized id) or loaded from `client`.  Falls
+    back to the UNITS_PER_COURSE count proxy only when neither is provided.
 
     Returns (all_passed, violations) where each violation is a CheckResult with
     code UNIT_CAP.
     """
+    if units_by_course is None and client is not None:
+        all_ids = [c for cs in plan.planned_courses.values() for c in cs]
+        units_by_course = _course_units_by_norm(client, all_ids)
+
     violations: list[CheckResult] = []
 
     for quarter, courses in plan.planned_courses.items():
-        total = len(courses) * UNITS_PER_COURSE
+        total = quarter_units(courses, units_by_course)
         if total > plan.units_per_quarter:
             violations.append(CheckResult(
                 valid=False,
@@ -560,7 +615,7 @@ def validate(plan: CoursePlan) -> tuple[bool, list[CheckResult]]:
     checks = [
         ("prereqs_satisfied",      prereqs_satisfied(plan, client)),
         ("major_requirements_met", major_requirements_met(plan, client)),
-        ("units_valid",            units_valid(plan)),
+        ("units_valid",            units_valid(plan, client)),
         ("no_duplicate_courses",   no_duplicate_courses(plan)),
     ]
 
