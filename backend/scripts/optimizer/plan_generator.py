@@ -34,6 +34,7 @@ from .hard_constraints import (
     _load_aliases,  # FIX 6
     _norm,
     _qkey,
+    coreq_split_pairs,
 )
 from .optimizer import OptimizationResult, optimize, _check_prereqs  # _check_prereqs for prereq-safe _perturb
 from .offering_patterns import is_likely_offered
@@ -1243,12 +1244,16 @@ def _perturb(
         q1, q2 = rng.sample(non_empty, 2)
         c1 = rng.choice(p.planned_courses[q1])
         c2 = rng.choice(p.planned_courses[q2])
+        before_split = coreq_split_pairs(p, trees) if trees else set()
         p.planned_courses[q1].remove(c1)
         p.planned_courses[q2].remove(c2)
         p.planned_courses[q1].append(c2)
         p.planned_courses[q2].append(c1)
-        # Reject swap if it introduces any prereq violation
-        if trees and _check_prereqs(p, trees):
+        # Reject swap if it introduces a prereq violation or splits a coreq pair
+        if trees and (
+            _check_prereqs(p, trees)
+            or (coreq_split_pairs(p, trees) - before_split)
+        ):
             p.planned_courses[q1].remove(c2)
             p.planned_courses[q2].remove(c1)
             p.planned_courses[q1].append(c1)

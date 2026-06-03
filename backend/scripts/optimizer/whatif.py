@@ -29,6 +29,7 @@ from .hard_constraints import (
     _norm,
     _pretty_quarter,
     _qkey,
+    coreq_split_pairs,
     units_valid,
 )
 from .optimizer import _check_prereqs, _prereq_trees, _soft_score
@@ -313,8 +314,14 @@ def _perturb_unlocked(
     locked_norm: set[str],
     rng:         random.Random,
     n_swaps:     int,
+    trees:       dict[str, dict] | None = None,
 ) -> CoursePlan:
-    """Swap n_swaps random pairs of UNLOCKED courses between quarters."""
+    """Swap n_swaps random pairs of UNLOCKED courses between quarters.
+
+    When `trees` is provided, a swap that splits a corequisite pair (relative to
+    the pre-swap state) is undone so the optimizer never starts from a coreq-broken
+    plan.
+    """
     p = deepcopy(plan)
     quarters = list(p.planned_courses.keys())
     for _ in range(n_swaps):
@@ -330,10 +337,16 @@ def _perturb_unlocked(
         if not free1 or not free2:
             continue
         c1, c2 = rng.choice(free1), rng.choice(free2)
+        before_split = coreq_split_pairs(p, trees) if trees else set()
         p.planned_courses[q1].remove(c1)
         p.planned_courses[q2].remove(c2)
         p.planned_courses[q1].append(c2)
         p.planned_courses[q2].append(c1)
+        if trees and (coreq_split_pairs(p, trees) - before_split):
+            p.planned_courses[q1].remove(c2)
+            p.planned_courses[q2].remove(c1)
+            p.planned_courses[q1].append(c1)
+            p.planned_courses[q2].append(c2)
     return p
 
 
@@ -356,6 +369,8 @@ def _whatif_optimize(
 
     # Violations that are already present before we start (don't penalise new moves for them)
     base_viols = set(_check_prereqs(plan, trees, extra_available))
+    # Coreq pairs already split in the input — moves may not add new ones.
+    base_coreq_split = coreq_split_pairs(plan, trees)
 
     for _ in range(max_iter):
         # Quarters with at least one unlocked course
@@ -384,6 +399,10 @@ def _whatif_optimize(
         # Only reject if the move ADDS new violations
         cand_viols = set(_check_prereqs(candidate, trees, extra_available))
         if cand_viols - base_viols:
+            continue
+
+        # Coreqs must share a quarter — reject moves that newly split a pair
+        if coreq_split_pairs(candidate, trees) - base_coreq_split:
             continue
 
         cand_score, cand_bd = _soft_score(candidate, diff_scores, meta)
@@ -488,7 +507,7 @@ def optimize_around_locks(
 
     for s, n_swaps in configs:
         rng   = random.Random(s)
-        start = _perturb_unlocked(base, locked_norm, rng, n_swaps) if n_swaps else base
+        start = _perturb_unlocked(base, locked_norm, rng, n_swaps, trees) if n_swaps else base
         opt, score, bd = _whatif_optimize(
             start, locked_norm, trees, diff_scores, meta, seed=s,
             extra_available=completed_norm,

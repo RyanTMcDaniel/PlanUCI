@@ -217,3 +217,62 @@ def test_validate_locks_detects_conflict():
     })
     assert not valid, "Expected lock conflict but validate_locks returned valid=True"
     assert len(conflicts) > 0, "Expected at least one conflict message"
+
+
+# ── 11. Corequisites must share a quarter ─────────────────────────────────────
+
+def test_coreq_split_pairs_detects_and_clears():
+    """coreq_split_pairs flags an AND coreq placed in a different quarter, and is
+    empty once the pair shares a quarter.  Edge direction is irrelevant
+    (MATH105A→105LA holds the edge; the helper treats it symmetrically)."""
+    from scripts.optimizer.hard_constraints import coreq_split_pairs
+    trees = {"MATH105A": {"AND": [{"prereqType": "course", "courseId": "MATH 105LA", "coreq": True}]}}
+
+    split = _make_plan(
+        planned_courses={"2026_fall": ["MATH105LA"], "2027_winter": ["MATH105A"]},
+    )
+    assert coreq_split_pairs(split, trees) == {frozenset(("MATH105A", "MATH105LA"))}
+
+    together = _make_plan(planned_courses={"2026_fall": ["MATH105A", "MATH105LA"]})
+    assert coreq_split_pairs(together, trees) == set()
+
+
+def test_generate_keeps_coreqs_same_quarter():
+    """BS-0K6A requires two coreq pairs (105A/105LA, 105B/105LB) with edges encoded
+    in opposite directions.  Every generated variant must keep each pair together."""
+    res = generate(
+        major_id="BS-0K6A",
+        completed_courses=[],
+        graduation_quarter="2030_spring",
+        units_per_quarter=16,
+        start_quarter="2026_fall",
+    )
+    assert res.variants, "expected at least one variant"
+    for v in res.variants:
+        loc = {c: q for q, cs in v.plan.planned_courses.items() for c in cs}
+        for a, b in [("MATH105A", "MATH105LA"), ("MATH105B", "MATH105LB")]:
+            if a in loc and b in loc:
+                assert loc[a] == loc[b], f"{a}@{loc[a]} split from {b}@{loc[b]}"
+
+
+def test_whatif_does_not_split_coreqs():
+    """optimize_around_locks must never introduce a coreq split; given a split
+    input it may fix it, but the output must have no split pairs."""
+    from scripts.optimizer.hard_constraints import coreq_split_pairs
+    from scripts.optimizer.optimizer import _prereq_trees
+
+    plan = _make_plan(
+        completed_courses=["MATH2A", "MATH2B", "MATH9", "MATH3A"],
+        planned_courses={
+            "2026_fall":   ["MATH105LA"],
+            "2027_winter": ["MATH105A"],
+        },
+        units_per_quarter=16,
+    )
+    res = optimize_around_locks(plan, [], top_n=3)
+    assert res["status"] == "ok", res
+    all_ids = [c for cs in plan.planned_courses.values() for c in cs]
+    trees = _prereq_trees(create_client(os.getenv("SUPABASE_URL"), os.getenv("SUPABASE_SERVICE_KEY")), all_ids)
+    for p in res["plans"]:
+        cp = CoursePlan(major_id="x", planned_courses=p["planned_courses"])
+        assert coreq_split_pairs(cp, trees) == set(), p["planned_courses"]

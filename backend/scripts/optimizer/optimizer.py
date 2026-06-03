@@ -28,6 +28,7 @@ from .hard_constraints import (
     _eval_tree,
     _norm,
     _qkey,
+    coreq_split_pairs,
     major_requirements_met,
     no_duplicate_courses,
     units_valid,
@@ -192,6 +193,12 @@ def optimize(
     quarters = sorted(plan.planned_courses.keys(), key=_qkey)
     improved = False
 
+    # Coreqs must stay in the same quarter.  Reject any move that introduces a
+    # split not already present in the starting plan (the seed is coreq-valid, so
+    # in practice this freezes coreq pairs together).  base-aware so a pre-split
+    # input is never made worse.
+    base_coreq_split = coreq_split_pairs(plan, trees)
+
     for _ in range(max_iter):
         non_empty = [q for q in quarters if best.planned_courses.get(q)]
         if not non_empty:
@@ -211,6 +218,10 @@ def optimize(
 
         # Prereqs (in-memory, no Supabase)
         if _check_prereqs(candidate, trees):
+            continue
+
+        # Coreqs must share a quarter — reject moves that split a pair
+        if coreq_split_pairs(candidate, trees) - base_coreq_split:
             continue
 
         # Soft score
