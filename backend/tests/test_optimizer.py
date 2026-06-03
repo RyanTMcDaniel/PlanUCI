@@ -321,3 +321,27 @@ def test_whatif_respects_real_unit_cap(client):
     for p in res["plans"]:
         for q, cs in p["planned_courses"].items():
             assert quarter_units(cs, ubc) <= 24, (q, cs, quarter_units(cs, ubc))
+
+
+# ── 13. Minimum-12-units soft constraint ─────────────────────────────────────
+
+def test_min_units_load_penalizes_underloaded_quarters():
+    from scripts.optimizer.soft_constraints import min_units_load, WEIGHTS
+    meta = {"A": {"min_units": 4}, "B": {"min_units": 4}, "C": {"min_units": 4}}
+    # Empty quarters are ignored; a full 12-unit quarter scores 0.
+    assert min_units_load(_make_plan(planned_courses={"2026_fall": ["A", "B", "C"]}), meta) == 0.0
+    assert min_units_load(_make_plan(planned_courses={"2026_fall": []}), meta) == 0.0
+    # An 8-unit quarter has a (12-8)/12 = 1/3 shortfall.
+    assert abs(min_units_load(_make_plan(planned_courses={"2026_fall": ["A", "B"]}), meta) - (1 / 3)) < 1e-9
+    # Registered with a weight so it actually influences the optimizer.
+    assert "min_units_load" in WEIGHTS and WEIGHTS["min_units_load"] > 0
+
+
+def test_min_units_load_in_soft_breakdown():
+    """Both the generate and whatif paths score through _soft_score, which must now
+    include the min_units_load term."""
+    from scripts.optimizer.optimizer import _soft_score
+    from scripts.optimizer.soft_constraints import _load_difficulty_scores
+    plan = _make_plan(planned_courses={"2026_fall": ["I&CSCI31"]})
+    _, breakdown = _soft_score(plan, _load_difficulty_scores(), {})
+    assert "min_units_load" in breakdown

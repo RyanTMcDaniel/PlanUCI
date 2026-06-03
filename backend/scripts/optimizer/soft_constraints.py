@@ -15,7 +15,7 @@ import statistics
 from dotenv import load_dotenv
 from supabase import create_client
 
-from .hard_constraints import CoursePlan, _norm, _qkey
+from .hard_constraints import CoursePlan, UNITS_PER_COURSE, _norm, _qkey
 
 _ENV = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", ".env")
 load_dotenv(_ENV)
@@ -33,6 +33,8 @@ WEIGHTS = {
     # Adjacent-quarter smoothing (2× the implicit progression weight).
     # Penalises sharp swings between consecutive quarters, including cliff jumps.
     "adjacent_smoothing":   0.40,
+    # Discourage under-loaded quarters: non-empty quarters should carry >=12 units.
+    "min_units_load":       0.30,
 }
 
 _DEFAULT_DIFFICULTY = 5.0   # used when a course has no entry in the CSV
@@ -54,12 +56,12 @@ def _load_difficulty_scores() -> dict[str, float]:
 
 
 def _load_course_meta(client, course_ids: list[str]) -> dict[str, dict]:
-    """Fetch ge_list and department for each course id from Supabase."""
+    """Fetch ge_list, department and min_units for each course id from Supabase."""
     if not course_ids:
         return {}
     rows = (
         client.table("courses")
-        .select("id,department,ge_list")
+        .select("id,department,ge_list,min_units")
         .in_("id", course_ids)
         .execute()
         .data
@@ -260,6 +262,31 @@ def adjacent_smoothing(plan: CoursePlan, diff_scores: dict[str, float]) -> float
     return min(1.0, total / n_pairs)
 
 
+_MIN_UNITS_TARGET = 12  # quarters below this many units are under-loaded
+
+
+def min_units_load(plan: CoursePlan, course_meta: dict[str, dict]) -> float:
+    """Penalty for non-empty quarters carrying fewer than 12 units.
+
+    Empty quarters are ignored — a gap quarter is fine.  For each non-empty
+    quarter, the shortfall below 12 units is normalized to [0, 1] (>=12 units → 0,
+    0 units → 1) and the penalties are averaged.  Real per-course units come from
+    course_meta; missing entries fall back to UNITS_PER_COURSE.
+    """
+    shortfalls: list[float] = []
+    for courses in plan.planned_courses.values():
+        if not courses:
+            continue  # empty quarter — not penalized
+        units = sum(
+            (course_meta.get(_norm(c), {}).get("min_units") or UNITS_PER_COURSE)
+            for c in courses
+        )
+        shortfalls.append(max(0.0, _MIN_UNITS_TARGET - units) / _MIN_UNITS_TARGET)
+    if not shortfalls:
+        return 0.0
+    return sum(shortfalls) / len(shortfalls)
+
+
 # ── Combined scorer ───────────────────────────────────────────────────────────
 
 def score(plan: CoursePlan) -> tuple[float, dict[str, float]]:
@@ -279,6 +306,7 @@ def score(plan: CoursePlan) -> tuple[float, dict[str, float]]:
         "ge_distribution":      ge_distribution(plan, meta),
         "workload_progression": workload_progression(plan, diff_scores),
         "major_clustering":     major_clustering(plan, meta),
+        "min_units_load":       min_units_load(plan, meta),
     }
     combined = sum(WEIGHTS[k] * v for k, v in breakdown.items())
     return combined, breakdown

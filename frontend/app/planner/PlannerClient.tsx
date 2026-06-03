@@ -71,6 +71,18 @@ function abbrevQuarter(q: string): string {
   return (_QUARTER_ABBREV[season] ?? season[0]) + (year?.slice(2) ?? "");
 }
 
+// Normalize a course ID for comparison — mirrors the backend `_norm` so placed
+// courses match requirement-pool IDs regardless of source format.  Without this,
+// a pool listing "I&CSCI161" or "CSE46" never matches a placed "ICS161"/"ICS46"
+// (and vice versa), so elective counters read 0 even when courses are placed.
+const _COURSE_ALIASES: Record<string, string> = {
+  CSE31: "ICS31", CSE43: "ICS43", CSE45C: "ICS45C", CSE46: "ICS46",
+};
+function normId(id: string): string {
+  const s = id.replace(/\s+/g, "").toUpperCase().replace("I&CSCI", "ICS");
+  return _COURSE_ALIASES[s] ?? s;
+}
+
 // ── Constants ─────────────────────────────────────────────────────────────────
 
 // Calendar anchor for the qkey scheme — keeps plannedCourses keys (e.g.
@@ -853,9 +865,12 @@ function QuarterCell({
           );
         })()}
         {removable && onRemoveQuarter && (
-          <button onClick={onRemoveQuarter}
-            className="text-[9px] text-[#383838] hover:text-[#666] transition-colors leading-none">
-            ✕
+          <button
+            onClick={onRemoveQuarter}
+            title="Remove summer quarter — its courses return to the sidebar"
+            className={`${units > 0 ? "" : "ml-auto"} flex items-center gap-0.5 rounded px-1 py-0.5 text-[9px] font-semibold uppercase tracking-wide text-amber-500/80 hover:text-amber-300 hover:bg-amber-950/40 transition-colors leading-none shrink-0`}
+          >
+            ✕ Remove
           </button>
         )}
       </div>
@@ -1044,7 +1059,7 @@ function RequirementGroup({
               courseId={cid}
               title={courseInfoMap[cid]?.title}
               units={courseInfoMap[cid]?.min_units}
-              isPlaced={placedSet.has(cid)}
+              isPlaced={placedSet.has(normId(cid))}
               isApCredit={apCreditedSet.has(cid)}
               unavailable={!courseInfoMap[cid]}
               diffScore={difficultyMap[cid] ?? null}
@@ -1103,7 +1118,7 @@ function FlatGroup({
             courseId={cid}
             title={courseInfoMap[cid]?.title}
             units={courseInfoMap[cid]?.min_units}
-            isPlaced={placedSet.has(cid)}
+            isPlaced={placedSet.has(normId(cid))}
             isApCredit={apCreditedSet.has(cid)}
             unavailable={!courseInfoMap[cid]}
             diffScore={difficultyMap[cid] ?? null}
@@ -1267,7 +1282,7 @@ function GESection({
               courseId={cid}
               title={courseInfoMap[cid]?.title}
               units={courseInfoMap[cid]?.min_units}
-              isPlaced={placedSet.has(cid)}
+              isPlaced={placedSet.has(normId(cid))}
               isApCredit={apCreditedSet.has(cid)}
               unavailable={!courseInfoMap[cid]}
               diffScore={difficultyMap[cid] ?? null}
@@ -1359,11 +1374,13 @@ export default function PlannerClient() {
   // the optimizer is rewired separately.
   const gradQuarter = useMemo(() => qkey(numYears, "spring"), [numYears]);
 
+  // Normalized set of placed (+ AP-credited) course IDs.  Membership tests below
+  // normalize the queried ID too, so pool IDs in any alias/spacing form match.
   const placedSet = useMemo(() => {
     const s = new Set<string>();
-    for (const ids of Object.values(plannedCourses)) ids.forEach((id) => s.add(id));
+    for (const ids of Object.values(plannedCourses)) ids.forEach((id) => s.add(normId(id)));
     // AP-credited courses count as "placed" for sidebar coverage checks
-    apCreditedSet.forEach((id) => s.add(id));
+    apCreditedSet.forEach((id) => s.add(normId(id)));
     return s;
   }, [plannedCourses, apCreditedSet]);
 
@@ -1429,7 +1446,7 @@ export default function PlannerClient() {
           done: be.remaining === 0,
         };
       }
-      const placed = req.courses.filter((c) => placedSet.has(c)).length;
+      const placed = req.courses.filter((c) => placedSet.has(normId(c))).length;
       return {
         placed,
         needed: req.courses_needed,
@@ -1444,7 +1461,7 @@ export default function PlannerClient() {
   // and avoids any major/minor group-name collision in the backend lookup.
   const clientCoverage = useMemo<GetCoverage>(() => {
     return (req: ReqGroup): Coverage => {
-      const placed = req.courses.filter((c) => placedSet.has(c)).length;
+      const placed = req.courses.filter((c) => placedSet.has(normId(c))).length;
       return {
         placed,
         needed: req.courses_needed,
@@ -1511,7 +1528,7 @@ export default function PlannerClient() {
 
   const minorPlacedRequired = useMemo(
     () =>
-      [...placedSet].filter((id) => minorRequirements.some((r) => r.courses.includes(id))).length,
+      [...placedSet].filter((id) => minorRequirements.some((r) => r.courses.some((c) => normId(c) === id))).length,
     [placedSet, minorRequirements],
   );
 
@@ -2209,7 +2226,7 @@ export default function PlannerClient() {
                               courseId={c.id}
                               title={c.title}
                               units={c.min_units}
-                              isPlaced={placedSet.has(c.id)}
+                              isPlaced={placedSet.has(normId(c.id))}
                               isApCredit={apCreditedSet.has(c.id)}
                               unavailable={false}
                               diffScore={difficultyMap[c.id] ?? null}

@@ -44,6 +44,7 @@ from .soft_constraints import (
     difficulty_balance,
     ge_distribution,
     major_clustering,
+    min_units_load,
     workload_progression,
 )
 
@@ -123,6 +124,7 @@ def _soft_score(
         "workload_progression": workload_progression(plan, diff_scores),
         "major_clustering":     major_clustering(plan, meta),
         "adjacent_smoothing":   adjacent_smoothing(plan, diff_scores),
+        "min_units_load":       min_units_load(plan, meta),
     }
     return sum(WEIGHTS[k] * v for k, v in breakdown.items()), breakdown
 
