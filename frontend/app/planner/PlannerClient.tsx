@@ -281,7 +281,7 @@ function parseLockConflict(conflict: string): string {
 function LockIcon({ locked }: { locked: boolean }) {
   return (
     <svg viewBox="0 0 14 14" fill="none"
-      className={`w-3 h-3 transition-colors ${locked ? "text-amber-400" : "text-[#555] group-hover/card:text-[#e8e8e8]"}`}>
+      className={`w-4 h-4 transition-colors ${locked ? "text-amber-400" : "text-[#555] group-hover/card:text-[#e8e8e8]"}`}>
       <rect x="3" y="6" width="8" height="6" rx="1.2" stroke="currentColor" strokeWidth="1.3"/>
       <path d="M5 6V4.5a2 2 0 014 0V6" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round"/>
     </svg>
@@ -490,6 +490,99 @@ function MinorCombobox({
   );
 }
 
+// ── Specialization combobox ─────────────────────────────────────────────────
+// Mirrors MajorCombobox/MinorCombobox; specializations select by major_id.
+
+function SpecializationCombobox({
+  options, selectedMajorId, onSelect,
+}: {
+  options: MajorOption[];
+  selectedMajorId: string;
+  onSelect: (majorId: string) => void;
+}) {
+  const [query, setQuery] = useState("");
+  const [open, setOpen] = useState(false);
+  const containerRef = useRef<HTMLDivElement>(null);
+  const inputRef = useRef<HTMLInputElement>(null);
+
+  const specLabel = (o: MajorOption) => o.specialization_name ?? o.major_id;
+
+  const selectedName = useMemo(() => {
+    const o = options.find((o) => o.major_id === selectedMajorId);
+    return o ? specLabel(o) : "";
+  }, [options, selectedMajorId]);
+
+  useEffect(() => {
+    if (!open) setQuery(selectedName);
+  }, [selectedName, open]);
+
+  useEffect(() => {
+    function onMouseDown(e: MouseEvent) {
+      if (containerRef.current && !containerRef.current.contains(e.target as Node)) {
+        setOpen(false);
+        setQuery(selectedName);
+      }
+    }
+    document.addEventListener("mousedown", onMouseDown);
+    return () => document.removeEventListener("mousedown", onMouseDown);
+  }, [selectedName]);
+
+  const filtered = useMemo(() => {
+    const q = query.trim().toLowerCase();
+    return options
+      .filter((o) => !q || specLabel(o).toLowerCase().includes(q))
+      .slice(0, 40);
+  }, [options, query]);
+
+  function handleSelect(opt: MajorOption) {
+    onSelect(opt.major_id);
+    setQuery(specLabel(opt));
+    setOpen(false);
+  }
+
+  function handleKeyDown(e: React.KeyboardEvent) {
+    if (e.key === "Escape") {
+      setOpen(false);
+      setQuery(selectedName);
+      inputRef.current?.blur();
+    }
+    if (e.key === "Enter" && filtered.length > 0) handleSelect(filtered[0]);
+  }
+
+  return (
+    <div ref={containerRef} className="relative">
+      <div className="relative">
+        <input
+          ref={inputRef}
+          type="text"
+          value={query}
+          onChange={(e) => { setQuery(e.target.value); setOpen(true); }}
+          onFocus={() => setOpen(true)}
+          onKeyDown={handleKeyDown}
+          placeholder="Search for a specialization..."
+          className="w-full bg-[#111] border border-[#2a2a2a] rounded px-2.5 py-1.5 text-[11px] text-[#f0f0f0] placeholder-[#444] focus:outline-none focus:border-[#3b82f6]/60 disabled:opacity-50 pr-6"
+        />
+        <svg className="absolute right-2 top-1/2 -translate-y-1/2 w-3 h-3 text-[#444] pointer-events-none" viewBox="0 0 12 12" fill="none">
+          <path d="M2 4l4 4 4-4" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round"/>
+        </svg>
+      </div>
+      {open && filtered.length > 0 && (
+        <div className="absolute z-50 top-full left-0 right-0 mt-px bg-[#1a1a1a] border border-[#2a2a2a] rounded max-h-52 overflow-y-auto shadow-xl">
+          {filtered.map((opt) => (
+            <button
+              key={opt.major_id}
+              onMouseDown={() => handleSelect(opt)}
+              className="w-full text-left px-2.5 py-[7px] text-[11px] text-[#bbb] hover:bg-[#252525] hover:text-[#f0f0f0] transition-colors"
+            >
+              {specLabel(opt)}
+            </button>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
 // ── Course tooltip ─────────────────────────────────────────────────────────────
 
 function CourseTooltip({
@@ -660,7 +753,7 @@ function PlacedCard({
     <div
       ref={setNodeRef}
       style={style}
-      className={`group/card flex items-center gap-1.5 rounded-r-md pl-2 pr-1 py-1 select-none
+      className={`group/card flex items-center gap-2 rounded-r-md pl-1.5 pr-1.5 py-1.5 select-none
         bg-[#1e1e1e] border border-l-0 border-[#2a2a2a] shadow-sm transition-colors min-h-[44px]
         ${isDragging ? "opacity-20" : "hover:bg-[#252525] hover:border-[#333]"}`}
     >
@@ -668,43 +761,49 @@ function PlacedCard({
       <span
         {...listeners}
         {...attributes}
-        className="text-[10px] text-[#2a2a2a] group-hover/card:text-[#444] cursor-grab active:cursor-grabbing shrink-0 leading-none self-start mt-1"
+        className="text-[18px] text-[#2a2a2a] group-hover/card:text-[#444] cursor-grab active:cursor-grabbing shrink-0 leading-none self-center"
       >
         ⠿
       </span>
 
-      {/* course info */}
-      <div className="flex-1 min-w-0">
-        <p className="text-[15px] font-bold text-[#e8e8e8] leading-tight truncate">{courseId}</p>
-        {title && (
-          <p className="text-[10px] text-[#999] leading-snug truncate">{title}</p>
-        )}
-      </div>
+      {/* content */}
+      <div className="flex-1 min-w-0 flex flex-col gap-1">
+        {/* top row: course code/name + action buttons */}
+        <div className="flex items-start gap-1.5">
+          <div className="flex-1 min-w-0">
+            <p className="text-[17px] font-bold text-[#e8e8e8] leading-tight truncate">{courseId}</p>
+            {title && (
+              <p className="text-[12px] text-[#999] leading-snug truncate">{title}</p>
+            )}
+          </div>
+          <div className="flex gap-0.5 shrink-0 opacity-0 group-hover/card:opacity-100 transition-opacity">
+            <button
+              onPointerDown={(e) => e.stopPropagation()}
+              onClick={() => onToggleLock(courseId)}
+              title={isLocked ? "Unlock" : "Lock to quarter"}
+              className="flex items-center justify-center w-7 h-7 rounded hover:bg-[#333] transition-colors"
+            >
+              <LockIcon locked={isLocked} />
+            </button>
+            <button
+              onPointerDown={(e) => e.stopPropagation()}
+              onClick={() => onRemove(courseId, quarterKey)}
+              title="Remove"
+              className="flex items-center justify-center w-7 h-7 rounded text-[#555] hover:text-[#e8e8e8] hover:bg-[#333] text-[18px] leading-none transition-colors"
+            >
+              ×
+            </button>
+          </div>
+        </div>
 
-      {/* right side */}
-      <div className="flex flex-col items-end gap-0.5 shrink-0">
-        {gpa != null && isFinite(gpa) ? (
-          <span className="text-[10px] font-mono font-medium" style={{ color: "#9a9a9a" }}>{gpa.toFixed(2)} GPA</span>
-        ) : (
-          <span className="text-[9px] font-mono text-[#5a5a5a] whitespace-nowrap">No GPA Data</span>
-        )}
-        <span className="text-[11px] font-medium text-[#888] tabular-nums">{units ?? "?"} <span className="font-normal text-[#5a5a5a]">UNITS</span></span>
-        <div className="flex gap-1 opacity-0 group-hover/card:opacity-100 transition-opacity">
-          <button
-            onPointerDown={(e) => e.stopPropagation()}
-            onClick={() => onToggleLock(courseId)}
-            title={isLocked ? "Unlock" : "Lock to quarter"}
-          >
-            <LockIcon locked={isLocked} />
-          </button>
-          <button
-            onPointerDown={(e) => e.stopPropagation()}
-            onClick={() => onRemove(courseId, quarterKey)}
-            title="Remove"
-            className="text-[#555] hover:text-[#e8e8e8] text-[12px] leading-none w-3 text-center transition-colors"
-          >
-            ×
-          </button>
+        {/* bottom row: gpa + units */}
+        <div className="flex items-center gap-2">
+          {gpa != null && isFinite(gpa) ? (
+            <span className="text-[10px] font-mono font-medium" style={{ color: "#9a9a9a" }}>{gpa.toFixed(2)} GPA</span>
+          ) : (
+            <span className="text-[9px] font-mono text-[#5a5a5a] whitespace-nowrap">No GPA Data</span>
+          )}
+          <span className="text-[11px] font-medium text-[#888] tabular-nums">{units ?? "?"} <span className="font-normal text-[#5a5a5a]">UNITS</span></span>
         </div>
       </div>
     </div>
@@ -928,7 +1027,7 @@ function CoursePill({
 }) {
   // Pick-N pools list many courses; keep their codes compact. Everywhere else
   // uses the larger, easier-to-read size.
-  const codeSize = compact ? "text-[9px]" : "text-[11px]";
+  const codeSize = compact ? "text-[9px]" : "text-[13px]";
 
   const { attributes, listeners, setNodeRef, transform, isDragging } = useDraggable({
     id: `sidebar|${courseId}`,
@@ -2477,17 +2576,11 @@ export default function PlannerClient() {
             )}
 
             {sidebarTab !== "minor" && specializations.length > 0 && (
-              <select
-                value={selectedMajorId}
-                onChange={(e) => setSelectedMajorId(e.target.value)}
-                className="w-full bg-[#111] border border-[#2a2a2a] rounded px-2.5 py-1.5 text-[11px] text-[#f0f0f0] focus:outline-none focus:border-[#3b82f6]/60"
-              >
-                {specializations.map((spec) => (
-                  <option key={spec.major_id} value={spec.major_id}>
-                    {spec.specialization_name ?? spec.major_id}
-                  </option>
-                ))}
-              </select>
+              <SpecializationCombobox
+                options={specializations}
+                selectedMajorId={selectedMajorId}
+                onSelect={setSelectedMajorId}
+              />
             )}
 
             {sidebarTab === "minor" && (

@@ -49,15 +49,19 @@ export function exportScheduleToPDF(input: SchedulePdfInput): void {
   const pageH = doc.internal.pageSize.getHeight();
   const margin = 28;
 
+  // ── Black page background ────────────────────────────────────────────────────
+  doc.setFillColor(0, 0, 0);
+  doc.rect(0, 0, pageW, pageH, "F");
+
   // ── Title ──────────────────────────────────────────────────────────────────
   doc.setFont("helvetica", "bold");
   doc.setFontSize(15);
-  doc.setTextColor(24, 24, 27);
+  doc.setTextColor(240, 240, 240);
   doc.text(truncate(doc, majorName || "Degree Plan", pageW - margin * 2 - 120), margin, margin + 4);
 
   doc.setFont("helvetica", "normal");
   doc.setFontSize(10);
-  doc.setTextColor(113, 113, 122);
+  doc.setTextColor(160, 160, 168);
   doc.text(`${totalUnits} total units`, pageW - margin, margin + 4, { align: "right" });
 
   // ── Grid geometry ────────────────────────────────────────────────────────────
@@ -78,11 +82,11 @@ export function exportScheduleToPDF(input: SchedulePdfInput): void {
     const rowY = gridTop + ri * rowH;
 
     // Year gutter
-    doc.setFillColor(244, 244, 245);
+    doc.setFillColor(26, 26, 26);
     doc.rect(margin, rowY, gutterW, rowH, "F");
     doc.setFont("helvetica", "bold");
     doc.setFontSize(7.5);
-    doc.setTextColor(113, 113, 122);
+    doc.setTextColor(160, 160, 168);
     doc.text(year.label.toUpperCase(), margin + gutterW / 2 + 2.5, rowY + rowH / 2, {
       align: "center",
       angle: 90,
@@ -92,19 +96,19 @@ export function exportScheduleToPDF(input: SchedulePdfInput): void {
       const x = gridLeft + ci * colW;
 
       // Cell border + header band
-      doc.setDrawColor(228, 228, 231);
+      doc.setDrawColor(60, 60, 60);
       doc.setLineWidth(0.6);
       doc.rect(x, rowY, colW, rowH);
-      doc.setFillColor(249, 250, 251);
+      doc.setFillColor(24, 24, 24);
       doc.rect(x, rowY, colW, headerH, "F");
 
       // Quarter header: label (left) + units (right)
       doc.setFont("helvetica", "bold");
       doc.setFontSize(8);
-      doc.setTextColor(63, 63, 70);
+      doc.setTextColor(224, 224, 228);
       doc.text(q.label, x + pad, rowY + 10.5);
       doc.setFont("helvetica", "normal");
-      doc.setTextColor(140, 140, 148);
+      doc.setTextColor(170, 170, 178);
       doc.text(`${q.units}u`, x + colW - pad, rowY + 10.5, { align: "right" });
 
       // Courses
@@ -122,18 +126,18 @@ export function exportScheduleToPDF(input: SchedulePdfInput): void {
         const avail = colW - (textX - x) - pad - 16;
         doc.setFont("helvetica", "bold");
         doc.setFontSize(7.5);
-        doc.setTextColor(24, 24, 27);
+        doc.setTextColor(232, 232, 232);
         doc.text(truncate(doc, c.code, avail), textX, cy);
         if (c.units != null) {
           doc.setFont("helvetica", "normal");
           doc.setFontSize(6.5);
-          doc.setTextColor(160, 160, 168);
+          doc.setTextColor(150, 150, 158);
           doc.text(`${c.units}u`, x + colW - pad, cy, { align: "right" });
         }
         if (c.title) {
           doc.setFont("helvetica", "normal");
           doc.setFontSize(6.5);
-          doc.setTextColor(130, 130, 138);
+          doc.setTextColor(150, 150, 158);
           doc.text(truncate(doc, c.title, colW - pad - (textX - x)), textX, cy + 6.5);
           cy += lineH + 2.5;
         } else {
