@@ -68,12 +68,10 @@ interface TopProfessor {
 // Module-level cache — survives tooltip unmount/remount within the session
 const _topProfsCache = new Map<string, TopProfessor[]>();
 
-const _QUARTER_ABBREV: Record<string, string> = {
-  Fall: "F", Winter: "W", Spring: "S", Summer: "Su",
-};
-function abbrevQuarter(q: string): string {
+function fullQuarter(q: string): string {
+  // quarters_taught arrive as "Fall 2021"; show the full term name on cards.
   const [season, year] = q.split(" ");
-  return (_QUARTER_ABBREV[season] ?? season[0]) + (year?.slice(2) ?? "");
+  return year ? `${season} ${year}` : season;
 }
 
 // Normalize a course ID for comparison — mirrors the backend `_norm` so placed
@@ -571,10 +569,10 @@ function CourseTooltip({
         <p className="text-[8px] font-bold uppercase tracking-widest text-[#444] mb-1.5">Offered</p>
         <div style={{ display: "grid", gridTemplateColumns: "22px repeat(3, 1fr)", gap: "2px 4px" }}>
           <span />
-          {["F", "W", "S"].map((q) => (
+          {["Fall", "Winter", "Spring"].map((q) => (
             <span key={q} className="text-[7px] text-[#444] text-center font-mono">{q}</span>
           ))}
-          {TIP_YEARS.flatMap((yr) => [
+          {[...TIP_YEARS].reverse().flatMap((yr) => [
             <span key={`${yr}l`} className="text-[7px] text-[#444] font-mono">{String(yr).slice(2)}</span>,
             ...["Fall", "Winter", "Spring"].map((q) => (
               <span
@@ -615,7 +613,7 @@ function CourseTooltip({
                   <span className="text-[#22c55e]">{"  "}GPA: {prof.overall_avg_gpa.toFixed(2)}</span>
                 )}
                 {prof.quarters_taught.length > 0 && (
-                  <span className="text-[#555]">{"  "}Taught: {prof.quarters_taught.map(abbrevQuarter).join(", ")}</span>
+                  <span className="text-[#555]">{"  "}Taught: {prof.quarters_taught.map(fullQuarter).join(", ")}</span>
                 )}
               </div>
             ))}
@@ -3248,6 +3246,14 @@ export default function PlannerClient() {
           </div>
         </main>
       </div>
+
+      {/* Feedback link — subtle, fixed bottom-right */}
+      <a
+        href="mailto:rtmcdani@uci.edu"
+        className="fixed bottom-3 right-4 z-40 text-[10px] text-[#444] hover:text-[#888] transition-colors"
+      >
+        Mail any feedback to rtmcdani@uci.edu
+      </a>
 
       {/* Drag overlay */}
       <DragOverlay dropAnimation={null}>
