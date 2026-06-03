@@ -7,6 +7,7 @@ import torch
 import torch.nn as nn
 from dotenv import load_dotenv
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 from sentence_transformers import SentenceTransformer
 from supabase import create_client
 
@@ -104,6 +105,17 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="PlanUCI ML API", lifespan=lifespan)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "https://plan-uci-three.vercel.app",
+        "http://localhost:3000",
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 from .routers import difficulty, sentiment, optimizer  # noqa: E402
 app.include_router(difficulty.router, prefix="/difficulty", tags=["difficulty"])
