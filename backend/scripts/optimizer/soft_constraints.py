@@ -35,6 +35,11 @@ WEIGHTS = {
     "adjacent_smoothing":   0.40,
     # Discourage under-loaded quarters: non-empty quarters should carry >=12 units.
     "min_units_load":       0.30,
+    # Earliness preferences: nudge lower-division courses and GE-satisfying
+    # courses toward earlier quarters. Below the smallest existing term (0.20)
+    # so they influence ordering without overriding difficulty/feasibility.
+    "lower_div_earliness":  0.15,
+    "ge_earliness":         0.15,
 }
 
 _DEFAULT_DIFFICULTY = 5.0   # used when a course has no entry in the CSV
@@ -285,6 +290,58 @@ def min_units_load(plan: CoursePlan, course_meta: dict[str, dict]) -> float:
     if not shortfalls:
         return 0.0
     return sum(shortfalls) / len(shortfalls)
+
+
+def _course_number(course_id: str) -> int | None:
+    """Leading course number from a (normalized) id: 'MATH2D' → 2, 'ICS161' → 161."""
+    m = re.search(r"(\d+)", _norm(course_id))
+    return int(m.group(1)) if m else None
+
+
+def lower_div_earliness(plan: CoursePlan, locked_norm: frozenset[str] = frozenset()) -> float:
+    """Earliness preference for lower-division (course number < 100) courses.
+
+    Mean of (quarter_index / total_quarters) over UNLOCKED lower-div courses, so
+    a lower-div course placed late incurs a higher penalty. Soft only — never
+    blocks a late placement that prereqs/availability require. Locked courses are
+    excluded (they can't move, so they'd only add a constant offset). Returns
+    0.0 when there are no unlocked lower-div courses.
+    """
+    sorted_q = sorted(plan.planned_courses.keys(), key=_qkey)
+    n = len(sorted_q)
+    if n == 0:
+        return 0.0
+    penalties: list[float] = []
+    for i, q in enumerate(sorted_q):
+        for c in plan.planned_courses[q]:
+            if _norm(c) in locked_norm:
+                continue
+            num = _course_number(c)
+            if num is not None and num < 100:
+                penalties.append(i / n)
+    return sum(penalties) / len(penalties) if penalties else 0.0
+
+
+def ge_earliness(
+    plan: CoursePlan, course_meta: dict[str, dict], locked_norm: frozenset[str] = frozenset()
+) -> float:
+    """Earliness preference for GE-satisfying courses (non-empty ge_list).
+
+    Same shape as lower_div_earliness: mean of (quarter_index / total_quarters)
+    over UNLOCKED GE courses. Front-loads GE completion. Soft only.
+    """
+    sorted_q = sorted(plan.planned_courses.keys(), key=_qkey)
+    n = len(sorted_q)
+    if n == 0:
+        return 0.0
+    penalties: list[float] = []
+    for i, q in enumerate(sorted_q):
+        for c in plan.planned_courses[q]:
+            if _norm(c) in locked_norm:
+                continue
+            if course_meta.get(_norm(c), {}).get("ge_list"):
+                penalties.append(i / n)
+    return sum(penalties) / len(penalties) if penalties else 0.0
 
 
 # ── Combined scorer ───────────────────────────────────────────────────────────

@@ -43,6 +43,8 @@ from .soft_constraints import (
     adjacent_smoothing,
     difficulty_balance,
     ge_distribution,
+    ge_earliness,
+    lower_div_earliness,
     major_clustering,
     min_units_load,
     workload_progression,
@@ -116,8 +118,13 @@ def _soft_score(
     plan: CoursePlan,
     diff_scores: dict[str, float],
     meta: dict[str, dict],
+    locked_norm: frozenset[str] = frozenset(),
 ) -> tuple[float, dict[str, float]]:
-    """Soft score using pre-loaded data — no Supabase calls."""
+    """Soft score using pre-loaded data — no Supabase calls.
+
+    locked_norm: normalized ids of locked courses, excluded from the earliness
+    preferences (they can't move, so they'd only add a constant offset).
+    """
     breakdown = {
         "difficulty_balance":   difficulty_balance(plan, diff_scores),
         "ge_distribution":      ge_distribution(plan, meta),
@@ -125,6 +132,8 @@ def _soft_score(
         "major_clustering":     major_clustering(plan, meta),
         "adjacent_smoothing":   adjacent_smoothing(plan, diff_scores),
         "min_units_load":       min_units_load(plan, meta),
+        "lower_div_earliness":  lower_div_earliness(plan, locked_norm),
+        "ge_earliness":         ge_earliness(plan, meta, locked_norm),
     }
     return sum(WEIGHTS[k] * v for k, v in breakdown.items()), breakdown
 

@@ -375,7 +375,7 @@ def _whatif_optimize(
     """
     rng       = random.Random(seed)
     best      = deepcopy(plan)
-    best_score, best_bd = _soft_score(plan, diff_scores, meta)
+    best_score, best_bd = _soft_score(plan, diff_scores, meta, frozenset(locked_norm))
     quarters  = sorted(plan.planned_courses.keys(), key=_qkey)
     cap       = plan.units_per_quarter
 
@@ -418,7 +418,7 @@ def _whatif_optimize(
         if coreq_split_pairs(candidate, trees) - base_coreq_split:
             continue
 
-        cand_score, cand_bd = _soft_score(candidate, diff_scores, meta)
+        cand_score, cand_bd = _soft_score(candidate, diff_scores, meta, frozenset(locked_norm))
         if cand_score < best_score:
             best, best_score, best_bd = candidate, cand_score, cand_bd
 
