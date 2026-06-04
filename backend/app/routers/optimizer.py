@@ -108,10 +108,15 @@ class GenerateRequest(BaseModel):
     waived_ges:         list[str] = []
     ap_scores:          dict[str, int] = {}  # {"AP Calculus AB": 4, "AP Statistics": 5}
     start_quarter:      str = ""   # grid's first quarter (e.g. "2026_fall"); pins the window
+    seed_courses:       list[str] = []  # current schedule + GE/Minor picks to keep in the plan
+    seed_only:          bool = False    # GE/Minor autofill: don't auto-add major requireds
 
 
 @router.post("/generate")
 def optimizer_generate(req: GenerateRequest):
+    # Seeded (additive autofill) requests are schedule-specific — bypass the
+    # shared cache so a seeded result never collides with a from-scratch one.
+    use_cache = not req.seed_courses and not req.seed_only
     cache_key = optimizer_cache.make_key(
         major_id           = req.major_id,
         completed_courses  = req.completed_courses,
@@ -122,10 +127,11 @@ def optimizer_generate(req: GenerateRequest):
         start_quarter      = req.start_quarter or None,
     )
     client = _supabase_client()
-    cached = optimizer_cache.get(client, cache_key)
-    if cached is not None:
-        cached["cached"] = True
-        return cached
+    if use_cache:
+        cached = optimizer_cache.get(client, cache_key)
+        if cached is not None:
+            cached["cached"] = True
+            return cached
 
     try:
         result = generate(
@@ -136,6 +142,8 @@ def optimizer_generate(req: GenerateRequest):
             waived_ges         = req.waived_ges,
             ap_scores          = req.ap_scores,
             start_quarter      = req.start_quarter or None,
+            seed_courses       = req.seed_courses,
+            seed_only          = req.seed_only,
         )
     except FeasibilityError as e:
         raise HTTPException(
@@ -166,7 +174,8 @@ def optimizer_generate(req: GenerateRequest):
         "choice_groups":        result.choice_groups,
         "cached":               False,
     }
-    optimizer_cache.set(client, cache_key, response)
+    if use_cache:
+        optimizer_cache.set(client, cache_key, response)
     _increment_stat("schedules_saved")  # fire-and-forget; never blocks the response
     return response
 

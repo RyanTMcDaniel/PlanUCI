@@ -42,6 +42,19 @@ interface DragData {
   quarterKey?: string;
 }
 
+// Coverage pills shown on autofilled cards that cross-cover requirements.
+// Major/Minor courses placed with no cross-cover carry no tag (clean card).
+type CoverageTag =
+  | { kind: "major" }
+  | { kind: "ge"; code: string }
+  | { kind: "minor" };
+
+// GE category code for display/labels: "GE_Vb" → "Vb", falling back to name.
+function geCode(req: ReqGroup): string {
+  const g = req.requirement_group ?? "";
+  return g.replace(/^GE[_-]?/i, "") || req.group_name;
+}
+
 interface CourseStats {
   professor: {
     name: string;
@@ -719,10 +732,39 @@ function CourseTooltip({
   );
 }
 
+// ── Coverage pills ───────────────────────────────────────────────────────────
+// Small colored tags on a placed card showing what an autofilled course covers:
+// blue = major requirement, green = GE category (with code), purple = minor.
+
+function CoverageTags({ tags }: { tags: CoverageTag[] }) {
+  if (tags.length === 0) return null;
+  return (
+    <div className="flex flex-wrap items-center gap-1 mt-1">
+      {tags.map((t, i) => {
+        const label = t.kind === "major" ? "Major" : t.kind === "minor" ? "Minor" : t.code;
+        const cls =
+          t.kind === "major"
+            ? "bg-[#3b82f6]/20 border-[#3b82f6]/40 text-[#93c5fd]"
+            : t.kind === "minor"
+            ? "bg-purple-500/20 border-purple-500/40 text-purple-300"
+            : "bg-emerald-500/20 border-emerald-500/40 text-emerald-300";
+        return (
+          <span
+            key={i}
+            className={`rounded-full border px-1.5 py-[1px] text-[8.5px] font-bold leading-none tracking-wide ${cls}`}
+          >
+            {label}
+          </span>
+        );
+      })}
+    </div>
+  );
+}
+
 // ── Placed card ────────────────────────────────────────────────────────────────
 
 function PlacedCard({
-  courseId, quarterKey, title, units, level, diffScore, gpa, isLocked, onToggleLock, onRemove,
+  courseId, quarterKey, title, units, level, diffScore, gpa, isLocked, onToggleLock, onRemove, tags,
 }: {
   courseId: string;
   quarterKey: string;
@@ -734,6 +776,7 @@ function PlacedCard({
   isLocked: boolean;
   onToggleLock: (id: string) => void;
   onRemove: (id: string, qKey: string) => void;
+  tags?: CoverageTag[];
 }) {
   const { attributes, listeners, setNodeRef, transform, isDragging } = useDraggable({
     id: `placed|${quarterKey}|${courseId}`,
@@ -768,12 +811,13 @@ function PlacedCard({
         ⠿
       </span>
 
-      {/* content — course code (larger) + name (smaller) */}
+      {/* content — course code (larger) + name (smaller) + coverage pills */}
       <div className="flex-1 min-w-0 flex flex-col justify-center gap-0.5 py-1.5">
         <p className="text-[19px] font-bold text-[#e8e8e8] leading-tight truncate">{courseId}</p>
         {title && (
           <p className="text-[12px] text-[#999] leading-snug truncate">{title}</p>
         )}
+        {tags && <CoverageTags tags={tags} />}
       </div>
 
       {/* units (top) + avg gpa (below) — right side, left of action strip */}
@@ -898,7 +942,7 @@ function QuarterCell({
   courseIds, courseInfoMap, difficultyMap, lockedCourses, onToggleLock, onRemove,
   prereqWarnings, onDismissWarning,
   removable, onRemoveQuarter,
-  maxUnitsPerQuarter,
+  maxUnitsPerQuarter, coverageTags,
 }: {
   qKey: string;
   label: string;
@@ -914,6 +958,7 @@ function QuarterCell({
   removable?: boolean;
   onRemoveQuarter?: () => void;
   maxUnitsPerQuarter?: number;
+  coverageTags: Record<string, CoverageTag[]>;
 }) {
   const { setNodeRef, isOver } = useDroppable({
     id: `zone|${qKey}`,
@@ -1003,6 +1048,7 @@ function QuarterCell({
             courseInfoMap={courseInfoMap}
             prereqWarning={prereqWarnings[cid]}
             onDismissWarning={() => onDismissWarning(cid)}
+            tags={coverageTags[cid]}
           />
         ))}
       </div>
@@ -1711,6 +1757,9 @@ export default function PlannerClient() {
   const [optimizeLoading, setOptimizeLoading] = useState(false);
   const [toast, setToast] = useState<string | null>(null);
   const [prereqWarnings, setPrereqWarnings] = useState<Record<string, string>>({});
+  // Coverage pills for cross-covering autofilled courses (ephemeral — recomputed
+  // on each autofill, auto-pruned when a course leaves the plan; not persisted).
+  const [coverageTags, setCoverageTags] = useState<Record<string, CoverageTag[]>>({});
   const [difficultyMap, setDifficultyMap] = useState<Record<string, number>>({});
   const [optimizerOnline, setOptimizerOnline] = useState<boolean | null>(null);
   const [apScores, setApScores] = useState<Record<string, number>>({});
@@ -1993,6 +2042,22 @@ export default function PlannerClient() {
       fetchDifficulties(missing);
     }).catch(() => {});
   }, [plannedCourses, fetchDifficulties]);
+
+  // ── Prune coverage pills for courses no longer in the plan ────────────────
+  // Keeps tags in sync when a course is moved out / removed manually. Tags set
+  // immediately after an autofill survive because the new plan still holds them.
+  useEffect(() => {
+    const placedNow = new Set(Object.values(plannedCourses).flat());
+    setCoverageTags((prev) => {
+      let changed = false;
+      const next: Record<string, CoverageTag[]> = {};
+      for (const [id, t] of Object.entries(prev)) {
+        if (placedNow.has(id)) next[id] = t;
+        else changed = true;
+      }
+      return changed ? next : prev;
+    });
+  }, [plannedCourses]);
 
   // ── Global course search (any course, not just requirements) ──────────────
   useEffect(() => {
@@ -2449,6 +2514,117 @@ export default function PlannerClient() {
     });
   }, []);
 
+  // ── Autofill seed selection (per tab) ──────────────────────────────────────
+  // Decides which courses an autofill click should ADD for the active tab and
+  // the coverage pills to attach. All eligibility (major/GE/minor) is in
+  // frontend state, so SELECTION happens here; the backend optimizer then does
+  // prereq-aware PLACEMENT/ordering for the combined seed.
+  //   major → seedOnly=false: backend adds the required backbone; no extra picks
+  //           and no pills (plain required courses stay clean).
+  //   ge    → fill each unmet GE category, preferring double-cover (a) an unmet
+  //           major req, then (b) another unmet GE, else (c) random eligible.
+  //   minor → pick-N groups only placed when a course also covers an unmet major
+  //           or GE (else skipped); required minor courses always placed.
+  const buildAutofillSeed = useCallback(
+    (tab: "major" | "ge" | "minor") => {
+      const tags: Record<string, CoverageTag[]> = {};
+      const seedExtra: string[] = [];
+      const chosen = new Set<string>(); // normIds added this run
+
+      const unmetMajor = new Set<string>();
+      for (const r of requirements) {
+        if (getCoverage(r).remaining > 0) r.courses.forEach((c) => unmetMajor.add(normId(c)));
+      }
+
+      const geCats = geRequirements
+        .filter((r) => !apSatisfiedGEs.has(r.requirement_group ?? ""))
+        .map((r) => ({ code: geCode(r), req: r, remaining: clientCoverage(r).remaining }))
+        .filter((c) => c.remaining > 0);
+
+      const covers = (req: ReqGroup, cid: string) => req.courses.some((x) => normId(x) === normId(cid));
+      const available = (cid: string) =>
+        !!courseInfoMap[cid] && !placedSet.has(normId(cid)) && !chosen.has(normId(cid));
+      const add = (cid: string, t: CoverageTag[]) => {
+        seedExtra.push(cid);
+        tags[cid] = t;
+        chosen.add(normId(cid));
+      };
+
+      if (tab === "ge") {
+        const needByCode = new Map(geCats.map((c) => [c.code, c.remaining]));
+        for (const cat of geCats) {
+          while ((needByCode.get(cat.code) ?? 0) > 0) {
+            const eligible = cat.req.courses.filter(available);
+            if (eligible.length === 0) break;
+            const t: CoverageTag[] = [{ kind: "ge", code: cat.code }];
+            // a) double-cover an unmet major requirement
+            let pick = eligible.find((c) => unmetMajor.has(normId(c)));
+            if (pick) {
+              t.push({ kind: "major" });
+            } else {
+              // b) cover another unmet GE category
+              pick = eligible.find((c) => geCats.some((o) => o.code !== cat.code && covers(o.req, c)));
+              if (pick) {
+                for (const o of geCats)
+                  if (o.code !== cat.code && covers(o.req, pick)) t.push({ kind: "ge", code: o.code });
+              } else {
+                // c) any eligible course, picked randomly
+                pick = eligible[Math.floor(Math.random() * eligible.length)];
+              }
+            }
+            add(pick, t);
+            needByCode.set(cat.code, (needByCode.get(cat.code) ?? 1) - 1);
+            for (const tag of t)
+              if (tag.kind === "ge" && tag.code !== cat.code) {
+                const n = needByCode.get(tag.code);
+                if (n && n > 0) needByCode.set(tag.code, n - 1);
+              }
+          }
+        }
+        return { seedExtra, tags, seedOnly: true };
+      }
+
+      if (tab === "minor") {
+        for (const req of minorRequirements) {
+          const isPickN = req.courses_needed < req.courses.length;
+          if (isPickN) {
+            const eligible = req.courses.filter(available);
+            let pick = eligible.find((c) => unmetMajor.has(normId(c)));
+            let extra: CoverageTag[] = [];
+            if (pick) {
+              extra = [{ kind: "major" }];
+            } else {
+              for (const c of eligible) {
+                const hit = geCats.find((o) => covers(o.req, c));
+                if (hit) {
+                  pick = c;
+                  extra = [{ kind: "ge", code: hit.code }];
+                  break;
+                }
+              }
+            }
+            if (pick) add(pick, [{ kind: "minor" }, ...extra]);
+            // no cross-cover → skip this pick-N group entirely
+          } else {
+            for (const c of req.courses) {
+              if (!available(c)) continue;
+              const extra: CoverageTag[] = [];
+              if (unmetMajor.has(normId(c))) extra.push({ kind: "major" });
+              const hit = geCats.find((o) => covers(o.req, c));
+              if (hit) extra.push({ kind: "ge", code: hit.code });
+              add(c, [{ kind: "minor" }, ...extra]);
+            }
+          }
+        }
+        return { seedExtra, tags, seedOnly: true };
+      }
+
+      // major tab: keep the current schedule; backend fills the required backbone.
+      return { seedExtra, tags, seedOnly: false };
+    },
+    [requirements, geRequirements, minorRequirements, placedSet, getCoverage, clientCoverage, apSatisfiedGEs, courseInfoMap],
+  );
+
   const toggleSummer = useCallback((year: number) => {
     setSummerYears((prev) => {
       const next = new Set(prev);
@@ -2840,104 +3016,63 @@ export default function PlannerClient() {
               </div>
             )}
             <button
-              disabled={!selectedMajorId || autoFillLoading}
+              disabled={!selectedMajorId || autoFillLoading || (sidebarTab === "minor" && !selectedMinorId)}
               onClick={async () => {
                 if (!selectedMajorId || autoFillLoading) return;
+                if (sidebarTab === "minor" && !selectedMinorId) return;
                 setAutoFillLoading(true);
                 setToast(null);
                 try {
-                  // Build locked course→quarter map from the current plan
-                  const lockedMap: Record<string, string> = {};
-                  for (const [quarter, courses] of Object.entries(plannedCourses)) {
-                    for (const cid of courses) {
-                      if (lockedCourses.has(cid)) lockedMap[cid] = quarter;
-                    }
-                  }
-                  const hasLocks = Object.keys(lockedMap).length > 0;
+                  // Frontend selects WHAT to add for the active tab; the backend
+                  // optimizer places/orders the combined seed (current schedule +
+                  // picks), free to reorder for prereqs/difficulty but never
+                  // dropping a placed course (additive — no wipe).
+                  const { seedExtra, tags, seedOnly } = buildAutofillSeed(sidebarTab);
+                  const currentCourses = Object.values(plannedCourses).flat();
+                  const seed_courses = [...currentCourses, ...seedExtra];
 
-                  const res = await fetch(hasLocks ? "/api/whatif" : "/api/optimizer", {
+                  const res = await fetch("/api/optimizer", {
                     method: "POST",
                     headers: { "Content-Type": "application/json" },
-                    body: hasLocks
-                      ? JSON.stringify({
-                          plan: {
-                            major_id: selectedMajorId,
-                            completed_courses: [],
-                            planned_courses: plannedCourses,
-                            graduation_year: parseInt(gradQuarter.split("_")[0]),
-                            units_per_quarter: maxUnits,
-                          },
-                          locked_courses: lockedMap,
-                          major_id: selectedMajorId,
-                          graduation_quarter: gradQuarter,
-                          units_per_quarter: maxUnits,
-                          waived_ges: [],
-                          ap_scores: apScores,
-                        })
-                      : JSON.stringify({
-                          major_id: selectedMajorId,
-                          completed_courses: [],
-                          graduation_quarter: gradQuarter,
-                          units_per_quarter: maxUnits,
-                          waived_ges: [],
-                          ap_scores: apScores,
-                          // Pin the optimizer window to the grid's first (Fall)
-                          // quarter so it never schedules into off-grid quarters.
-                          start_quarter: qkey(1, "fall"),
-                        }),
+                    body: JSON.stringify({
+                      major_id: selectedMajorId,
+                      completed_courses: [],
+                      graduation_quarter: gradQuarter,
+                      units_per_quarter: maxUnits,
+                      waived_ges: [],
+                      ap_scores: apScores,
+                      // Pin the optimizer window to the grid's first (Fall) quarter
+                      // so it never schedules into off-grid quarters.
+                      start_quarter: qkey(1, "fall"),
+                      seed_courses,
+                      seed_only: seedOnly,
+                    }),
                   });
                   const data = await res.json();
                   if (!res.ok) {
-                    if (
-                      data?.detail?.error === "lock_conflict" &&
-                      Array.isArray(data.detail.conflicts) &&
-                      data.detail.conflicts.length > 0
-                    ) {
-                      setLockConflictErrors(data.detail.conflicts as string[]);
-                    } else {
-                      const msg =
-                        typeof data?.detail === "object"
-                          ? (data.detail.message ?? JSON.stringify(data.detail))
-                          : (data?.detail ?? data?.error ?? "Optimizer error");
-                      setToast(String(msg));
-                    }
+                    const msg =
+                      typeof data?.detail === "object"
+                        ? (data.detail.message ?? JSON.stringify(data.detail))
+                        : (data?.detail ?? data?.error ?? "Optimizer error");
+                    setToast(String(msg));
                   } else {
                     setLockConflictErrors(null);
-                    if (hasLocks) {
-                      // optimize_around_locks: { status, plans | conflicts }
-                      if (data?.status === "infeasible") {
-                        const reasons: string[] = Array.isArray(data.conflicts)
-                          ? data.conflicts.map(
-                              (c: { reason?: string }) => c?.reason ?? String(c),
-                            )
-                          : [];
-                        setToast(
-                          reasons.length
-                            ? `Can't rebalance with these locks — ${reasons.join(" · ")}`
-                            : "Can't rebalance with these locked courses.",
-                        );
-                      } else {
-                        const plan = data?.plans?.[0]?.planned_courses as
-                          | PlannedCourses
-                          | undefined;
-                        if (plan) {
-                          setPlannedCourses(plan);
-                          validatePlan(plan);
-                        } else {
-                          setToast("No plan returned from optimizer");
-                        }
-                      }
+                    const plan = data?.variants?.[0]?.planned_courses as
+                      | PlannedCourses
+                      | undefined;
+                    if (plan) {
+                      setPlannedCourses(plan);
+                      validatePlan(plan);
+                      // Attach coverage pills for courses present in the result.
+                      const placedNow = new Set(Object.values(plan).flat());
+                      setCoverageTags((prev) => {
+                        const merged: Record<string, CoverageTag[]> = { ...prev, ...tags };
+                        const next: Record<string, CoverageTag[]> = {};
+                        for (const [id, t] of Object.entries(merged)) if (placedNow.has(id)) next[id] = t;
+                        return next;
+                      });
                     } else {
-                      // generate(): { variants: [...] }
-                      const plan = data?.variants?.[0]?.planned_courses as
-                        | PlannedCourses
-                        | undefined;
-                      if (plan) {
-                        setPlannedCourses(plan);
-                        validatePlan(plan);
-                      } else {
-                        setToast("No plan returned from optimizer");
-                      }
+                      setToast("No plan returned from optimizer");
                     }
                   }
                 } catch (err) {
@@ -2947,7 +3082,7 @@ export default function PlannerClient() {
                 }
               }}
               className={`w-full flex items-center justify-center gap-2 rounded py-2.5 text-[11px] font-bold tracking-wide transition-all
-                ${selectedMajorId && !autoFillLoading
+                ${selectedMajorId && !autoFillLoading && !(sidebarTab === "minor" && !selectedMinorId)
                   ? "bg-[#3b82f6] hover:bg-[#2563eb] text-white"
                   : "bg-[#1a1a1a] text-[#3a3a3a] cursor-not-allowed"}`}
             >
@@ -2959,7 +3094,14 @@ export default function PlannerClient() {
                   Generating…
                 </>
               ) : (
-                <><span>✦</span> Auto-fill Plan</>
+                <>
+                  <span>✦</span>{" "}
+                  {sidebarTab === "ge"
+                    ? "Auto-fill GE Requirements"
+                    : sidebarTab === "minor"
+                    ? "Auto-fill Minor Requirements"
+                    : "Auto-fill Major Requirements"}
+                </>
               )}
             </button>
 
@@ -3286,6 +3428,7 @@ export default function PlannerClient() {
                             prereqWarnings={prereqWarnings}
                             onDismissWarning={dismissWarning}
                             maxUnitsPerQuarter={maxUnits}
+                            coverageTags={coverageTags}
                           />
                         );
                       })}
@@ -3300,6 +3443,7 @@ export default function PlannerClient() {
                           onRemove={removeCourse}
                           prereqWarnings={prereqWarnings}
                           onDismissWarning={dismissWarning}
+                          coverageTags={coverageTags}
                           removable onRemoveQuarter={() => toggleSummer(year)}
                           maxUnitsPerQuarter={maxUnits}
                         />

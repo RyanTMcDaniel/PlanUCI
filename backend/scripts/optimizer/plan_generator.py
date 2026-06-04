@@ -1381,6 +1381,8 @@ def generate(
     specialization_id: str | None = None,
     ap_scores: dict[str, int] | None = None,
     start_quarter: str | None = None,
+    seed_courses: list[str] | None = None,
+    seed_only: bool = False,
 ) -> GenerationResult:
     """Generate up to 3 optimized plan variants for a major.
 
@@ -1388,6 +1390,17 @@ def generate(
     ----------
     waived_ges : list of requirement_group codes (e.g. ["GE_VI"]) to skip.
                  Only groups marked waivable=True in the DB are skippable.
+    seed_courses : extra course IDs that MUST appear in the plan in addition to
+                 the major's required courses — e.g. the user's current schedule
+                 plus any GE/Minor picks chosen on the frontend.  They are merged
+                 into the course set (deduped, minus completed/AP); the scheduler
+                 is free to reorder them for prereqs / difficulty balance, but
+                 never drops them.  This is what makes autofill additive instead
+                 of wiping the existing schedule.
+    seed_only :  when True, the major's required courses are NOT auto-added — the
+                 plan is built from seed_courses (+ their implicit prereqs) only.
+                 Used by GE/Minor autofill so clicking "Auto-fill GE" doesn't also
+                 pull in every remaining major requirement.
 
     Returns
     -------
@@ -1411,6 +1424,23 @@ def generate(
         client, major_id, completed_norm, waived_ges, specialization_id, ap_scores
     )
     group_map: dict[str, list[str]] = {}  # no auto-picked choices in the seed
+
+    # seed_only (GE/Minor autofill): drop the required-course backbone so the plan
+    # is built from the caller's seed (+ implicit prereqs) alone.
+    if seed_only:
+        courses_to_plan = []
+
+    # Merge caller-supplied seed courses (current schedule + GE/Minor picks).
+    # courses_to_plan holds RAW ids deduped via _norm — match that here so a
+    # seeded course already present as a required course isn't duplicated.
+    if seed_courses:
+        seen = {_norm(c) for c in courses_to_plan}
+        for c in seed_courses:
+            nc = _norm(c)
+            if nc and nc not in seen and nc not in completed_norm:
+                courses_to_plan.append(c)
+                seen.add(nc)
+
     if not courses_to_plan:
         return GenerationResult(variants=[], choice_groups=choice_groups)
 
