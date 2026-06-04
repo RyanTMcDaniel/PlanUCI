@@ -66,7 +66,10 @@ CREATE TABLE IF NOT EXISTS public.app_stats (
 INSERT INTO public.app_stats (key, value) VALUES ('schedules_saved', 0)
 ON CONFLICT (key) DO NOTHING;
 
--- No RLS policy → only the service role can read/write (anon has no access).
+-- RLS on with NO policies → anon/authenticated have zero access; only the
+-- service role (which bypasses RLS) can read/write. Both the optimizer backend
+-- and /api/stats use SUPABASE_SERVICE_KEY, so they keep working.
+ALTER TABLE public.app_stats ENABLE ROW LEVEL SECURITY;
 
 -- Atomic counter bump, called fire-and-forget from the optimizer backend.
 CREATE OR REPLACE FUNCTION public.increment_stat(stat_key TEXT)
@@ -83,3 +86,10 @@ CREATE OR REPLACE FUNCTION public.get_total_users()
 RETURNS BIGINT AS $$
   SELECT COUNT(*) FROM auth.users;
 $$ LANGUAGE sql SECURITY DEFINER;
+
+-- Lock both RPCs to the service role: functions default to EXECUTE for PUBLIC,
+-- which would let anon bump the counter or read the user count over the API.
+REVOKE EXECUTE ON FUNCTION public.increment_stat(TEXT)  FROM PUBLIC, anon, authenticated;
+REVOKE EXECUTE ON FUNCTION public.get_total_users()     FROM PUBLIC, anon, authenticated;
+GRANT  EXECUTE ON FUNCTION public.increment_stat(TEXT)  TO service_role;
+GRANT  EXECUTE ON FUNCTION public.get_total_users()     TO service_role;
