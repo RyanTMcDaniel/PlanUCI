@@ -2934,6 +2934,81 @@ export default function PlannerClient() {
         }
       }
 
+      // (d.2) OR-gated prereq pullback. Strict (AND) prereqs are floored, but
+      // OR-gated prereqs (e.g. MATH 1B → MATH2A, BIO SCI 93 → BIOSCI94) carry no
+      // floor (FIX A), so an injected one can land in the same/later quarter than
+      // its dependent. Real, OR-aware check (requiredMissingCourses): a course's
+      // tree is satisfied if any OR option sits in an EARLIER quarter (or AP / a
+      // same-quarter coreq partner). When a representative prereq is found in the
+      // same/later quarter, move the prereq EARLIER — to the latest under-cap
+      // quarter before the dependent that is still after the prereq's OWN
+      // prerequisites (the guard that prevents pulling a course back past its own
+      // chain and oscillating). If no such slot exists, nudge the dependent one
+      // slot later instead. One fix per pass, then rescan; capped at 20 passes.
+      const haveBefore = (qi: number): Set<string> => {
+        const h = new Set<string>(apNorm);
+        for (let i = 0; i < qi; i++) for (const id of planned_courses[quarters[i]]) h.add(normId(id));
+        return h;
+      };
+      let pullSafety = 0;
+      let pullChanged = true;
+      while (pullChanged && pullSafety++ < 20) {
+        pullChanged = false;
+        const placedAt = new Map<string, number>();
+        for (let i = 0; i < quarters.length; i++)
+          for (const id of planned_courses[quarters[i]]) placedAt.set(normId(id), i);
+
+        outer:
+        for (let qi = 0; qi < quarters.length; qi++) {
+          for (const x of [...planned_courses[quarters[qi]]]) {
+            const tree = trees[x] ?? trees[normId(x)];
+            if (!tree) continue;
+            // have = AP + everything strictly before qi + x's same-quarter coreqs.
+            const have = haveBefore(qi);
+            const xCoreqs = new Set(coreqPartnersInPool(x).map(normId));
+            for (const id of planned_courses[quarters[qi]]) if (xCoreqs.has(normId(id))) have.add(normId(id));
+
+            for (const m of requiredMissingCourses(tree, have)) {
+              const mn = normId(m);
+              const pj = placedAt.get(mn);
+              if (pj == null || pj < qi) continue;            // not placed / already earlier
+              const prereq = pool.find((c) => normId(c) === mn);
+              if (!prereq) continue;
+              const pu = unitsOf(prereq);
+              const ptree = trees[prereq] ?? trees[normId(prereq)];
+              // Latest under-cap quarter < qi where the prereq is itself valid
+              // (its own prereqs satisfied by still-earlier quarters).
+              let dest = -1;
+              for (let i = qi - 1; i >= 0; i--) {
+                if (quarterUnits[i] + pu > maxUnits) continue;
+                if (ptree && requiredMissingCourses(ptree, haveBefore(i)).length > 0) continue;
+                dest = i;
+                break;
+              }
+              if (dest >= 0) {
+                planned_courses[quarters[pj]] = planned_courses[quarters[pj]].filter((c) => c !== prereq);
+                quarterUnits[pj] -= pu;
+                planned_courses[quarters[dest]].push(prereq);
+                quarterUnits[dest] += pu;
+                assignedIdx.set(mn, dest);
+              } else if (qi + 1 < quarters.length) {
+                // No valid room before the dependent — nudge the dependent later.
+                const xu = unitsOf(x);
+                planned_courses[quarters[qi]] = planned_courses[quarters[qi]].filter((c) => c !== x);
+                quarterUnits[qi] -= xu;
+                planned_courses[quarters[qi + 1]].push(x);
+                quarterUnits[qi + 1] += xu;
+                assignedIdx.set(normId(x), qi + 1);
+              } else {
+                continue; // dependent already in the last quarter — can't fix in this grid
+              }
+              pullChanged = true;
+              break outer; // placement changed — restart the scan from a clean state
+            }
+          }
+        }
+      }
+
       // (e) send to /api/whatif — same shape as the Optimize Schedule button.
       const res = await fetch("/api/whatif", {
         method: "POST",
