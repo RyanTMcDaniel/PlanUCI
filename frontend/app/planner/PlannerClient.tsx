@@ -50,10 +50,73 @@ type CoverageTag =
   | { kind: "ge"; code: string }
   | { kind: "minor" };
 
-// GE category code for display/labels: "GE_Vb" → "Vb", falling back to name.
+// Clean UCI GE codes keyed by the DB's requirement_group, so pills read "Ia"
+// instead of "I_WRITING_LD" / "V_THIRD".
+const GE_CODE_LABELS: Record<string, string> = {
+  GE_I_WRITING_LD: "Ia",
+  GE_I_WRITING_UD: "Ib",
+  GE_II: "II",
+  GE_III: "III",
+  GE_IV: "IV",
+  GE_Va: "Va",
+  GE_Vb: "Vb",
+  GE_V_THIRD: "V",
+  GE_VI: "VI",
+  GE_VII: "VII",
+  GE_VIII: "VIII",
+};
+
+// GE category code for display/labels: maps via GE_CODE_LABELS, falling back to
+// the requirement_group with the "GE_" prefix stripped.
 function geCode(req: ReqGroup): string {
   const g = req.requirement_group ?? "";
-  return g.replace(/^GE[_-]?/i, "") || req.group_name;
+  return GE_CODE_LABELS[g] ?? (g.replace(/^GE[_-]?/i, "") || req.group_name);
+}
+
+// ge_list token (e.g. "III", "Va") → requirement_group. The authoritative GE
+// taxonomy: a course satisfies a category iff its ge_list says so.
+const GE_TOKEN_TO_GROUP: Record<string, string> = {
+  Ia: "GE_I_WRITING_LD",
+  Ib: "GE_I_WRITING_UD",
+  II: "GE_II",
+  III: "GE_III",
+  IV: "GE_IV",
+  Va: "GE_Va",
+  Vb: "GE_Vb",
+  VI: "GE_VI",
+  VII: "GE_VII",
+  VIII: "GE_VIII",
+};
+// Canonical category order for tie-breaks.
+const GE_ORDER: Record<string, number> = {
+  GE_I_WRITING_LD: 0, GE_I_WRITING_UD: 1, GE_II: 2, GE_III: 3, GE_IV: 4,
+  GE_Va: 5, GE_Vb: 6, GE_V_THIRD: 7, GE_VI: 8, GE_VII: 9, GE_VIII: 10,
+};
+// clean code ("III", "V", "Ia") → requirement_group (inverse of GE_CODE_LABELS).
+const GE_LABEL_TO_GROUP: Record<string, string> = Object.fromEntries(
+  Object.entries(GE_CODE_LABELS).map(([g, label]) => [label, g]),
+);
+
+// Authoritative GE coverage for a course, derived ONLY from its ge_list (never
+// array membership). Returns requirement_group codes that also appear in the
+// passed geRequirements (so already-filled / not-needed categories are skipped
+// when the caller passes the unfilled subset). GE_V_THIRD is satisfied by any
+// "GE Va:" / "GE Vb:" course since it has no token of its own.
+function getCourseGECategories(course: CourseDetail | undefined, geRequirements: ReqGroup[]): string[] {
+  if (!course?.ge_list?.length) return [];
+  const present = new Set(geRequirements.map((r) => r.requirement_group ?? "").filter(Boolean));
+  const tokens = new Set<string>();
+  for (const s of course.ge_list) {
+    const m = /^GE\s+([A-Za-z]+)\s*:/.exec(s);
+    if (m) tokens.add(m[1]);
+  }
+  const out = new Set<string>();
+  for (const tok of tokens) {
+    const g = GE_TOKEN_TO_GROUP[tok];
+    if (g && present.has(g)) out.add(g);
+  }
+  if ((tokens.has("Va") || tokens.has("Vb")) && present.has("GE_V_THIRD")) out.add("GE_V_THIRD");
+  return [...out].sort((a, b) => (GE_ORDER[a] ?? 99) - (GE_ORDER[b] ?? 99));
 }
 
 // ── Prerequisite-tree evaluation (mirrors backend hard_constraints._eval_tree) ──
@@ -98,15 +161,16 @@ function offeredSeasons(terms: string[] | null | undefined): Set<string> {
   return s;
 }
 
-// Place selected courses into the EARLIEST prereq-valid, offered, open quarter
-// without moving anything already in the plan. Pass 0 respects the unit cap;
-// pass 1 allows overload so a valid course is never left unplaced for capacity
-// alone. Returns the new plan plus which picks landed.
+// Place selected courses without moving anything already in the plan. For each
+// course, collect every prereq-valid, offered quarter, then pick the one with
+// the LOWEST current difficulty to spread load (preferring quarters under the
+// unit cap; tie → earliest). Iterates so intra-batch prereq chains resolve.
 function placeSelectedCourses(
   plan: PlannedCourses,
   picks: string[],
   trees: Record<string, unknown>,
   info: Record<string, CourseDetail>,
+  diffMap: Record<string, number>,
   apNorm: Set<string>,
   quarters: string[],
   maxUnits: number,
@@ -126,26 +190,32 @@ function placeSelectedCourses(
       const tree = trees[cid] ?? trees[normId(cid)];
       const seasons = offeredSeasons(info[cid]?.terms);
       const units = info[cid]?.min_units ?? 4;
-      let landed = false;
 
-      for (let pass = 0; pass < 2 && !landed; pass++) {
-        for (let i = 0; i < quarters.length; i++) {
-          const q = quarters[i];
-          if (seasons.size && !seasons.has(seasonOf(q))) continue;
-          const available = new Set(apNorm);
-          for (let j = 0; j < i; j++) for (const x of next[quarters[j]] ?? []) available.add(normId(x));
-          const sameQ = new Set((next[q] ?? []).map(normId));
-          if (!evalPrereqTree(tree, available, sameQ)) continue;
-          const qUnits = (next[q] ?? []).reduce((s, x) => s + (info[x]?.min_units ?? 4), 0);
-          if (pass === 0 && qUnits + units > maxUnits) continue;
-          next[q] = [...(next[q] ?? []), cid];
-          placed.push(cid);
-          landed = true;
-          progress = true;
-          break;
-        }
+      const cands: { q: string; withinCap: boolean; diff: number; idx: number }[] = [];
+      for (let i = 0; i < quarters.length; i++) {
+        const q = quarters[i];
+        if (seasons.size && !seasons.has(seasonOf(q))) continue;
+        const available = new Set(apNorm);
+        for (let j = 0; j < i; j++) for (const x of next[quarters[j]] ?? []) available.add(normId(x));
+        const sameQ = new Set((next[q] ?? []).map(normId));
+        if (!evalPrereqTree(tree, available, sameQ)) continue;
+        const ids = next[q] ?? [];
+        const qUnits = ids.reduce((s, x) => s + (info[x]?.min_units ?? 4), 0);
+        const d = calculateQuarterDifficulty(
+          ids.map((x) => ({ difficulty_score: diffMap[x] ?? null, units: info[x]?.min_units ?? null })),
+        );
+        cands.push({ q, withinCap: qUnits + units <= maxUnits, diff: d?.combined ?? 0, idx: i });
       }
-      if (!landed) still.push(cid);
+      if (cands.length === 0) {
+        still.push(cid);
+        continue;
+      }
+      const pool = cands.some((c) => c.withinCap) ? cands.filter((c) => c.withinCap) : cands;
+      pool.sort((a, b) => a.diff - b.diff || a.idx - b.idx);
+      const best = pool[0].q;
+      next[best] = [...(next[best] ?? []), cid];
+      placed.push(cid);
+      progress = true;
     }
     remaining = still;
   }
@@ -2169,7 +2239,7 @@ export default function PlannerClient() {
         const qNorm = q.replace(/\s+/g, "").toUpperCase();
         const { data } = await supabase
           .from("courses")
-          .select("id, title, min_units, description, course_level, terms, avg_gpa")
+          .select("id, title, min_units, description, course_level, terms, avg_gpa, ge_list")
           .or(`id.ilike.${qNorm}%,title.ilike.%${q}%`)
           .limit(20);
         const results = (data ?? []) as CourseDetail[];
@@ -2726,6 +2796,251 @@ export default function PlannerClient() {
     [requirements, geRequirements, minorRequirements, placedSet, getCoverage, clientCoverage, apSatisfiedGEs, courseInfoMap],
   );
 
+  // GE categories an ALREADY-PLACED course counts toward. Autofilled cards keep
+  // their (capped) GE pills as the source of truth; everything else falls back
+  // to authoritative ge_list. Keeps the "filled" tally consistent with pills.
+  const placedGECats = useCallback(
+    (id: string, groups: ReqGroup[]): string[] => {
+      const t = coverageTags[id];
+      if (t && t.some((x) => x.kind === "ge")) {
+        return t
+          .filter((x): x is Extract<CoverageTag, { kind: "ge" }> => x.kind === "ge")
+          .map((x) => GE_LABEL_TO_GROUP[x.code] ?? "")
+          .filter((g) => g && groups.some((r) => (r.requirement_group ?? "") === g));
+      }
+      return getCourseGECategories(courseInfoMapRef.current[id], groups);
+    },
+    [coverageTags],
+  );
+
+  // ── Shared local placement for GE/Minor autofill ───────────────────────────
+  // Fetches prereq trees + any missing course details, then places `picks` into
+  // the lowest-difficulty valid quarter (never the optimizer, never moving
+  // existing courses) and applies the coverage pills. Defined before the
+  // handlers that depend on it.
+  const runLocalPlacement = useCallback(
+    async (picks: string[], tags: Record<string, CoverageTag[]>, tab: "ge" | "minor") => {
+      if (picks.length === 0) {
+        setToast(
+          tab === "ge"
+            ? "Nothing to add — GE categories are filled or have no eligible courses left."
+            : "Nothing to add — required minor courses are placed and no pick-N group cross-covers.",
+        );
+        return;
+      }
+      const trees = await fetchPrereqTrees(picks);
+      let infoNow = courseInfoMapRef.current;
+      const missing = picks.filter((id) => !infoNow[id]);
+      if (missing.length) {
+        const details = await fetchCourseDetails(missing);
+        if (details.length) {
+          setCourseInfoMap((prev) => {
+            const n = { ...prev };
+            for (const c of details) n[c.id] = c;
+            return n;
+          });
+          const merged = { ...courseInfoMapRef.current };
+          for (const c of details) merged[c.id] = c;
+          infoNow = merged;
+          fetchDifficulties(missing);
+        }
+      }
+      const quarters: string[] = [];
+      for (let y = 1; y <= numYears; y++) {
+        for (const s of ["fall", "winter", "spring"]) quarters.push(qkey(y, s));
+        if (summerYears.has(y)) quarters.push(qkey(y, "summer"));
+      }
+      const apNorm = new Set([...apCreditedSet].map(normId));
+      const { plan, placed, unplaced } = placeSelectedCourses(
+        plannedCourses, picks, trees, infoNow, difficultyMap, apNorm, quarters, maxUnits,
+      );
+      setPlannedCourses(plan);
+      validatePlan(plan);
+      const inPlan = new Set(Object.values(plan).flat());
+      setCoverageTags((prev) => {
+        const next: Record<string, CoverageTag[]> = { ...prev };
+        for (const id of placed) next[id] = tags[id] ?? next[id];
+        for (const k of Object.keys(next)) if (!inPlan.has(k)) delete next[k];
+        return next;
+      });
+      if (unplaced.length) {
+        setToast(
+          `Couldn't place ${unplaced.length} course(s) within their offering terms/prereqs: ` +
+            `${unplaced.slice(0, 3).join(", ")}${unplaced.length > 3 ? "…" : ""}`,
+        );
+      }
+    },
+    [plannedCourses, numYears, summerYears, apCreditedSet, difficultyMap, maxUnits, validatePlan, fetchDifficulties],
+  );
+
+  // ── GE autofill (no optimizer) ─────────────────────────────────────────────
+  // Coverage is authoritative (ge_list via getCourseGECategories) — NEVER array
+  // membership. Array membership only supplies the candidate POOL per category.
+  const handleGEAutofill = useCallback(async () => {
+    const info = courseInfoMapRef.current;
+    const allGroups = geRequirements.filter((r) => !apSatisfiedGEs.has(r.requirement_group ?? ""));
+    const keyOf = (r: ReqGroup) => r.requirement_group ?? r.group_name;
+    const groupByKey = new Map(allGroups.map((g) => [keyOf(g), g] as const));
+
+    // need = remaining slots per group, decremented by what's authoritatively placed.
+    const need = new Map<string, number>();
+    for (const g of allGroups) need.set(keyOf(g), g.courses_needed ?? 1);
+    for (const ids of Object.values(plannedCourses))
+      for (const id of ids)
+        for (const cat of placedGECats(id, allGroups)) {
+          const n = need.get(cat);
+          if (n != null) need.set(cat, n - 1);
+        }
+    for (const [k, v] of [...need]) if (v <= 0) need.delete(k); // keep only unfilled
+
+    const unmetMajor = new Set<string>();
+    for (const r of requirements) if (getCoverage(r).remaining > 0) r.courses.forEach((c) => unmetMajor.add(normId(c)));
+
+    const placedIds = new Set(Object.values(plannedCourses).flat().map(normId));
+    const picks: string[] = [];
+    const tags: Record<string, CoverageTag[]> = {};
+    const chosen = new Set<string>();
+    const available = (cid: string) => !!info[cid] && !placedIds.has(normId(cid)) && !chosen.has(normId(cid));
+
+    let guard = 0;
+    while (need.size > 0 && guard++ < 300) {
+      const unfilled = allGroups.filter((g) => (need.get(keyOf(g)) ?? 0) > 0);
+      const key = [...need.keys()].sort((a, b) => (GE_ORDER[a] ?? 99) - (GE_ORDER[b] ?? 99))[0];
+      const g = groupByKey.get(key);
+      if (!g) { need.delete(key); continue; }
+
+      // Pool from array membership; coverage filter is authoritative.
+      const candidates = g.courses.filter((c) => available(c) && getCourseGECategories(info[c], unfilled).includes(key));
+      if (candidates.length === 0) { need.delete(key); continue; }
+
+      // Scarcity: how many other available courses authoritatively cover each unfilled cat.
+      const universe = [...new Set(unfilled.flatMap((x) => x.courses))].filter(available);
+      const catsOf = new Map<string, string[]>();
+      for (const c of universe) catsOf.set(c, getCourseGECategories(info[c], unfilled));
+      const eligibleCount = new Map<string, number>();
+      for (const c of universe) for (const cat of catsOf.get(c)!) eligibleCount.set(cat, (eligibleCount.get(cat) ?? 0) + 1);
+      const scarcity = (cat: string) => {
+        const others = (eligibleCount.get(cat) ?? 0) - 1; // exclude the course itself
+        return others <= 0 ? Infinity : 1 / others;
+      };
+      // Cap a course's covered-unfilled categories to 2 by scarcity (tie: order).
+      const capTo2 = (cats: string[]) =>
+        cats.length <= 2
+          ? cats
+          : [...cats].sort((a, b) => scarcity(b) - scarcity(a) || (GE_ORDER[a] ?? 99) - (GE_ORDER[b] ?? 99)).slice(0, 2);
+
+      let bestScore = -1;
+      let best: { c: string; capped: string[] }[] = [];
+      let fallback: string | null = null;
+      for (const c of candidates) {
+        if (!fallback) fallback = c;
+        const capped = capTo2(catsOf.get(c) ?? getCourseGECategories(info[c], unfilled));
+        if (!capped.includes(key)) continue; // this course is better spent on scarcer cats
+        let score = capped.length >= 2 ? 3 : 2;
+        if (unmetMajor.has(normId(c))) score += 1;
+        if (score > bestScore) { bestScore = score; best = [{ c, capped }]; }
+        else if (score === bestScore) best.push({ c, capped });
+      }
+
+      let pick: string;
+      let capped: string[];
+      if (best.length) {
+        const ch = best[Math.floor(Math.random() * best.length)];
+        pick = ch.c;
+        capped = ch.capped;
+      } else {
+        pick = fallback!; // none kept `key` in its cap → credit this one to `key` only
+        capped = [key];
+      }
+
+      const t: CoverageTag[] = capped.map((cat) => ({ kind: "ge", code: GE_CODE_LABELS[cat] ?? cat }));
+      if (unmetMajor.has(normId(pick))) t.push({ kind: "major" });
+      picks.push(pick);
+      tags[pick] = t;
+      chosen.add(normId(pick));
+      for (const cat of capped) {
+        const n = need.get(cat);
+        if (n != null) {
+          if (n - 1 <= 0) need.delete(cat);
+          else need.set(cat, n - 1);
+        }
+      }
+    }
+    await runLocalPlacement(picks, tags, "ge");
+  }, [plannedCourses, geRequirements, apSatisfiedGEs, requirements, getCoverage, placedGECats, runLocalPlacement]);
+
+  // ── Minor autofill (no optimizer) ──────────────────────────────────────────
+  const handleMinorAutofill = useCallback(async () => {
+    const info = courseInfoMapRef.current;
+    const placedIds = new Set(Object.values(plannedCourses).flat().map(normId));
+    const geGroups = geRequirements.filter((r) => !apSatisfiedGEs.has(r.requirement_group ?? ""));
+    const keyOf = (r: ReqGroup) => r.requirement_group ?? r.group_name;
+
+    // Unfilled GE groups, authoritative (ge_list) — never array membership.
+    const geNeed = new Map<string, number>();
+    for (const g of geGroups) geNeed.set(keyOf(g), g.courses_needed ?? 1);
+    for (const ids of Object.values(plannedCourses))
+      for (const id of ids)
+        for (const cat of placedGECats(id, geGroups)) {
+          const n = geNeed.get(cat);
+          if (n != null) geNeed.set(cat, n - 1);
+        }
+    const geUnfilled = geGroups.filter((g) => (geNeed.get(keyOf(g)) ?? 0) > 0);
+
+    const unmetMajor = new Set<string>();
+    for (const r of requirements) if (getCoverage(r).remaining > 0) r.courses.forEach((c) => unmetMajor.add(normId(c)));
+
+    // GE categories this course authoritatively covers among still-unfilled
+    // groups, capped at 2 (canonical order) to match the GE-autofill cap.
+    const geCoveredUnfilled = (cid: string) => getCourseGECategories(info[cid], geUnfilled).slice(0, 2);
+
+    const picks: string[] = [];
+    const tags: Record<string, CoverageTag[]> = {};
+    const chosen = new Set<string>();
+
+    const avail = (cid: string) => !!info[cid] && !placedIds.has(normId(cid)) && !chosen.has(normId(cid));
+    const tagFor = (cid: string): CoverageTag[] => {
+      const t: CoverageTag[] = [{ kind: "minor" }];
+      for (const cat of geCoveredUnfilled(cid)) t.push({ kind: "ge", code: GE_CODE_LABELS[cat] ?? cat });
+      if (unmetMajor.has(normId(cid))) t.push({ kind: "major" });
+      return t;
+    };
+
+    for (const req of minorRequirements) {
+      const isPickN = req.courses_needed < req.courses.length;
+      if (!isPickN) {
+        // Required course(s): always place if not already on the schedule.
+        for (const c of req.courses) {
+          if (!avail(c)) continue;
+          picks.push(c);
+          tags[c] = tagFor(c);
+          chosen.add(normId(c));
+        }
+      } else {
+        // Pick-N: only place a candidate that cross-covers an unfilled GE / unmet major.
+        let bestScore = 0;
+        let best: string[] = [];
+        for (const c of req.courses.filter(avail)) {
+          let score = 0;
+          if (geCoveredUnfilled(c).length > 0) score += 2;
+          if (unmetMajor.has(normId(c))) score += 1;
+          if (score > bestScore) {
+            bestScore = score;
+            best = [c];
+          } else if (score === bestScore && score > 0) best.push(c);
+        }
+        if (bestScore > 0 && best.length) {
+          const pick = best[Math.floor(Math.random() * best.length)];
+          picks.push(pick);
+          tags[pick] = tagFor(pick);
+          chosen.add(normId(pick));
+        }
+        // else: no cross-cover → skip this group entirely.
+      }
+    }
+    await runLocalPlacement(picks, tags, "minor");
+  }, [plannedCourses, geRequirements, apSatisfiedGEs, minorRequirements, requirements, getCoverage, placedGECats, runLocalPlacement]);
+
   const toggleSummer = useCallback((year: number) => {
     setSummerYears((prev) => {
       const next = new Set(prev);
@@ -3124,63 +3439,10 @@ export default function PlannerClient() {
                 setAutoFillLoading(true);
                 setToast(null);
                 try {
-                  if (sidebarTab === "ge" || sidebarTab === "minor") {
-                    // GE / Minor: place LOCALLY — never the major optimizer.
-                    // Selection comes from the in-state requirement course lists;
-                    // placement uses prereq trees pulled from Supabase + offering
-                    // terms, and never moves an already-placed course.
-                    const { seedExtra, tags } = buildAutofillSeed(sidebarTab);
-                    if (seedExtra.length === 0) {
-                      setToast(
-                        sidebarTab === "ge"
-                          ? "Nothing to add — GE categories are filled or have no eligible courses left."
-                          : "Nothing to add — required minor courses are placed and no pick-N group cross-covers.",
-                      );
-                    } else {
-                      const trees = await fetchPrereqTrees(seedExtra);
-                      // Ensure picks have course details (terms/units) for placement.
-                      let infoNow = courseInfoMapRef.current;
-                      const missing = seedExtra.filter((id) => !infoNow[id]);
-                      if (missing.length) {
-                        const details = await fetchCourseDetails(missing);
-                        if (details.length) {
-                          setCourseInfoMap((prev) => {
-                            const n = { ...prev };
-                            for (const c of details) n[c.id] = c;
-                            return n;
-                          });
-                          const merged = { ...courseInfoMapRef.current };
-                          for (const c of details) merged[c.id] = c;
-                          infoNow = merged;
-                          fetchDifficulties(missing);
-                        }
-                      }
-                      // Ordered visible quarter grid (chronological).
-                      const quarters: string[] = [];
-                      for (let y = 1; y <= numYears; y++) {
-                        for (const s of ["fall", "winter", "spring"]) quarters.push(qkey(y, s));
-                        if (summerYears.has(y)) quarters.push(qkey(y, "summer"));
-                      }
-                      const apNorm = new Set([...apCreditedSet].map(normId));
-                      const { plan, placed, unplaced } = placeSelectedCourses(
-                        plannedCourses, seedExtra, trees, infoNow, apNorm, quarters, maxUnits,
-                      );
-                      setPlannedCourses(plan);
-                      validatePlan(plan);
-                      const inPlan = new Set(Object.values(plan).flat());
-                      setCoverageTags((prev) => {
-                        const next: Record<string, CoverageTag[]> = { ...prev };
-                        for (const id of placed) next[id] = tags[id] ?? next[id];
-                        for (const k of Object.keys(next)) if (!inPlan.has(k)) delete next[k];
-                        return next;
-                      });
-                      if (unplaced.length) {
-                        setToast(
-                          `Couldn't place ${unplaced.length} course(s) within their offering terms/prereqs: ` +
-                            `${unplaced.slice(0, 3).join(", ")}${unplaced.length > 3 ? "…" : ""}`,
-                        );
-                      }
-                    }
+                  if (sidebarTab === "ge") {
+                    await handleGEAutofill();   // local placement — never the optimizer
+                  } else if (sidebarTab === "minor") {
+                    await handleMinorAutofill(); // local placement — never the optimizer
                   } else {
                     // MAJOR (unchanged): the optimizer fills the required backbone,
                     // seeding from the current schedule so nothing is wiped.
