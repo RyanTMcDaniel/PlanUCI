@@ -252,6 +252,34 @@ export async function fetchPrereqTrees(ids: string[]): Promise<Record<string, Pr
   return out;
 }
 
+/** Pull the raw `corequisites` text for the given courses straight from the
+ *  `courses` table. Returns a map keyed by raw course id (only courses with a
+ *  non-empty corequisites string are included). The corequisites field is the
+ *  authoritative store for true bidirectional coreqs (lecture↔lab); the
+ *  prerequisite_tree stores coreq edges one-directionally (and not at all for
+ *  lab rows), so the field is the only reliable source of mutual pairs. */
+export async function fetchCorequisites(ids: string[]): Promise<Record<string, string>> {
+  if (ids.length === 0) return {};
+  const supabase = createClient();
+  const BATCH = 100;
+  const out: Record<string, string> = {};
+
+  for (let i = 0; i < ids.length; i += BATCH) {
+    const { data, error } = await supabase
+      .from("courses")
+      .select("id, corequisites")
+      .in("id", ids.slice(i, i + BATCH));
+
+    if (error) throw new Error(error.message);
+    for (const r of data ?? []) {
+      const text = (r as { id: string; corequisites: string | null }).corequisites;
+      if (text && text.trim()) out[(r as { id: string }).id] = text;
+    }
+  }
+
+  return out;
+}
+
 /** Distinct AP exam names sorted alphabetically (for the AP scores input UI).
  *  Routed through /api/ap-exams to use the service key (ap_credits has RLS). */
 export async function fetchApExamNames(): Promise<string[]> {

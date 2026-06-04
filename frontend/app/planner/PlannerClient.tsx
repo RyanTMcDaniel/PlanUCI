@@ -22,6 +22,7 @@ import {
   fetchMajorRequirements,
   fetchCourseDetails,
   fetchPrereqTrees,
+  fetchCorequisites,
   fetchGERequirements,
   fetchApExamNames,
   resolveApCredits,
@@ -2760,6 +2761,40 @@ export default function PlannerClient() {
         collectPrereqCourseLeaves(trees[id] ?? trees[normId(id)]).filter(
           (p) => poolNorm.has(normId(p)) && normId(p) !== normId(id),
         );
+      // In-pool coreq:true partners of a course (its tree's coreq leaves).
+      const coreqPartnersInPool = (id: string): string[] =>
+        collectCoreqCourseLeaves(trees[id] ?? trees[normId(id)]).filter(
+          (p) => poolNorm.has(normId(p)) && normId(p) !== normId(id),
+        );
+
+      // FIX B — genuine bidirectional coreq pairs. The prerequisite_tree stores
+      // coreq edges one-directionally (and not at all for lab rows), so a tree
+      // coreq:true edge alone can't tell a true lecture↔lab coreq (MATH105A ↔
+      // MATH105LA) from a "prerequisite or concurrent" edge (CHEM1A → MATH2A).
+      // The authoritative signal is the `corequisites` field being MUTUAL: A
+      // lists B and B lists A. Only those pairs get forced same-quarter; the
+      // unidirectional edges merely contribute a same-quarter floor (below).
+      const coreqText = await fetchCorequisites(pool);
+      const COURSE_TOKEN_RE = /[A-Z][A-Z&]*(?:\s+[A-Z][A-Z&]*)*\s+\d+[A-Z]*/g;
+      const fieldRefs = (id: string): Set<string> => {
+        const text = coreqText[id] ?? coreqText[normId(id)] ?? "";
+        const out = new Set<string>();
+        for (const m of text.toUpperCase().matchAll(COURSE_TOKEN_RE)) {
+          const nn = normId(m[0]);
+          if (poolNorm.has(nn) && nn !== normId(id)) out.add(nn);
+        }
+        return out;
+      };
+      const refsByNorm = new Map<string, Set<string>>();
+      for (const c of pool) refsByNorm.set(normId(c), fieldRefs(c));
+      const bidirKey = (a: string, b: string) => [a, b].sort().join("|");
+      const bidirSet = new Set<string>();
+      for (const a of pool) {
+        const an = normId(a);
+        for (const bn of refsByNorm.get(an) ?? [])
+          if (refsByNorm.get(bn)?.has(an)) bidirSet.add(bidirKey(an, bn));
+      }
+      const isBidirCoreq = (a: string, b: string) => bidirSet.has(bidirKey(normId(a), normId(b)));
 
       // Topological order: prereqs before dependents.
       const ordered: string[] = [];
@@ -2777,13 +2812,22 @@ export default function PlannerClient() {
       };
       for (const c of pool) visit(c, new Set());
 
-      // Prereq floor: 1 + the latest quarter any in-pool prereq is assigned to.
+      // Prereq floor: latest quarter that gates this course.
+      //  • strict prereq → must come strictly AFTER  ⇒ floor ≥ prereqIdx + 1
+      //  • coreq:true    → may share the SAME quarter ⇒ floor ≥ prereqIdx (FIX A)
+      // The coreq term only raises the dependent's floor; it never moves the
+      // partner. So "prereq-or-concurrent" edges just push the dependent to its
+      // partner's quarter or later — the partner is never dragged forward.
       const assignedIdx = new Map<string, number>();
       const floorOf = (c: string): number => {
         let floor = 0;
         for (const p of prereqsInPool(c)) {
           const pi = assignedIdx.get(normId(p));
           if (pi != null) floor = Math.max(floor, pi + 1);
+        }
+        for (const p of coreqPartnersInPool(c)) {
+          const pi = assignedIdx.get(normId(p));
+          if (pi != null) floor = Math.max(floor, pi);
         }
         return floor;
       };
@@ -2854,19 +2898,15 @@ export default function PlannerClient() {
         }
       }
 
-      // (d.1) Coreq alignment: a coreq:true leaf means SAME quarter, not "after".
-      // Pull each coreq pair onto a single quarter — the LATER of the two current
-      // slots, so the strict-prereq floor of either partner is still respected
-      // (their prereqs were floored at or before their current slots). Iterate
-      // until stable so a course shared across pairs drags its whole coreq
-      // component together. Co-location is mandatory, so this may overload a
-      // quarter past the unit cap — consistent with the seeding above, the
-      // optimizer rebalances units afterward. Keeping the pair together here
-      // means whatif's base-aware split guard never sees (and freezes) a split.
-      const coreqPartnersInPool = (id: string): string[] =>
-        collectCoreqCourseLeaves(trees[id] ?? trees[normId(id)]).filter(
-          (p) => poolNorm.has(normId(p)) && normId(p) !== normId(id),
-        );
+      // (d.1) Coreq alignment — FIX B: only GENUINE bidirectional coreq pairs
+      // (mutual in the corequisites field, e.g. MATH105A ↔ MATH105LA) are forced
+      // into a single quarter. Unidirectional "prereq-or-concurrent" edges are
+      // NOT aligned here — floorOf already lets the dependent sit in its
+      // partner's quarter or later, so the seed handles them without moving the
+      // partner. To co-locate a pair we move the EARLIER-placed partner UP to the
+      // later one's quarter (FIX A direction): moving a course later never breaks
+      // its own prereqs, and a genuine coreq lab has no dependents — so we never
+      // drag a foundational prereq forward.
       let coreqChanged = true;
       let coreqSafety = 0;
       const coreqMaxIter = (ordered.length + 1) * (quarters.length + 1);
@@ -2876,10 +2916,11 @@ export default function PlannerClient() {
           for (const p of coreqPartnersInPool(c)) {
             const partner = pool.find((x) => normId(x) === normId(p));
             if (!partner) continue;
+            if (!isBidirCoreq(c, partner)) continue; // FIX B: bidirectional pairs only
             const ci = assignedIdx.get(normId(c));
             const pi = assignedIdx.get(normId(partner));
             if (ci == null || pi == null || ci === pi) continue;
-            const target = Math.max(ci, pi); // later slot respects both prereq floors
+            const target = Math.max(ci, pi); // co-locate at the later slot (move earlier UP)
             const mover = ci < pi ? c : partner;
             const from = Math.min(ci, pi);
             const u = unitsOf(mover);
