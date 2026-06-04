@@ -494,11 +494,12 @@ function MinorCombobox({
 // Mirrors MajorCombobox/MinorCombobox; specializations select by major_id.
 
 function SpecializationCombobox({
-  options, selectedMajorId, onSelect,
+  options, selectedMajorId, onSelect, loading,
 }: {
   options: MajorOption[];
   selectedMajorId: string;
   onSelect: (majorId: string) => void;
+  loading: boolean;
 }) {
   const [query, setQuery] = useState("");
   const [open, setOpen] = useState(false);
@@ -559,7 +560,8 @@ function SpecializationCombobox({
           onChange={(e) => { setQuery(e.target.value); setOpen(true); }}
           onFocus={() => setOpen(true)}
           onKeyDown={handleKeyDown}
-          placeholder="Search for a specialization..."
+          placeholder={loading ? "Loading specializations…" : "Search for a specialization..."}
+          disabled={loading && options.length === 0}
           className="w-full bg-[#111] border border-[#2a2a2a] rounded px-2.5 py-1.5 text-[11px] text-[#f0f0f0] placeholder-[#444] focus:outline-none focus:border-[#3b82f6]/60 disabled:opacity-50 pr-6"
         />
         <svg className="absolute right-2 top-1/2 -translate-y-1/2 w-3 h-3 text-[#444] pointer-events-none" viewBox="0 0 12 12" fill="none">
@@ -753,58 +755,58 @@ function PlacedCard({
     <div
       ref={setNodeRef}
       style={style}
-      className={`group/card flex items-center gap-2 rounded-r-md pl-1.5 pr-1.5 py-1.5 select-none
-        bg-[#1e1e1e] border border-l-0 border-[#2a2a2a] shadow-sm transition-colors min-h-[44px]
+      className={`group/card flex items-stretch gap-1.5 rounded-r-md pl-1 pr-0 select-none
+        bg-[#1e1e1e] border border-l-0 border-[#2a2a2a] shadow-sm transition-colors min-h-[60px]
         ${isDragging ? "opacity-20" : "hover:bg-[#252525] hover:border-[#333]"}`}
     >
-      {/* drag handle */}
+      {/* drag handle — left, vertically centered */}
       <span
         {...listeners}
         {...attributes}
-        className="text-[18px] text-[#2a2a2a] group-hover/card:text-[#444] cursor-grab active:cursor-grabbing shrink-0 leading-none self-center"
+        className="flex items-center text-[26px] text-[#2a2a2a] group-hover/card:text-[#444] cursor-grab active:cursor-grabbing shrink-0 leading-none self-center"
       >
         ⠿
       </span>
 
       {/* content */}
-      <div className="flex-1 min-w-0 flex flex-col gap-1">
-        {/* top row: course code/name + action buttons */}
-        <div className="flex items-start gap-1.5">
-          <div className="flex-1 min-w-0">
-            <p className="text-[17px] font-bold text-[#e8e8e8] leading-tight truncate">{courseId}</p>
-            {title && (
-              <p className="text-[12px] text-[#999] leading-snug truncate">{title}</p>
-            )}
-          </div>
-          <div className="flex gap-0.5 shrink-0 opacity-0 group-hover/card:opacity-100 transition-opacity">
-            <button
-              onPointerDown={(e) => e.stopPropagation()}
-              onClick={() => onToggleLock(courseId)}
-              title={isLocked ? "Unlock" : "Lock to quarter"}
-              className="flex items-center justify-center w-7 h-7 rounded hover:bg-[#333] transition-colors"
-            >
-              <LockIcon locked={isLocked} />
-            </button>
-            <button
-              onPointerDown={(e) => e.stopPropagation()}
-              onClick={() => onRemove(courseId, quarterKey)}
-              title="Remove"
-              className="flex items-center justify-center w-7 h-7 rounded text-[#555] hover:text-[#e8e8e8] hover:bg-[#333] text-[18px] leading-none transition-colors"
-            >
-              ×
-            </button>
-          </div>
+      <div className="flex-1 min-w-0 flex flex-col justify-center gap-1 py-1.5">
+        {/* course code (larger) + name (smaller) */}
+        <div className="min-w-0">
+          <p className="text-[19px] font-bold text-[#e8e8e8] leading-tight truncate">{courseId}</p>
+          {title && (
+            <p className="text-[12px] text-[#999] leading-snug truncate">{title}</p>
+          )}
         </div>
 
-        {/* bottom row: gpa + units */}
+        {/* gpa + units — left aligned */}
         <div className="flex items-center gap-2">
           {gpa != null && isFinite(gpa) ? (
-            <span className="text-[10px] font-mono font-medium" style={{ color: "#9a9a9a" }}>{gpa.toFixed(2)} GPA</span>
+            <span className="text-[10px] font-mono font-medium" style={{ color: "#9a9a9a" }}>{gpa.toFixed(2)} AVG GPA</span>
           ) : (
             <span className="text-[9px] font-mono text-[#5a5a5a] whitespace-nowrap">No GPA Data</span>
           )}
           <span className="text-[11px] font-medium text-[#888] tabular-nums">{units ?? "?"} <span className="font-normal text-[#5a5a5a]">UNITS</span></span>
         </div>
+      </div>
+
+      {/* right-edge action strip — full card height: remove (top) / lock (bottom) */}
+      <div className="flex flex-col shrink-0 w-7 self-stretch border-l border-[#2a2a2a]">
+        <button
+          onPointerDown={(e) => e.stopPropagation()}
+          onClick={() => onRemove(courseId, quarterKey)}
+          title="Remove"
+          className="flex-1 flex items-center justify-center rounded-tr-md text-[#555] hover:text-[#e8e8e8] hover:bg-[#333] text-[18px] leading-none transition-colors border-b border-[#2a2a2a]"
+        >
+          ×
+        </button>
+        <button
+          onPointerDown={(e) => e.stopPropagation()}
+          onClick={() => onToggleLock(courseId)}
+          title={isLocked ? "Unlock" : "Lock to quarter"}
+          className="flex-1 flex items-center justify-center rounded-br-md hover:bg-[#333] transition-colors"
+        >
+          <LockIcon locked={isLocked} />
+        </button>
       </div>
     </div>
   );
@@ -1027,7 +1029,7 @@ function CoursePill({
 }) {
   // Pick-N pools list many courses; keep their codes compact. Everywhere else
   // uses the larger, easier-to-read size.
-  const codeSize = compact ? "text-[9px]" : "text-[13px]";
+  const codeSize = compact ? "text-[9px]" : "text-[15px]";
 
   const { attributes, listeners, setNodeRef, transform, isDragging } = useDraggable({
     id: `sidebar|${courseId}`,
@@ -2580,6 +2582,7 @@ export default function PlannerClient() {
                 options={specializations}
                 selectedMajorId={selectedMajorId}
                 onSelect={setSelectedMajorId}
+                loading={majorList.length === 0 && !majorListError}
               />
             )}
 
