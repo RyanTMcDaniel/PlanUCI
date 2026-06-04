@@ -150,17 +150,19 @@ function requiredMissingCourses(node: unknown, have: Set<string>): string[] {
   return []; // NOT / unknown → nothing to add
 }
 
-// STRICT prereq course-leaf ids referenced in a prereq tree's AND/OR branches
-// (NOT = anti-requisite, skipped; coreq:true leaves skipped — those are
-// same-quarter partners, not "must come before"). Used to derive topological
-// seed ordering and prereq floors.
+// HARD prereq course-leaf ids that must come strictly before a course — only
+// AND-required leaves (coreq:true skipped — same-quarter partners; NOT skipped —
+// anti-requisite). OR branches contribute NOTHING: a choice between options is
+// not a hard floor (any single option may satisfy it), so we leave the ordering
+// of OR alternatives to whatif rather than pinning a floor. Used to derive
+// topological seed ordering and prereq floors.
 function collectPrereqCourseLeaves(node: unknown): string[] {
   if (!node || typeof node !== "object") return [];
   const n = node as Record<string, unknown>;
   const out: string[] = [];
-  for (const key of ["AND", "OR"] as const) {
-    const arr = n[key];
-    if (!Array.isArray(arr)) continue;
+  // AND only: every child is required. OR (and any other key) contributes no floor.
+  const arr = n.AND;
+  if (Array.isArray(arr)) {
     for (const item of arr as PrereqItem[]) {
       if (item?.prereqType === "course" && item.courseId && item.coreq !== true) {
         out.push(String(item.courseId));
@@ -2785,9 +2787,12 @@ export default function PlannerClient() {
         }
         return floor;
       };
-      // Seed in topological order at the EARLIEST slot >= floor (prereqs land as
-      // early as possible, so dependents always have a later slot). Prefer
-      // under-cap quarters; overload only as a last resort (optimizer fixes units).
+      // Two-pass seed (spread across the full grid; never overload the front).
+      // Pass 1: in topological order, place each course in the EARLIEST quarter
+      // that is both at/after its prereq floor and under the unit cap. A course
+      // that finds no under-cap quarter at/after its floor is deferred — it is
+      // NOT overloaded onto an early quarter here.
+      const deferred: string[] = [];
       for (const c of ordered) {
         const u = unitsOf(c);
         const floor = Math.min(floorOf(c), quarters.length - 1);
@@ -2795,7 +2800,24 @@ export default function PlannerClient() {
         for (let i = floor; i < quarters.length; i++) {
           if (quarterUnits[i] + u <= maxUnits) { chosen = i; break; }
         }
-        if (chosen === -1) chosen = floor; // no capped room at/after floor → overload at floor
+        if (chosen === -1) { deferred.push(c); continue; }
+        planned_courses[quarters[chosen]].push(c);
+        quarterUnits[chosen] += u;
+        assignedIdx.set(normId(c), chosen);
+      }
+      // Pass 2: place each deferred (overloaded) course by scanning FORWARD from
+      // its floor toward the end of the grid for the first under-cap quarter, so
+      // overflow lands in later / still-empty quarters instead of overloading the
+      // front. If the whole tail is full, overload the LAST quarter (keeps the
+      // front clean and avoids leaving trailing quarters empty).
+      for (const c of deferred) {
+        const u = unitsOf(c);
+        const floor = Math.min(floorOf(c), quarters.length - 1);
+        let chosen = -1;
+        for (let i = floor; i < quarters.length; i++) {
+          if (quarterUnits[i] + u <= maxUnits) { chosen = i; break; }
+        }
+        if (chosen === -1) chosen = quarters.length - 1; // tail full → overload the END
         planned_courses[quarters[chosen]].push(c);
         quarterUnits[chosen] += u;
         assignedIdx.set(normId(c), chosen);
