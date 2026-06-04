@@ -150,6 +150,25 @@ function requiredMissingCourses(node: unknown, have: Set<string>): string[] {
   return []; // NOT / unknown → nothing to add
 }
 
+// All course-leaf ids referenced anywhere in a prereq tree's AND/OR branches
+// (NOT = anti-requisite, skipped). Used to derive topological seed ordering.
+function collectPrereqCourseLeaves(node: unknown): string[] {
+  if (!node || typeof node !== "object") return [];
+  const n = node as Record<string, unknown>;
+  const out: string[] = [];
+  for (const key of ["AND", "OR"] as const) {
+    const arr = n[key];
+    if (!Array.isArray(arr)) continue;
+    for (const item of arr as PrereqItem[]) {
+      if (item?.prereqType === "course" && item.courseId) out.push(String(item.courseId));
+      else if (item?.prereqType !== "exam" && item && typeof item === "object") {
+        out.push(...collectPrereqCourseLeaves(item));
+      }
+    }
+  }
+  return out;
+}
+
 interface CourseStats {
   professor: {
     name: string;
@@ -2680,18 +2699,79 @@ export default function PlannerClient() {
       }
 
       // (d) payload plan: ALL grid quarters as keys (whatif only redistributes
-      // among quarters present in the plan), locked courses in their real
-      // quarters, the whole pool seeded into the first quarter.
+      // among quarters present in the plan). Locked courses stay put; unlocked
+      // pool courses are distributed round-robin under the unit cap with a
+      // topological pass (a course never seeds before an in-pool prereq) — this
+      // gives the optimizer a feasible starting state instead of one stuffed
+      // quarter.
       const quarters: string[] = [];
       for (let y = 1; y <= numYears; y++) {
         for (const s of ["fall", "winter", "spring"]) quarters.push(qkey(y, s));
         if (summerYears.has(y)) quarters.push(qkey(y, "summer"));
       }
-      const firstQuarter = quarters[0];
       const planned_courses: Record<string, string[]> = {};
       for (const q of quarters) planned_courses[q] = [];
-      for (const [cid, q] of Object.entries(lockedMap)) (planned_courses[q] ??= []).push(cid);
-      planned_courses[firstQuarter] = [...(planned_courses[firstQuarter] ?? []), ...pool];
+      const quarterUnits = new Array(quarters.length).fill(0);
+      const qIndex = new Map(quarters.map((q, i) => [q, i] as const));
+      const unitsOf = (id: string) => courseInfoMapRef.current[id]?.min_units ?? 4;
+
+      // Locked courses stay in their quarters; count their units against them.
+      for (const [cid, q] of Object.entries(lockedMap)) {
+        (planned_courses[q] ??= []).push(cid);
+        const i = qIndex.get(q);
+        if (i != null) quarterUnits[i] += unitsOf(cid);
+      }
+
+      // In-pool prereqs of a course (course-leaves of its tree that are in the pool).
+      const poolNorm = new Set(pool.map(normId));
+      const prereqsInPool = (id: string): string[] =>
+        collectPrereqCourseLeaves(trees[id] ?? trees[normId(id)]).filter(
+          (p) => poolNorm.has(normId(p)) && normId(p) !== normId(id),
+        );
+
+      // Topological order: prereqs before dependents.
+      const ordered: string[] = [];
+      const seenTopo = new Set<string>();
+      const visit = (id: string, stack: Set<string>) => {
+        const nn = normId(id);
+        if (seenTopo.has(nn) || stack.has(nn)) return;
+        stack.add(nn);
+        for (const p of prereqsInPool(id)) {
+          const dep = pool.find((x) => normId(x) === normId(p));
+          if (dep) visit(dep, stack);
+        }
+        stack.delete(nn);
+        if (!seenTopo.has(nn)) { seenTopo.add(nn); ordered.push(id); }
+      };
+      for (const c of pool) visit(c, new Set());
+
+      // Round-robin seed across quarters, respecting prereq floor + unit cap.
+      const assignedIdx = new Map<string, number>();
+      let rr = 0;
+      for (const c of ordered) {
+        const u = unitsOf(c);
+        let floor = 0;
+        for (const p of prereqsInPool(c)) {
+          const pi = assignedIdx.get(normId(p));
+          if (pi != null) floor = Math.max(floor, pi + 1);
+        }
+        floor = Math.min(floor, quarters.length - 1);
+        let chosen = -1;
+        for (let k = 0; k < quarters.length; k++) {
+          const i = (rr + k) % quarters.length;
+          if (i < floor) continue;
+          if (quarterUnits[i] + u <= maxUnits) { chosen = i; break; }
+        }
+        if (chosen === -1) {
+          // No capped room at/after the floor — use the least-full eligible quarter.
+          chosen = floor;
+          for (let i = floor; i < quarters.length; i++) if (quarterUnits[i] < quarterUnits[chosen]) chosen = i;
+        }
+        planned_courses[quarters[chosen]].push(c);
+        quarterUnits[chosen] += u;
+        assignedIdx.set(normId(c), chosen);
+        rr = (chosen + 1) % quarters.length;
+      }
 
       // (e) send to /api/whatif — same shape as the Optimize Schedule button.
       const res = await fetch("/api/whatif", {
