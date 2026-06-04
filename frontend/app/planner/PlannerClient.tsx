@@ -21,6 +21,7 @@ import {
   type ApCreditResult,
   fetchMajorRequirements,
   fetchCourseDetails,
+  fetchPrereqTrees,
   fetchGERequirements,
   fetchApExamNames,
   resolveApCredits,
@@ -53,6 +54,106 @@ type CoverageTag =
 function geCode(req: ReqGroup): string {
   const g = req.requirement_group ?? "";
   return g.replace(/^GE[_-]?/i, "") || req.group_name;
+}
+
+// ── Prerequisite-tree evaluation (mirrors backend hard_constraints._eval_tree) ──
+// A node is { AND|OR|NOT: item[] }; an item is a leaf or a nested node.
+// `available` = normed ids completed in PRIOR quarters (+ AP); `sameQuarter` =
+// normed ids in the candidate quarter (satisfies coreqs only).
+type PrereqItem = {
+  prereqType?: string;
+  courseId?: string;
+  coreq?: boolean;
+} & Record<string, unknown>;
+
+function evalPrereqItem(item: PrereqItem, available: Set<string>, sameQuarter: Set<string>): boolean {
+  if (item?.prereqType === "course") {
+    const cid = normId(String(item.courseId ?? ""));
+    if (item.coreq) return available.has(cid) || sameQuarter.has(cid);
+    return available.has(cid);
+  }
+  if (item?.prereqType === "exam") return true; // AP/exam prereqs assumed handled
+  return evalPrereqTree(item, available, sameQuarter);
+}
+
+function evalPrereqTree(node: unknown, available: Set<string>, sameQuarter: Set<string>): boolean {
+  if (!node || typeof node !== "object") return true;
+  const n = node as Record<string, unknown>;
+  if (Array.isArray(n.AND)) return (n.AND as PrereqItem[]).every((i) => evalPrereqItem(i, available, sameQuarter));
+  if (Array.isArray(n.OR)) return (n.OR as PrereqItem[]).some((i) => evalPrereqItem(i, available, sameQuarter));
+  if (Array.isArray(n.NOT))
+    return !(n.NOT as PrereqItem[]).some(
+      (i) => i?.prereqType === "course" && available.has(normId(String(i.courseId ?? ""))),
+    );
+  return true; // empty node — no prereqs
+}
+
+// Seasons a course is offered in (lowercase), parsed from terms like "2023 Fall".
+function offeredSeasons(terms: string[] | null | undefined): Set<string> {
+  const s = new Set<string>();
+  for (const t of terms ?? []) {
+    const season = t.trim().split(/\s+/).pop()?.toLowerCase();
+    if (season) s.add(season);
+  }
+  return s;
+}
+
+// Place selected courses into the EARLIEST prereq-valid, offered, open quarter
+// without moving anything already in the plan. Pass 0 respects the unit cap;
+// pass 1 allows overload so a valid course is never left unplaced for capacity
+// alone. Returns the new plan plus which picks landed.
+function placeSelectedCourses(
+  plan: PlannedCourses,
+  picks: string[],
+  trees: Record<string, unknown>,
+  info: Record<string, CourseDetail>,
+  apNorm: Set<string>,
+  quarters: string[],
+  maxUnits: number,
+): { plan: PlannedCourses; placed: string[]; unplaced: string[] } {
+  const next: PlannedCourses = {};
+  for (const [q, ids] of Object.entries(plan)) next[q] = [...ids];
+  for (const q of quarters) if (!next[q]) next[q] = [];
+
+  const placed: string[] = [];
+  let remaining = [...picks];
+  let progress = true;
+
+  while (progress && remaining.length) {
+    progress = false;
+    const still: string[] = [];
+    for (const cid of remaining) {
+      const tree = trees[cid] ?? trees[normId(cid)];
+      const seasons = offeredSeasons(info[cid]?.terms);
+      const units = info[cid]?.min_units ?? 4;
+      let landed = false;
+
+      for (let pass = 0; pass < 2 && !landed; pass++) {
+        for (let i = 0; i < quarters.length; i++) {
+          const q = quarters[i];
+          if (seasons.size && !seasons.has(seasonOf(q))) continue;
+          const available = new Set(apNorm);
+          for (let j = 0; j < i; j++) for (const x of next[quarters[j]] ?? []) available.add(normId(x));
+          const sameQ = new Set((next[q] ?? []).map(normId));
+          if (!evalPrereqTree(tree, available, sameQ)) continue;
+          const qUnits = (next[q] ?? []).reduce((s, x) => s + (info[x]?.min_units ?? 4), 0);
+          if (pass === 0 && qUnits + units > maxUnits) continue;
+          next[q] = [...(next[q] ?? []), cid];
+          placed.push(cid);
+          landed = true;
+          progress = true;
+          break;
+        }
+      }
+      if (!landed) still.push(cid);
+    }
+    remaining = still;
+  }
+  return { plan: next, placed, unplaced: remaining };
+}
+
+function seasonOf(qk: string): string {
+  return qk.split("_")[1] ?? "";
 }
 
 interface CourseStats {
@@ -799,7 +900,7 @@ function PlacedCard({
       ref={setNodeRef}
       style={style}
       className={`group/card flex items-stretch gap-1.5 rounded-r-md pl-1 pr-0 select-none
-        bg-[#1e1e1e] border border-l-0 border-[#2a2a2a] shadow-sm transition-colors min-h-[60px]
+        bg-[#1e1e1e] border border-l-0 border-[#2a2a2a] shadow-sm transition-colors min-h-[44px]
         ${isDragging ? "opacity-20" : "hover:bg-[#252525] hover:border-[#333]"}`}
     >
       {/* drag handle — left, vertically centered */}
@@ -812,10 +913,10 @@ function PlacedCard({
       </span>
 
       {/* content — course code (larger) + name (smaller) + coverage pills */}
-      <div className="flex-1 min-w-0 flex flex-col justify-center gap-0.5 py-1.5">
+      <div className="flex-1 min-w-0 flex flex-col justify-center gap-0.5 py-1">
         <p className="text-[19px] font-bold text-[#e8e8e8] leading-tight truncate">{courseId}</p>
         {title && (
-          <p className="text-[12px] text-[#999] leading-snug truncate">{title}</p>
+          <p title={title} className="text-[10px] text-[#999] leading-snug overflow-hidden text-ellipsis whitespace-nowrap">{title}</p>
         )}
         {tags && <CoverageTags tags={tags} />}
       </div>
@@ -2557,18 +2658,18 @@ export default function PlannerClient() {
             const eligible = cat.req.courses.filter(available);
             if (eligible.length === 0) break;
             const t: CoverageTag[] = [{ kind: "ge", code: cat.code }];
-            // a) double-cover an unmet major requirement
-            let pick = eligible.find((c) => unmetMajor.has(normId(c)));
+            // PRIORITY 1: multi-GE cover — also satisfies another unfilled GE category
+            let pick = eligible.find((c) => geCats.some((o) => o.code !== cat.code && covers(o.req, c)));
             if (pick) {
-              t.push({ kind: "major" });
+              for (const o of geCats)
+                if (o.code !== cat.code && covers(o.req, pick)) t.push({ kind: "ge", code: o.code });
             } else {
-              // b) cover another unmet GE category
-              pick = eligible.find((c) => geCats.some((o) => o.code !== cat.code && covers(o.req, c)));
+              // PRIORITY 2: also satisfies an unplaced major requirement
+              pick = eligible.find((c) => unmetMajor.has(normId(c)));
               if (pick) {
-                for (const o of geCats)
-                  if (o.code !== cat.code && covers(o.req, pick)) t.push({ kind: "ge", code: o.code });
+                t.push({ kind: "major" });
               } else {
-                // c) any eligible course, picked randomly
+                // PRIORITY 3: any eligible course from the pool, picked randomly
                 pick = eligible[Math.floor(Math.random() * eligible.length)];
               }
             }
@@ -3023,56 +3124,113 @@ export default function PlannerClient() {
                 setAutoFillLoading(true);
                 setToast(null);
                 try {
-                  // Frontend selects WHAT to add for the active tab; the backend
-                  // optimizer places/orders the combined seed (current schedule +
-                  // picks), free to reorder for prereqs/difficulty but never
-                  // dropping a placed course (additive — no wipe).
-                  const { seedExtra, tags, seedOnly } = buildAutofillSeed(sidebarTab);
-                  const currentCourses = Object.values(plannedCourses).flat();
-                  const seed_courses = [...currentCourses, ...seedExtra];
-
-                  const res = await fetch("/api/optimizer", {
-                    method: "POST",
-                    headers: { "Content-Type": "application/json" },
-                    body: JSON.stringify({
-                      major_id: selectedMajorId,
-                      completed_courses: [],
-                      graduation_quarter: gradQuarter,
-                      units_per_quarter: maxUnits,
-                      waived_ges: [],
-                      ap_scores: apScores,
-                      // Pin the optimizer window to the grid's first (Fall) quarter
-                      // so it never schedules into off-grid quarters.
-                      start_quarter: qkey(1, "fall"),
-                      seed_courses,
-                      seed_only: seedOnly,
-                    }),
-                  });
-                  const data = await res.json();
-                  if (!res.ok) {
-                    const msg =
-                      typeof data?.detail === "object"
-                        ? (data.detail.message ?? JSON.stringify(data.detail))
-                        : (data?.detail ?? data?.error ?? "Optimizer error");
-                    setToast(String(msg));
-                  } else {
-                    setLockConflictErrors(null);
-                    const plan = data?.variants?.[0]?.planned_courses as
-                      | PlannedCourses
-                      | undefined;
-                    if (plan) {
+                  if (sidebarTab === "ge" || sidebarTab === "minor") {
+                    // GE / Minor: place LOCALLY — never the major optimizer.
+                    // Selection comes from the in-state requirement course lists;
+                    // placement uses prereq trees pulled from Supabase + offering
+                    // terms, and never moves an already-placed course.
+                    const { seedExtra, tags } = buildAutofillSeed(sidebarTab);
+                    if (seedExtra.length === 0) {
+                      setToast(
+                        sidebarTab === "ge"
+                          ? "Nothing to add — GE categories are filled or have no eligible courses left."
+                          : "Nothing to add — required minor courses are placed and no pick-N group cross-covers.",
+                      );
+                    } else {
+                      const trees = await fetchPrereqTrees(seedExtra);
+                      // Ensure picks have course details (terms/units) for placement.
+                      let infoNow = courseInfoMapRef.current;
+                      const missing = seedExtra.filter((id) => !infoNow[id]);
+                      if (missing.length) {
+                        const details = await fetchCourseDetails(missing);
+                        if (details.length) {
+                          setCourseInfoMap((prev) => {
+                            const n = { ...prev };
+                            for (const c of details) n[c.id] = c;
+                            return n;
+                          });
+                          const merged = { ...courseInfoMapRef.current };
+                          for (const c of details) merged[c.id] = c;
+                          infoNow = merged;
+                          fetchDifficulties(missing);
+                        }
+                      }
+                      // Ordered visible quarter grid (chronological).
+                      const quarters: string[] = [];
+                      for (let y = 1; y <= numYears; y++) {
+                        for (const s of ["fall", "winter", "spring"]) quarters.push(qkey(y, s));
+                        if (summerYears.has(y)) quarters.push(qkey(y, "summer"));
+                      }
+                      const apNorm = new Set([...apCreditedSet].map(normId));
+                      const { plan, placed, unplaced } = placeSelectedCourses(
+                        plannedCourses, seedExtra, trees, infoNow, apNorm, quarters, maxUnits,
+                      );
                       setPlannedCourses(plan);
                       validatePlan(plan);
-                      // Attach coverage pills for courses present in the result.
-                      const placedNow = new Set(Object.values(plan).flat());
+                      const inPlan = new Set(Object.values(plan).flat());
                       setCoverageTags((prev) => {
-                        const merged: Record<string, CoverageTag[]> = { ...prev, ...tags };
-                        const next: Record<string, CoverageTag[]> = {};
-                        for (const [id, t] of Object.entries(merged)) if (placedNow.has(id)) next[id] = t;
+                        const next: Record<string, CoverageTag[]> = { ...prev };
+                        for (const id of placed) next[id] = tags[id] ?? next[id];
+                        for (const k of Object.keys(next)) if (!inPlan.has(k)) delete next[k];
                         return next;
                       });
+                      if (unplaced.length) {
+                        setToast(
+                          `Couldn't place ${unplaced.length} course(s) within their offering terms/prereqs: ` +
+                            `${unplaced.slice(0, 3).join(", ")}${unplaced.length > 3 ? "…" : ""}`,
+                        );
+                      }
+                    }
+                  } else {
+                    // MAJOR (unchanged): the optimizer fills the required backbone,
+                    // seeding from the current schedule so nothing is wiped.
+                    const { seedExtra, tags, seedOnly } = buildAutofillSeed(sidebarTab);
+                    const currentCourses = Object.values(plannedCourses).flat();
+                    const seed_courses = [...currentCourses, ...seedExtra];
+
+                    const res = await fetch("/api/optimizer", {
+                      method: "POST",
+                      headers: { "Content-Type": "application/json" },
+                      body: JSON.stringify({
+                        major_id: selectedMajorId,
+                        completed_courses: [],
+                        graduation_quarter: gradQuarter,
+                        units_per_quarter: maxUnits,
+                        waived_ges: [],
+                        ap_scores: apScores,
+                        // Pin the optimizer window to the grid's first (Fall) quarter
+                        // so it never schedules into off-grid quarters.
+                        start_quarter: qkey(1, "fall"),
+                        seed_courses,
+                        seed_only: seedOnly,
+                      }),
+                    });
+                    const data = await res.json();
+                    if (!res.ok) {
+                      const msg =
+                        typeof data?.detail === "object"
+                          ? (data.detail.message ?? JSON.stringify(data.detail))
+                          : (data?.detail ?? data?.error ?? "Optimizer error");
+                      setToast(String(msg));
                     } else {
-                      setToast("No plan returned from optimizer");
+                      setLockConflictErrors(null);
+                      const plan = data?.variants?.[0]?.planned_courses as
+                        | PlannedCourses
+                        | undefined;
+                      if (plan) {
+                        setPlannedCourses(plan);
+                        validatePlan(plan);
+                        // Attach coverage pills for courses present in the result.
+                        const placedNow = new Set(Object.values(plan).flat());
+                        setCoverageTags((prev) => {
+                          const merged: Record<string, CoverageTag[]> = { ...prev, ...tags };
+                          const next: Record<string, CoverageTag[]> = {};
+                          for (const [id, t] of Object.entries(merged)) if (placedNow.has(id)) next[id] = t;
+                          return next;
+                        });
+                      } else {
+                        setToast("No plan returned from optimizer");
+                      }
                     }
                   }
                 } catch (err) {

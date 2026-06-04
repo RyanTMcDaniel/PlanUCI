@@ -220,6 +220,36 @@ export async function fetchCourseDetails(ids: string[]): Promise<CourseDetail[]>
   return results;
 }
 
+// AND/OR/NOT prerequisite tree (same shape the backend optimizer evaluates).
+// Leaves: { prereqType: "course", courseId, coreq? } | { prereqType: "exam", ... }.
+export type PrereqTree = Record<string, unknown>;
+
+/** Pull stored prerequisite_tree JSON for the given courses straight from the
+ *  `courses` table. Returns a map keyed by the raw course id (only courses that
+ *  actually have a tree are included). Used for frontend GE/Minor placement so
+ *  selected courses land in a prereq-valid quarter without the major optimizer. */
+export async function fetchPrereqTrees(ids: string[]): Promise<Record<string, PrereqTree>> {
+  if (ids.length === 0) return {};
+  const supabase = createClient();
+  const BATCH = 100;
+  const out: Record<string, PrereqTree> = {};
+
+  for (let i = 0; i < ids.length; i += BATCH) {
+    const { data, error } = await supabase
+      .from("courses")
+      .select("id, prerequisite_tree")
+      .in("id", ids.slice(i, i + BATCH));
+
+    if (error) throw new Error(error.message);
+    for (const r of data ?? []) {
+      const tree = (r as { id: string; prerequisite_tree: PrereqTree | null }).prerequisite_tree;
+      if (tree) out[(r as { id: string }).id] = tree;
+    }
+  }
+
+  return out;
+}
+
 /** Distinct AP exam names sorted alphabetically (for the AP scores input UI).
  *  Routed through /api/ap-exams to use the service key (ap_credits has RLS). */
 export async function fetchApExamNames(): Promise<string[]> {
