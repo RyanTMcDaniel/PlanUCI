@@ -66,6 +66,13 @@ const GE_CODE_LABELS: Record<string, string> = {
   GE_VIII: "VIII",
 };
 
+// GE category code for display/labels: maps via GE_CODE_LABELS, falling back to
+// the requirement_group with the "GE_" prefix stripped.
+function geCode(req: ReqGroup): string {
+  const g = req.requirement_group ?? "";
+  return GE_CODE_LABELS[g] ?? (g.replace(/^GE[_-]?/i, "") || req.group_name);
+}
+
 // ge_list token (e.g. "III", "Va") → requirement_group. The authoritative GE
 // taxonomy: a course satisfies a category iff its ge_list says so.
 const GE_TOKEN_TO_GROUP: Record<string, string> = {
@@ -154,78 +161,26 @@ function offeredSeasons(terms: string[] | null | undefined): Set<string> {
   return s;
 }
 
-function seasonOf(qk: string): string {
-  return qk.split("_")[1] ?? "";
-}
-
-// Placement timing band: GE & lower-division early, upper-division late, minor
-// spread throughout.
-function courseBand(
-  id: string,
-  info: CourseDetail | undefined,
-  isGE: boolean,
-  isMinor: boolean,
-): "early" | "late" | "spread" {
-  if (isGE) return "early";
-  if (isMinor) return "spread";
-  const lvl = info?.course_level ?? "";
-  if (/lower/i.test(lvl)) return "early";
-  if (/upper|grad/i.test(lvl)) return "late";
-  return extractCourseNumber(id) < 100 ? "early" : "late";
-}
-
-// ── Prereq closure ─────────────────────────────────────────────────────────
-// Course-leaf ids that must be ADDED so a prereq tree is satisfiable given what
-// is already available. AND → every child; OR → nothing if any option already
-// available, else pull the first course option; NOT/exam → ignored.
-function itemSatisfied(i: PrereqItem, have: Set<string>): boolean {
-  if (i?.prereqType === "course") return have.has(normId(String(i.courseId ?? "")));
-  if (i?.prereqType === "exam") return true;
-  return requiredMissingCourses(i, have).length === 0;
-}
-function missingFromItem(i: PrereqItem, have: Set<string>): string[] {
-  if (i?.prereqType === "course") {
-    const cid = String(i.courseId ?? "");
-    return cid && !have.has(normId(cid)) ? [cid] : [];
-  }
-  if (i?.prereqType === "exam") return [];
-  return requiredMissingCourses(i, have);
-}
-function requiredMissingCourses(node: unknown, have: Set<string>): string[] {
-  if (!node || typeof node !== "object") return [];
-  const n = node as Record<string, unknown>;
-  if (Array.isArray(n.AND)) return (n.AND as PrereqItem[]).flatMap((i) => missingFromItem(i, have));
-  if (Array.isArray(n.OR)) {
-    const items = n.OR as PrereqItem[];
-    if (items.some((i) => itemSatisfied(i, have))) return [];
-    const firstCourse = items.find((i) => i?.prereqType === "course" && i.courseId);
-    return firstCourse?.courseId ? [String(firstCourse.courseId)] : [];
-  }
-  return []; // NOT / unknown → nothing to add
-}
-
-// Local scheduler. Locked courses stay fixed in their quarters; every course in
-// `toPlace` is positioned in the earliest/latest/lowest-load valid quarter per
-// its band, respecting prereqs (against earlier quarters + locked + AP) and
-// offering terms. Iterates so prereq chains within the batch resolve.
-function placeWithPriority(
-  lockedPos: Record<string, string>,
-  toPlace: string[],
+// Place selected courses without moving anything already in the plan. For each
+// course, collect every prereq-valid, offered quarter, then pick the one with
+// the LOWEST current difficulty to spread load (preferring quarters under the
+// unit cap; tie → earliest). Iterates so intra-batch prereq chains resolve.
+function placeSelectedCourses(
+  plan: PlannedCourses,
+  picks: string[],
   trees: Record<string, unknown>,
   info: Record<string, CourseDetail>,
   diffMap: Record<string, number>,
   apNorm: Set<string>,
   quarters: string[],
   maxUnits: number,
-  bandOf: (id: string) => "early" | "late" | "spread",
 ): { plan: PlannedCourses; placed: string[]; unplaced: string[] } {
   const next: PlannedCourses = {};
-  for (const q of quarters) next[q] = [];
-  for (const [cid, q] of Object.entries(lockedPos)) (next[q] ??= []).push(cid);
+  for (const [q, ids] of Object.entries(plan)) next[q] = [...ids];
+  for (const q of quarters) if (!next[q]) next[q] = [];
 
-  const bandRank = { early: 0, spread: 1, late: 2 } as const;
   const placed: string[] = [];
-  let remaining = [...toPlace].sort((a, b) => bandRank[bandOf(a)] - bandRank[bandOf(b)]);
+  let remaining = [...picks];
   let progress = true;
 
   while (progress && remaining.length) {
@@ -235,9 +190,8 @@ function placeWithPriority(
       const tree = trees[cid] ?? trees[normId(cid)];
       const seasons = offeredSeasons(info[cid]?.terms);
       const units = info[cid]?.min_units ?? 4;
-      const band = bandOf(cid);
 
-      const cands: { q: string; idx: number; diff: number; withinCap: boolean }[] = [];
+      const cands: { q: string; withinCap: boolean; diff: number; idx: number }[] = [];
       for (let i = 0; i < quarters.length; i++) {
         const q = quarters[i];
         if (seasons.size && !seasons.has(seasonOf(q))) continue;
@@ -250,27 +204,26 @@ function placeWithPriority(
         const d = calculateQuarterDifficulty(
           ids.map((x) => ({ difficulty_score: diffMap[x] ?? null, units: info[x]?.min_units ?? null })),
         );
-        cands.push({ q, idx: i, diff: d?.combined ?? 0, withinCap: qUnits + units <= maxUnits });
+        cands.push({ q, withinCap: qUnits + units <= maxUnits, diff: d?.combined ?? 0, idx: i });
       }
       if (cands.length === 0) {
         still.push(cid);
         continue;
       }
       const pool = cands.some((c) => c.withinCap) ? cands.filter((c) => c.withinCap) : cands;
-      pool.sort((a, b) =>
-        band === "early"
-          ? a.idx - b.idx || a.diff - b.diff
-          : band === "late"
-          ? b.idx - a.idx || a.diff - b.diff
-          : a.diff - b.diff || a.idx - b.idx,
-      );
-      next[pool[0].q] = [...(next[pool[0].q] ?? []), cid];
+      pool.sort((a, b) => a.diff - b.diff || a.idx - b.idx);
+      const best = pool[0].q;
+      next[best] = [...(next[best] ?? []), cid];
       placed.push(cid);
       progress = true;
     }
     remaining = still;
   }
   return { plan: next, placed, unplaced: remaining };
+}
+
+function seasonOf(qk: string): string {
+  return qk.split("_")[1] ?? "";
 }
 
 interface CourseStats {
@@ -2732,6 +2685,117 @@ export default function PlannerClient() {
     });
   }, []);
 
+  // ── Autofill seed selection (per tab) ──────────────────────────────────────
+  // Decides which courses an autofill click should ADD for the active tab and
+  // the coverage pills to attach. All eligibility (major/GE/minor) is in
+  // frontend state, so SELECTION happens here; the backend optimizer then does
+  // prereq-aware PLACEMENT/ordering for the combined seed.
+  //   major → seedOnly=false: backend adds the required backbone; no extra picks
+  //           and no pills (plain required courses stay clean).
+  //   ge    → fill each unmet GE category, preferring double-cover (a) an unmet
+  //           major req, then (b) another unmet GE, else (c) random eligible.
+  //   minor → pick-N groups only placed when a course also covers an unmet major
+  //           or GE (else skipped); required minor courses always placed.
+  const buildAutofillSeed = useCallback(
+    (tab: "major" | "ge" | "minor") => {
+      const tags: Record<string, CoverageTag[]> = {};
+      const seedExtra: string[] = [];
+      const chosen = new Set<string>(); // normIds added this run
+
+      const unmetMajor = new Set<string>();
+      for (const r of requirements) {
+        if (getCoverage(r).remaining > 0) r.courses.forEach((c) => unmetMajor.add(normId(c)));
+      }
+
+      const geCats = geRequirements
+        .filter((r) => !apSatisfiedGEs.has(r.requirement_group ?? ""))
+        .map((r) => ({ code: geCode(r), req: r, remaining: clientCoverage(r).remaining }))
+        .filter((c) => c.remaining > 0);
+
+      const covers = (req: ReqGroup, cid: string) => req.courses.some((x) => normId(x) === normId(cid));
+      const available = (cid: string) =>
+        !!courseInfoMap[cid] && !placedSet.has(normId(cid)) && !chosen.has(normId(cid));
+      const add = (cid: string, t: CoverageTag[]) => {
+        seedExtra.push(cid);
+        tags[cid] = t;
+        chosen.add(normId(cid));
+      };
+
+      if (tab === "ge") {
+        const needByCode = new Map(geCats.map((c) => [c.code, c.remaining]));
+        for (const cat of geCats) {
+          while ((needByCode.get(cat.code) ?? 0) > 0) {
+            const eligible = cat.req.courses.filter(available);
+            if (eligible.length === 0) break;
+            const t: CoverageTag[] = [{ kind: "ge", code: cat.code }];
+            // PRIORITY 1: multi-GE cover — also satisfies another unfilled GE category
+            let pick = eligible.find((c) => geCats.some((o) => o.code !== cat.code && covers(o.req, c)));
+            if (pick) {
+              for (const o of geCats)
+                if (o.code !== cat.code && covers(o.req, pick)) t.push({ kind: "ge", code: o.code });
+            } else {
+              // PRIORITY 2: also satisfies an unplaced major requirement
+              pick = eligible.find((c) => unmetMajor.has(normId(c)));
+              if (pick) {
+                t.push({ kind: "major" });
+              } else {
+                // PRIORITY 3: any eligible course from the pool, picked randomly
+                pick = eligible[Math.floor(Math.random() * eligible.length)];
+              }
+            }
+            add(pick, t);
+            needByCode.set(cat.code, (needByCode.get(cat.code) ?? 1) - 1);
+            for (const tag of t)
+              if (tag.kind === "ge" && tag.code !== cat.code) {
+                const n = needByCode.get(tag.code);
+                if (n && n > 0) needByCode.set(tag.code, n - 1);
+              }
+          }
+        }
+        return { seedExtra, tags, seedOnly: true };
+      }
+
+      if (tab === "minor") {
+        for (const req of minorRequirements) {
+          const isPickN = req.courses_needed < req.courses.length;
+          if (isPickN) {
+            const eligible = req.courses.filter(available);
+            let pick = eligible.find((c) => unmetMajor.has(normId(c)));
+            let extra: CoverageTag[] = [];
+            if (pick) {
+              extra = [{ kind: "major" }];
+            } else {
+              for (const c of eligible) {
+                const hit = geCats.find((o) => covers(o.req, c));
+                if (hit) {
+                  pick = c;
+                  extra = [{ kind: "ge", code: hit.code }];
+                  break;
+                }
+              }
+            }
+            if (pick) add(pick, [{ kind: "minor" }, ...extra]);
+            // no cross-cover → skip this pick-N group entirely
+          } else {
+            for (const c of req.courses) {
+              if (!available(c)) continue;
+              const extra: CoverageTag[] = [];
+              if (unmetMajor.has(normId(c))) extra.push({ kind: "major" });
+              const hit = geCats.find((o) => covers(o.req, c));
+              if (hit) extra.push({ kind: "ge", code: hit.code });
+              add(c, [{ kind: "minor" }, ...extra]);
+            }
+          }
+        }
+        return { seedExtra, tags, seedOnly: true };
+      }
+
+      // major tab: keep the current schedule; backend fills the required backbone.
+      return { seedExtra, tags, seedOnly: false };
+    },
+    [requirements, geRequirements, minorRequirements, placedSet, getCoverage, clientCoverage, apSatisfiedGEs, courseInfoMap],
+  );
+
   // GE categories an ALREADY-PLACED course counts toward. Autofilled cards keep
   // their (capped) GE pills as the source of truth; everything else falls back
   // to authoritative ge_list. Keeps the "filled" tally consistent with pills.
@@ -2749,64 +2813,26 @@ export default function PlannerClient() {
     [coverageTags],
   );
 
-  // ── Shared schedule rebuild for any autofill (no optimizer) ────────────────
-  // Locked courses are the only fixed points. Every UNLOCKED placed course plus
-  // the tab's new `picks` (plus any prereqs auto-pulled from outside the pools)
-  // is re-placed from scratch: GE/lower-div early, upper-div late, minor spread,
-  // prereqs respected. Coverage pills carried by `tags` are applied to picks.
-  const rebuildSchedule = useCallback(
-    async (picks: string[], tags: Record<string, CoverageTag[]>, emptyMsg: string) => {
-      // Locked = fixed in place; everything else is re-placeable.
-      const lockedPos: Record<string, string> = {};
-      const unlockedExisting: string[] = [];
-      for (const [q, ids] of Object.entries(plannedCourses))
-        for (const id of ids) {
-          if (lockedCourses.has(id)) lockedPos[id] = q;
-          else unlockedExisting.push(id);
-        }
-
-      // Base set to place: unlocked existing ∪ new picks (deduped, minus locked).
-      const seen = new Set(Object.keys(lockedPos).map(normId));
-      const toPlace: string[] = [];
-      for (const id of [...unlockedExisting, ...picks]) {
-        const n = normId(id);
-        if (!seen.has(n)) { seen.add(n); toPlace.push(id); }
-      }
-      if (toPlace.length === 0) {
-        setToast(emptyMsg);
+  // ── Shared local placement for GE/Minor autofill ───────────────────────────
+  // Fetches prereq trees + any missing course details, then places `picks` into
+  // the lowest-difficulty valid quarter (never the optimizer, never moving
+  // existing courses) and applies the coverage pills. Defined before the
+  // handlers that depend on it.
+  const runLocalPlacement = useCallback(
+    async (picks: string[], tags: Record<string, CoverageTag[]>, tab: "ge" | "minor") => {
+      if (picks.length === 0) {
+        setToast(
+          tab === "ge"
+            ? "Nothing to add — GE categories are filled or have no eligible courses left."
+            : "Nothing to add — required minor courses are placed and no pick-N group cross-covers.",
+        );
         return;
       }
-
-      const apNorm = new Set([...apCreditedSet].map(normId));
-      const have = new Set<string>([...apNorm, ...Object.keys(lockedPos).map(normId), ...toPlace.map(normId)]);
-
-      // Auto-pull missing required prereqs (transitive) that aren't in any pool.
-      let trees = await fetchPrereqTrees(toPlace);
-      let frontier = [...toPlace];
-      const pulled: string[] = [];
-      let guard = 0;
-      while (frontier.length && guard++ < 20) {
-        const missing: string[] = [];
-        for (const cid of frontier) {
-          const tree = trees[cid] ?? trees[normId(cid)];
-          if (!tree) continue;
-          for (const m of requiredMissingCourses(tree, have)) {
-            const n = normId(m);
-            if (!have.has(n)) { have.add(n); missing.push(m); }
-          }
-        }
-        if (missing.length === 0) break;
-        pulled.push(...missing);
-        trees = { ...trees, ...(await fetchPrereqTrees(missing)) };
-        frontier = missing;
-      }
-      const allToPlace = [...toPlace, ...pulled];
-
-      // Hydrate details (terms / units / level) for anything missing.
-      let info = courseInfoMapRef.current;
-      const missingDetails = allToPlace.filter((id) => !info[id]);
-      if (missingDetails.length) {
-        const details = await fetchCourseDetails(missingDetails);
+      const trees = await fetchPrereqTrees(picks);
+      let infoNow = courseInfoMapRef.current;
+      const missing = picks.filter((id) => !infoNow[id]);
+      if (missing.length) {
+        const details = await fetchCourseDetails(missing);
         if (details.length) {
           setCourseInfoMap((prev) => {
             const n = { ...prev };
@@ -2815,41 +2841,36 @@ export default function PlannerClient() {
           });
           const merged = { ...courseInfoMapRef.current };
           for (const c of details) merged[c.id] = c;
-          info = merged;
-          fetchDifficulties(missingDetails);
+          infoNow = merged;
+          fetchDifficulties(missing);
         }
       }
-
-      const minorPool = new Set(minorRequirements.flatMap((r) => r.courses).map(normId));
-      const bandOf = (id: string) =>
-        courseBand(id, info[id], (info[id]?.ge_list?.length ?? 0) > 0, minorPool.has(normId(id)));
-
       const quarters: string[] = [];
       for (let y = 1; y <= numYears; y++) {
         for (const s of ["fall", "winter", "spring"]) quarters.push(qkey(y, s));
         if (summerYears.has(y)) quarters.push(qkey(y, "summer"));
       }
-
-      const { plan, unplaced } = placeWithPriority(
-        lockedPos, allToPlace, trees, info, difficultyMap, apNorm, quarters, maxUnits, bandOf,
+      const apNorm = new Set([...apCreditedSet].map(normId));
+      const { plan, placed, unplaced } = placeSelectedCourses(
+        plannedCourses, picks, trees, infoNow, difficultyMap, apNorm, quarters, maxUnits,
       );
       setPlannedCourses(plan);
       validatePlan(plan);
-
       const inPlan = new Set(Object.values(plan).flat());
       setCoverageTags((prev) => {
-        const next: Record<string, CoverageTag[]> = { ...prev, ...tags };
+        const next: Record<string, CoverageTag[]> = { ...prev };
+        for (const id of placed) next[id] = tags[id] ?? next[id];
         for (const k of Object.keys(next)) if (!inPlan.has(k)) delete next[k];
         return next;
       });
       if (unplaced.length) {
         setToast(
-          `Couldn't place ${unplaced.length} course(s) within offering terms/prereqs: ` +
+          `Couldn't place ${unplaced.length} course(s) within their offering terms/prereqs: ` +
             `${unplaced.slice(0, 3).join(", ")}${unplaced.length > 3 ? "…" : ""}`,
         );
       }
     },
-    [plannedCourses, lockedCourses, apCreditedSet, minorRequirements, numYears, summerYears, difficultyMap, maxUnits, validatePlan, fetchDifficulties],
+    [plannedCourses, numYears, summerYears, apCreditedSet, difficultyMap, maxUnits, validatePlan, fetchDifficulties],
   );
 
   // ── GE autofill (no optimizer) ─────────────────────────────────────────────
@@ -2945,8 +2966,8 @@ export default function PlannerClient() {
         }
       }
     }
-    await rebuildSchedule(picks, tags, "Nothing to schedule — GE categories are filled or everything is locked.");
-  }, [plannedCourses, geRequirements, apSatisfiedGEs, requirements, getCoverage, placedGECats, rebuildSchedule]);
+    await runLocalPlacement(picks, tags, "ge");
+  }, [plannedCourses, geRequirements, apSatisfiedGEs, requirements, getCoverage, placedGECats, runLocalPlacement]);
 
   // ── Minor autofill (no optimizer) ──────────────────────────────────────────
   const handleMinorAutofill = useCallback(async () => {
@@ -3017,32 +3038,8 @@ export default function PlannerClient() {
         // else: no cross-cover → skip this group entirely.
       }
     }
-    await rebuildSchedule(picks, tags, "Nothing to schedule — no minor courses to add or everything is locked.");
-  }, [plannedCourses, geRequirements, apSatisfiedGEs, minorRequirements, requirements, getCoverage, placedGECats, rebuildSchedule]);
-
-  // ── Major autofill (no optimizer) ──────────────────────────────────────────
-  // Adds remaining take-all required major courses (choice/elective pools stay
-  // user-driven), then rebuilds the whole unlocked schedule. Prereqs outside the
-  // major pool are auto-pulled by rebuildSchedule.
-  const handleMajorAutofill = useCallback(async () => {
-    const exclude = new Set<string>([
-      ...Object.values(plannedCourses).flat().map(normId),
-      ...[...apCreditedSet].map(normId),
-    ]);
-    const picks: string[] = [];
-    const chosen = new Set<string>();
-    for (const r of requirements) {
-      const isChoice = r.courses_needed < r.courses.length || r.requirement_type === "elective";
-      if (isChoice) continue; // take-all required groups only
-      for (const c of r.courses) {
-        const n = normId(c);
-        if (exclude.has(n) || chosen.has(n)) continue;
-        chosen.add(n);
-        picks.push(c);
-      }
-    }
-    await rebuildSchedule(picks, {}, "Nothing to schedule — required courses are placed or everything is locked.");
-  }, [plannedCourses, apCreditedSet, requirements, rebuildSchedule]);
+    await runLocalPlacement(picks, tags, "minor");
+  }, [plannedCourses, geRequirements, apSatisfiedGEs, minorRequirements, requirements, getCoverage, placedGECats, runLocalPlacement]);
 
   const toggleSummer = useCallback((year: number) => {
     setSummerYears((prev) => {
@@ -3443,14 +3440,63 @@ export default function PlannerClient() {
                 setToast(null);
                 try {
                   if (sidebarTab === "ge") {
-                    await handleGEAutofill();    // local rebuild — never the optimizer
+                    await handleGEAutofill();   // local placement — never the optimizer
                   } else if (sidebarTab === "minor") {
-                    await handleMinorAutofill();  // local rebuild — never the optimizer
+                    await handleMinorAutofill(); // local placement — never the optimizer
                   } else {
-                    await handleMajorAutofill();  // local rebuild — never the optimizer
+                    // MAJOR (unchanged): the optimizer fills the required backbone,
+                    // seeding from the current schedule so nothing is wiped.
+                    const { seedExtra, tags, seedOnly } = buildAutofillSeed(sidebarTab);
+                    const currentCourses = Object.values(plannedCourses).flat();
+                    const seed_courses = [...currentCourses, ...seedExtra];
+
+                    const res = await fetch("/api/optimizer", {
+                      method: "POST",
+                      headers: { "Content-Type": "application/json" },
+                      body: JSON.stringify({
+                        major_id: selectedMajorId,
+                        completed_courses: [],
+                        graduation_quarter: gradQuarter,
+                        units_per_quarter: maxUnits,
+                        waived_ges: [],
+                        ap_scores: apScores,
+                        // Pin the optimizer window to the grid's first (Fall) quarter
+                        // so it never schedules into off-grid quarters.
+                        start_quarter: qkey(1, "fall"),
+                        seed_courses,
+                        seed_only: seedOnly,
+                      }),
+                    });
+                    const data = await res.json();
+                    if (!res.ok) {
+                      const msg =
+                        typeof data?.detail === "object"
+                          ? (data.detail.message ?? JSON.stringify(data.detail))
+                          : (data?.detail ?? data?.error ?? "Optimizer error");
+                      setToast(String(msg));
+                    } else {
+                      setLockConflictErrors(null);
+                      const plan = data?.variants?.[0]?.planned_courses as
+                        | PlannedCourses
+                        | undefined;
+                      if (plan) {
+                        setPlannedCourses(plan);
+                        validatePlan(plan);
+                        // Attach coverage pills for courses present in the result.
+                        const placedNow = new Set(Object.values(plan).flat());
+                        setCoverageTags((prev) => {
+                          const merged: Record<string, CoverageTag[]> = { ...prev, ...tags };
+                          const next: Record<string, CoverageTag[]> = {};
+                          for (const [id, t] of Object.entries(merged)) if (placedNow.has(id)) next[id] = t;
+                          return next;
+                        });
+                      } else {
+                        setToast("No plan returned from optimizer");
+                      }
+                    }
                   }
                 } catch (err) {
-                  setToast(err instanceof Error ? err.message : "Autofill failed");
+                  setToast(err instanceof Error ? err.message : "Optimizer unavailable");
                 } finally {
                   setAutoFillLoading(false);
                 }
@@ -3570,10 +3616,10 @@ export default function PlannerClient() {
                   <svg className="w-3.5 h-3.5 animate-spin" viewBox="0 0 12 12" fill="none">
                     <circle cx="6" cy="6" r="4.5" stroke="currentColor" strokeWidth="1.5" strokeDasharray="20 8"/>
                   </svg>
-                  Rebalancing…
+                  Optimizing…
                 </>
               ) : (
-                <>Rebalance Difficulty</>
+                <>Optimize Schedule</>
               )}
             </button>
 
