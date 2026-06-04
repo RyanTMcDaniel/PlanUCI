@@ -11,6 +11,7 @@ POST /optimizer/requirements_state — plan_generator.get_requirements_state()
 
 import sys
 import os
+import threading
 
 # Ensure backend/ is on sys.path so scripts.optimizer.* is importable
 _BACKEND = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -40,6 +41,18 @@ load_dotenv(_ENV)
 
 def _supabase_client():
     return create_client(os.getenv("SUPABASE_URL"), os.getenv("SUPABASE_SERVICE_KEY"))
+
+
+def _increment_stat(stat_key: str) -> None:
+    """Fire-and-forget app_stats counter bump — runs off-thread so it can never
+    block or raise into the request path."""
+    def _run():
+        try:
+            _supabase_client().rpc("increment_stat", {"stat_key": stat_key}).execute()
+        except Exception:
+            pass
+    threading.Thread(target=_run, daemon=True).start()
+
 
 router = APIRouter()
 
@@ -154,6 +167,7 @@ def optimizer_generate(req: GenerateRequest):
         "cached":               False,
     }
     optimizer_cache.set(client, cache_key, response)
+    _increment_stat("schedules_saved")  # fire-and-forget; never blocks the response
     return response
 
 

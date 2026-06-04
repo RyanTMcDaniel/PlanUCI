@@ -55,3 +55,31 @@ ALTER TABLE public.saved_degree_plans ENABLE ROW LEVEL SECURITY;
 CREATE POLICY "owner access" ON public.saved_degree_plans
   USING (auth.uid() = user_id)
   WITH CHECK (auth.uid() = user_id);
+
+-- 5. app_stats: app-wide counters (read via the SUPABASE_SERVICE_KEY only)
+CREATE TABLE IF NOT EXISTS public.app_stats (
+  key        TEXT PRIMARY KEY,
+  value      BIGINT NOT NULL DEFAULT 0,
+  updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+INSERT INTO public.app_stats (key, value) VALUES ('schedules_saved', 0)
+ON CONFLICT (key) DO NOTHING;
+
+-- No RLS policy → only the service role can read/write (anon has no access).
+
+-- Atomic counter bump, called fire-and-forget from the optimizer backend.
+CREATE OR REPLACE FUNCTION public.increment_stat(stat_key TEXT)
+RETURNS VOID AS $$
+BEGIN
+  UPDATE public.app_stats SET value = value + 1, updated_at = NOW()
+  WHERE key = stat_key;
+END;
+$$ LANGUAGE plpgsql;
+
+-- auth.users isn't exposed over PostgREST, so expose the count via a
+-- SECURITY DEFINER function the service role can call with rpc().
+CREATE OR REPLACE FUNCTION public.get_total_users()
+RETURNS BIGINT AS $$
+  SELECT COUNT(*) FROM auth.users;
+$$ LANGUAGE sql SECURITY DEFINER;
