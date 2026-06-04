@@ -2745,32 +2745,61 @@ export default function PlannerClient() {
       };
       for (const c of pool) visit(c, new Set());
 
-      // Round-robin seed across quarters, respecting prereq floor + unit cap.
+      // Prereq floor: 1 + the latest quarter any in-pool prereq is assigned to.
       const assignedIdx = new Map<string, number>();
-      let rr = 0;
-      for (const c of ordered) {
-        const u = unitsOf(c);
+      const floorOf = (c: string): number => {
         let floor = 0;
         for (const p of prereqsInPool(c)) {
           const pi = assignedIdx.get(normId(p));
           if (pi != null) floor = Math.max(floor, pi + 1);
         }
-        floor = Math.min(floor, quarters.length - 1);
+        return floor;
+      };
+      // Seed in topological order at the EARLIEST slot >= floor (prereqs land as
+      // early as possible, so dependents always have a later slot). Prefer
+      // under-cap quarters; overload only as a last resort (optimizer fixes units).
+      for (const c of ordered) {
+        const u = unitsOf(c);
+        const floor = Math.min(floorOf(c), quarters.length - 1);
         let chosen = -1;
-        for (let k = 0; k < quarters.length; k++) {
-          const i = (rr + k) % quarters.length;
-          if (i < floor) continue;
+        for (let i = floor; i < quarters.length; i++) {
           if (quarterUnits[i] + u <= maxUnits) { chosen = i; break; }
         }
-        if (chosen === -1) {
-          // No capped room at/after the floor — use the least-full eligible quarter.
-          chosen = floor;
-          for (let i = floor; i < quarters.length; i++) if (quarterUnits[i] < quarterUnits[chosen]) chosen = i;
-        }
+        if (chosen === -1) chosen = floor; // no capped room at/after floor → overload at floor
         planned_courses[quarters[chosen]].push(c);
         quarterUnits[chosen] += u;
         assignedIdx.set(normId(c), chosen);
-        rr = (chosen + 1) % quarters.length;
+      }
+
+      // Enforce "course strictly after every in-pool prereq", iterating until
+      // stable so a move cascades to that course's own dependents. (Whenever the
+      // grid has room this guarantees prereqQuarter + 1; a course can only stay
+      // put if its prereq is already in the last quarter — genuine window-too-
+      // short, surfaced later by validation.)
+      let changed = true;
+      let safety = 0;
+      const maxIter = (ordered.length + 1) * (quarters.length + 1);
+      while (changed && safety++ < maxIter) {
+        changed = false;
+        for (const c of ordered) {
+          const floor = floorOf(c);
+          if (floor > quarters.length - 1) continue; // can't fit after prereq in this grid
+          const cur = assignedIdx.get(normId(c));
+          if (cur == null || cur >= floor) continue;
+          const u = unitsOf(c);
+          let target = -1;
+          for (let i = floor; i < quarters.length; i++) {
+            if (quarterUnits[i] + u <= maxUnits) { target = i; break; }
+          }
+          if (target === -1) target = floor;
+          if (target === cur) continue;
+          planned_courses[quarters[cur]] = planned_courses[quarters[cur]].filter((x) => x !== c);
+          quarterUnits[cur] -= u;
+          planned_courses[quarters[target]].push(c);
+          quarterUnits[target] += u;
+          assignedIdx.set(normId(c), target);
+          changed = true;
+        }
       }
 
       // (e) send to /api/whatif — same shape as the Optimize Schedule button.
