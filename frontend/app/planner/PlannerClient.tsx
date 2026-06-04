@@ -66,13 +66,6 @@ const GE_CODE_LABELS: Record<string, string> = {
   GE_VIII: "VIII",
 };
 
-// GE category code for display/labels: maps via GE_CODE_LABELS, falling back to
-// the requirement_group with the "GE_" prefix stripped.
-function geCode(req: ReqGroup): string {
-  const g = req.requirement_group ?? "";
-  return GE_CODE_LABELS[g] ?? (g.replace(/^GE[_-]?/i, "") || req.group_name);
-}
-
 // ge_list token (e.g. "III", "Va") → requirement_group. The authoritative GE
 // taxonomy: a course satisfies a category iff its ge_list says so.
 const GE_TOKEN_TO_GROUP: Record<string, string> = {
@@ -119,51 +112,13 @@ function getCourseGECategories(course: CourseDetail | undefined, geRequirements:
   return [...out].sort((a, b) => (GE_ORDER[a] ?? 99) - (GE_ORDER[b] ?? 99));
 }
 
-// ── Prerequisite-tree evaluation (mirrors backend hard_constraints._eval_tree) ──
-// A node is { AND|OR|NOT: item[] }; an item is a leaf or a nested node.
-// `available` = normed ids completed in PRIOR quarters (+ AP); `sameQuarter` =
-// normed ids in the candidate quarter (satisfies coreqs only).
+// Prerequisite-tree node/leaf shape: { AND|OR|NOT: item[] }, where a leaf has a
+// prereqType ("course" | "exam") and (for courses) a courseId / coreq flag.
 type PrereqItem = {
   prereqType?: string;
   courseId?: string;
   coreq?: boolean;
 } & Record<string, unknown>;
-
-function evalPrereqItem(item: PrereqItem, available: Set<string>, sameQuarter: Set<string>): boolean {
-  if (item?.prereqType === "course") {
-    const cid = normId(String(item.courseId ?? ""));
-    if (item.coreq) return available.has(cid) || sameQuarter.has(cid);
-    return available.has(cid);
-  }
-  if (item?.prereqType === "exam") return true; // AP/exam prereqs assumed handled
-  return evalPrereqTree(item, available, sameQuarter);
-}
-
-function evalPrereqTree(node: unknown, available: Set<string>, sameQuarter: Set<string>): boolean {
-  if (!node || typeof node !== "object") return true;
-  const n = node as Record<string, unknown>;
-  if (Array.isArray(n.AND)) return (n.AND as PrereqItem[]).every((i) => evalPrereqItem(i, available, sameQuarter));
-  if (Array.isArray(n.OR)) return (n.OR as PrereqItem[]).some((i) => evalPrereqItem(i, available, sameQuarter));
-  if (Array.isArray(n.NOT))
-    return !(n.NOT as PrereqItem[]).some(
-      (i) => i?.prereqType === "course" && available.has(normId(String(i.courseId ?? ""))),
-    );
-  return true; // empty node — no prereqs
-}
-
-// Seasons a course is offered in (lowercase), parsed from terms like "2023 Fall".
-function offeredSeasons(terms: string[] | null | undefined): Set<string> {
-  const s = new Set<string>();
-  for (const t of terms ?? []) {
-    const season = t.trim().split(/\s+/).pop()?.toLowerCase();
-    if (season) s.add(season);
-  }
-  return s;
-}
-
-function seasonOf(qk: string): string {
-  return qk.split("_")[1] ?? "";
-}
 
 // ── Prereq closure ─────────────────────────────────────────────────────────
 // Course-leaf ids that must be ADDED so a prereq tree is satisfiable given what
