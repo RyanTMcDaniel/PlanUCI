@@ -36,10 +36,12 @@ WEIGHTS = {
     # Discourage under-loaded quarters: non-empty quarters should carry >=12 units.
     "min_units_load":       0.30,
     # Earliness preferences: nudge lower-division courses and GE-satisfying
-    # courses toward earlier quarters. Below the smallest existing term (0.20)
-    # so they influence ordering without overriding difficulty/feasibility.
-    "lower_div_earliness":  0.15,
-    "ge_earliness":         0.15,
+    # courses toward earlier quarters. Kept below difficulty_balance (0.40) and
+    # adjacent_smoothing (0.40) so they never override difficulty/feasibility,
+    # but raised enough that their per-move deltas (≈ weight × 1/n) actually
+    # register against difficulty_balance moves instead of being drowned out.
+    "lower_div_earliness":  0.35,
+    "ge_earliness":         0.30,
 }
 
 _DEFAULT_DIFFICULTY = 5.0   # used when a course has no entry in the CSV

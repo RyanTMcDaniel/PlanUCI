@@ -150,8 +150,10 @@ function requiredMissingCourses(node: unknown, have: Set<string>): string[] {
   return []; // NOT / unknown → nothing to add
 }
 
-// All course-leaf ids referenced anywhere in a prereq tree's AND/OR branches
-// (NOT = anti-requisite, skipped). Used to derive topological seed ordering.
+// STRICT prereq course-leaf ids referenced in a prereq tree's AND/OR branches
+// (NOT = anti-requisite, skipped; coreq:true leaves skipped — those are
+// same-quarter partners, not "must come before"). Used to derive topological
+// seed ordering and prereq floors.
 function collectPrereqCourseLeaves(node: unknown): string[] {
   if (!node || typeof node !== "object") return [];
   const n = node as Record<string, unknown>;
@@ -160,9 +162,32 @@ function collectPrereqCourseLeaves(node: unknown): string[] {
     const arr = n[key];
     if (!Array.isArray(arr)) continue;
     for (const item of arr as PrereqItem[]) {
-      if (item?.prereqType === "course" && item.courseId) out.push(String(item.courseId));
-      else if (item?.prereqType !== "exam" && item && typeof item === "object") {
+      if (item?.prereqType === "course" && item.courseId && item.coreq !== true) {
+        out.push(String(item.courseId));
+      } else if (item?.prereqType !== "exam" && item && typeof item === "object") {
         out.push(...collectPrereqCourseLeaves(item));
+      }
+    }
+  }
+  return out;
+}
+
+// Corequisite course-leaf ids (coreq:true) referenced in a prereq tree. A coreq
+// means "same quarter", not "before" — these drive the coreq alignment pass in
+// the seed, NOT the prereq floor. Coreq edges are stored one-directionally
+// (e.g. MATH105A's tree points at MATH105LA; the lab's tree is empty).
+function collectCoreqCourseLeaves(node: unknown): string[] {
+  if (!node || typeof node !== "object") return [];
+  const n = node as Record<string, unknown>;
+  const out: string[] = [];
+  for (const key of ["AND", "OR"] as const) {
+    const arr = n[key];
+    if (!Array.isArray(arr)) continue;
+    for (const item of arr as PrereqItem[]) {
+      if (item?.prereqType === "course" && item.courseId && item.coreq === true) {
+        out.push(String(item.courseId));
+      } else if (item?.prereqType !== "exam" && item && typeof item === "object") {
+        out.push(...collectCoreqCourseLeaves(item));
       }
     }
   }
@@ -851,27 +876,24 @@ function CourseTooltip({
 // blue = major requirement, green = GE category (with code), purple = minor.
 
 function CoverageTags({ tags }: { tags: CoverageTag[] }) {
-  if (tags.length === 0) return null;
+  // Only GE coverage gets a pill — major/minor cards stay clean. Rendered as a
+  // fragment of spans (no wrapper) so the caller can flow them inline, right of
+  // the course code, with the first pill kept on the code's line.
+  const geTags = tags.filter(
+    (t): t is Extract<CoverageTag, { kind: "ge" }> => t.kind === "ge",
+  );
+  if (geTags.length === 0) return null;
   return (
-    <div className="flex flex-wrap items-center gap-1 mt-1">
-      {tags.map((t, i) => {
-        const label = t.kind === "major" ? "Major" : t.kind === "minor" ? "Minor" : t.code;
-        const cls =
-          t.kind === "major"
-            ? "bg-[#3b82f6]/20 border-[#3b82f6]/40 text-[#93c5fd]"
-            : t.kind === "minor"
-            ? "bg-purple-500/20 border-purple-500/40 text-purple-300"
-            : "bg-emerald-500/20 border-emerald-500/40 text-emerald-300";
-        return (
-          <span
-            key={i}
-            className={`rounded-full border px-1.5 py-[1px] text-[8.5px] font-bold leading-none tracking-wide ${cls}`}
-          >
-            {label}
-          </span>
-        );
-      })}
-    </div>
+    <>
+      {geTags.map((t, i) => (
+        <span
+          key={i}
+          className="rounded-full border px-1.5 py-[1px] text-[8.5px] font-bold leading-none tracking-wide bg-emerald-500/20 border-emerald-500/40 text-emerald-300"
+        >
+          {t.code}
+        </span>
+      ))}
+    </>
   );
 }
 
@@ -925,13 +947,15 @@ function PlacedCard({
         ⠿
       </span>
 
-      {/* content — course code (larger) + name (smaller) + coverage pills */}
+      {/* content — course code + GE pills (inline, right of the code) over name */}
       <div className="flex-1 min-w-0 flex flex-col justify-center gap-0.5 py-1">
-        <p className="text-[19px] font-bold text-[#e8e8e8] leading-tight truncate">{courseId}</p>
+        <div className="flex flex-wrap items-center gap-1.5">
+          <p className="text-[19px] font-bold text-[#e8e8e8] leading-tight truncate">{courseId}</p>
+          {tags && <CoverageTags tags={tags} />}
+        </div>
         {title && (
           <p title={title} className="text-[10px] text-[#999] leading-snug overflow-hidden text-ellipsis whitespace-nowrap">{title}</p>
         )}
-        {tags && <CoverageTags tags={tags} />}
       </div>
 
       {/* units (top) + avg gpa (below) — right side, left of action strip */}
@@ -2653,27 +2677,33 @@ export default function PlannerClient() {
   // schedule is left untouched.
   const buildAndOptimizePool = useCallback(
     async (newPicks: string[], newTags: Record<string, CoverageTag[]> = {}) => {
-      // (a) unlocked existing + locked positions.
+      // AP-credited courses are already satisfied (no quarter, never placeable);
+      // they must never enter the pool or lockedMap — they're passed to the
+      // optimizer as completed_courses instead.
+      const apNorm = new Set([...apCreditedSet].map(normId));
+
+      // (a) unlocked existing + locked positions (AP-credited courses excluded).
       const lockedMap: Record<string, string> = {};
       const unlockedExisting: string[] = [];
       for (const [q, ids] of Object.entries(plannedCourses))
         for (const id of ids) {
+          if (apNorm.has(normId(id))) continue;
           if (lockedCourses.has(id)) lockedMap[id] = q;
           else unlockedExisting.push(id);
         }
 
-      // (b) merge with new picks (dedupe by normalized id).
+      // (b) merge with new picks (dedupe by normalized id; AP-credited excluded).
       const seenNorm = new Set<string>();
       const pool: string[] = [];
       for (const id of [...unlockedExisting, ...newPicks]) {
         const nn = normId(id);
+        if (apNorm.has(nn)) continue;
         if (seenNorm.has(nn)) continue;
         seenNorm.add(nn);
         pool.push(id);
       }
 
       // (c) inject missing prereqs (transitive). have = pool ∪ locked ∪ AP.
-      const apNorm = new Set([...apCreditedSet].map(normId));
       const have = new Set<string>([...pool.map(normId), ...Object.keys(lockedMap).map(normId), ...apNorm]);
       let trees = await fetchPrereqTrees(pool); // ← prereq fetch #1
       let frontier = [...pool];
@@ -2802,6 +2832,45 @@ export default function PlannerClient() {
         }
       }
 
+      // (d.1) Coreq alignment: a coreq:true leaf means SAME quarter, not "after".
+      // Pull each coreq pair onto a single quarter — the LATER of the two current
+      // slots, so the strict-prereq floor of either partner is still respected
+      // (their prereqs were floored at or before their current slots). Iterate
+      // until stable so a course shared across pairs drags its whole coreq
+      // component together. Co-location is mandatory, so this may overload a
+      // quarter past the unit cap — consistent with the seeding above, the
+      // optimizer rebalances units afterward. Keeping the pair together here
+      // means whatif's base-aware split guard never sees (and freezes) a split.
+      const coreqPartnersInPool = (id: string): string[] =>
+        collectCoreqCourseLeaves(trees[id] ?? trees[normId(id)]).filter(
+          (p) => poolNorm.has(normId(p)) && normId(p) !== normId(id),
+        );
+      let coreqChanged = true;
+      let coreqSafety = 0;
+      const coreqMaxIter = (ordered.length + 1) * (quarters.length + 1);
+      while (coreqChanged && coreqSafety++ < coreqMaxIter) {
+        coreqChanged = false;
+        for (const c of ordered) {
+          for (const p of coreqPartnersInPool(c)) {
+            const partner = pool.find((x) => normId(x) === normId(p));
+            if (!partner) continue;
+            const ci = assignedIdx.get(normId(c));
+            const pi = assignedIdx.get(normId(partner));
+            if (ci == null || pi == null || ci === pi) continue;
+            const target = Math.max(ci, pi); // later slot respects both prereq floors
+            const mover = ci < pi ? c : partner;
+            const from = Math.min(ci, pi);
+            const u = unitsOf(mover);
+            planned_courses[quarters[from]] = planned_courses[quarters[from]].filter((x) => x !== mover);
+            quarterUnits[from] -= u;
+            planned_courses[quarters[target]].push(mover);
+            quarterUnits[target] += u;
+            assignedIdx.set(normId(mover), target);
+            coreqChanged = true;
+          }
+        }
+      }
+
       // (e) send to /api/whatif — same shape as the Optimize Schedule button.
       const res = await fetch("/api/whatif", {
         method: "POST",
@@ -2809,7 +2878,7 @@ export default function PlannerClient() {
         body: JSON.stringify({
           plan: {
             major_id: selectedMajorId,
-            completed_courses: [],
+            completed_courses: [...apCreditedSet],
             planned_courses,
             graduation_year: parseInt(gradQuarter.split("_")[0]),
             units_per_quarter: maxUnits,
