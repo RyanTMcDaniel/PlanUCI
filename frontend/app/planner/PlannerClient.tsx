@@ -768,25 +768,22 @@ function PlacedCard({
         ⠿
       </span>
 
-      {/* content */}
-      <div className="flex-1 min-w-0 flex flex-col justify-center gap-1 py-1.5">
-        {/* course code (larger) + name (smaller) */}
-        <div className="min-w-0">
-          <p className="text-[19px] font-bold text-[#e8e8e8] leading-tight truncate">{courseId}</p>
-          {title && (
-            <p className="text-[12px] text-[#999] leading-snug truncate">{title}</p>
-          )}
-        </div>
+      {/* content — course code (larger) + name (smaller) */}
+      <div className="flex-1 min-w-0 flex flex-col justify-center gap-0.5 py-1.5">
+        <p className="text-[19px] font-bold text-[#e8e8e8] leading-tight truncate">{courseId}</p>
+        {title && (
+          <p className="text-[12px] text-[#999] leading-snug truncate">{title}</p>
+        )}
+      </div>
 
-        {/* gpa + units — left aligned */}
-        <div className="flex items-center gap-2">
-          {gpa != null && isFinite(gpa) ? (
-            <span className="text-[10px] font-mono font-medium" style={{ color: "#9a9a9a" }}>{gpa.toFixed(2)} AVG GPA</span>
-          ) : (
-            <span className="text-[9px] font-mono text-[#5a5a5a] whitespace-nowrap">No GPA Data</span>
-          )}
-          <span className="text-[11px] font-medium text-[#888] tabular-nums">{units ?? "?"} <span className="font-normal text-[#5a5a5a]">UNITS</span></span>
-        </div>
+      {/* units (top) + avg gpa (below) — right side, left of action strip */}
+      <div className="flex flex-col items-end justify-center gap-0.5 shrink-0 py-1.5 pr-1 text-right">
+        <span className="text-[11px] font-medium text-[#888] tabular-nums">{units ?? "?"} <span className="font-normal text-[#5a5a5a]">UNITS</span></span>
+        {gpa != null && isFinite(gpa) ? (
+          <span className="text-[10px] font-mono font-medium" style={{ color: "#9a9a9a" }}>{gpa.toFixed(2)} AVG GPA</span>
+        ) : (
+          <span className="text-[9px] font-mono text-[#5a5a5a] whitespace-nowrap">No GPA Data</span>
+        )}
       </div>
 
       {/* right-edge action strip — full card height: remove (top) / lock (bottom) */}
