@@ -35,6 +35,11 @@ WEIGHTS = {
     "adjacent_smoothing":   0.40,
     # Discourage under-loaded quarters: non-empty quarters should carry >=12 units.
     "min_units_load":       0.30,
+    # Penalise quarters that exceed the unit cap. Weighted above difficulty_balance
+    # and adjacent_smoothing so the hill-climber actively moves courses OUT of
+    # over-cap quarters (e.g. into otherwise-empty later quarters) rather than
+    # leaving them packed.
+    "over_cap_penalty":     0.50,
     # Earliness preferences: nudge lower-division courses and GE-satisfying
     # courses toward earlier quarters. Kept below difficulty_balance (0.40) and
     # adjacent_smoothing (0.40) so they never override difficulty/feasibility,
@@ -292,6 +297,31 @@ def min_units_load(plan: CoursePlan, course_meta: dict[str, dict]) -> float:
     if not shortfalls:
         return 0.0
     return sum(shortfalls) / len(shortfalls)
+
+
+def over_cap_penalty(
+    plan: CoursePlan, units_per_quarter: int, course_meta: dict[str, dict]
+) -> float:
+    """Penalty for quarters whose unit total exceeds the cap.
+
+    For every quarter the normalised excess ``max(0, units - cap) / cap`` is
+    computed (quarters at or under the cap contribute 0) and SUMMED across
+    quarters.  (Summing rather than averaging over all quarters is deliberate:
+    dividing by the full quarter count diluted the term ~Nx below min_units_load,
+    so the hill-climber wouldn't move courses out of over-cap quarters — the whole
+    point of this term.)  Real per-course units come from course_meta; missing
+    entries fall back to UNITS_PER_COURSE.  Lower is better, like every soft term.
+    """
+    if units_per_quarter <= 0:
+        return 0.0
+    total = 0.0
+    for courses in plan.planned_courses.values():
+        units = sum(
+            (course_meta.get(_norm(c), {}).get("min_units") or UNITS_PER_COURSE)
+            for c in courses
+        )
+        total += max(0.0, units - units_per_quarter) / units_per_quarter
+    return total
 
 
 def _course_number(course_id: str) -> int | None:

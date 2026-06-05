@@ -47,6 +47,7 @@ from .soft_constraints import (
     lower_div_earliness,
     major_clustering,
     min_units_load,
+    over_cap_penalty,
     workload_progression,
 )
 
@@ -132,6 +133,7 @@ def _soft_score(
         "major_clustering":     major_clustering(plan, meta),
         "adjacent_smoothing":   adjacent_smoothing(plan, diff_scores),
         "min_units_load":       min_units_load(plan, meta),
+        "over_cap_penalty":     over_cap_penalty(plan, plan.units_per_quarter, meta),
         "lower_div_earliness":  lower_div_earliness(plan, locked_norm),
         "ge_earliness":         ge_earliness(plan, meta, locked_norm),
     }

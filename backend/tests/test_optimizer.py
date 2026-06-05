@@ -281,11 +281,12 @@ def test_whatif_does_not_split_coreqs():
 # ── 12. Unit cap uses real units + escalation ladder ─────────────────────────
 
 def test_unit_cap_tiers_ladder():
+    # Escalation is bounded to base_cap + 4 (the requested cap is the hard limit).
     from scripts.optimizer.hard_constraints import unit_cap_tiers
-    assert unit_cap_tiers(16) == [16, 20, 24]
+    assert unit_cap_tiers(16) == [16, 20]
     assert unit_cap_tiers(20) == [20, 24]
     assert unit_cap_tiers(24) == [24]
-    assert unit_cap_tiers(18) == [18, 20, 24]
+    assert unit_cap_tiers(18) == [18, 20]
 
 
 def test_units_valid_uses_real_units(client):

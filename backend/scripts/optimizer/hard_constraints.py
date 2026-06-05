@@ -26,13 +26,17 @@ UNIT_CAP_LADDER = (20, 24)
 
 
 def unit_cap_tiers(base_cap: int) -> list[int]:
-    """Caps to try, ascending: the requested cap first, then 20 then 24.
+    """Caps to try, ascending: the requested cap first, then ladder tiers up to
+    base_cap + 4 (the absolute ceiling).
 
-    Tiers below the requested cap are dropped (never schedule looser than asked
-    for at the first attempt), and 24 is the ceiling.
+    The requested cap is the intended hard limit; escalation is bounded to +4 so
+    the optimizer can't quietly schedule far over the requested load (which let
+    over-cap quarters pass as hard-valid instead of spreading courses out). Tiers
+    below the requested cap are dropped (never looser than asked at first try).
     """
+    ceiling = base_cap + 4
     tiers = sorted({base_cap, *UNIT_CAP_LADDER})
-    return [t for t in tiers if base_cap <= t <= max(base_cap, 24)] or [base_cap]
+    return [t for t in tiers if base_cap <= t <= ceiling] or [base_cap]
 
 
 def _qkey(qstr: str) -> tuple[int, int]:
