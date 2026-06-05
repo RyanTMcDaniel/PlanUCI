@@ -2874,8 +2874,10 @@ export default function PlannerClient() {
       // Pass 2: place each deferred (overloaded) course by scanning FORWARD from
       // its floor toward the end of the grid for the first under-cap quarter, so
       // overflow lands in later / still-empty quarters instead of overloading the
-      // front. If the whole tail is full, overload the LAST quarter (keeps the
-      // front clean and avoids leaving trailing quarters empty).
+      // front. If the whole tail is full, spread the overflow onto the LEAST-
+      // loaded quarter at/after the floor (FIX A) instead of dumping every
+      // deferred course onto the last quarter — that kept the front clean but
+      // stacked all overflow into one 32+ unit quarter that whatif rejects.
       for (const c of deferred) {
         const u = unitsOf(c);
         const floor = Math.min(floorOf(c), quarters.length - 1);
@@ -2883,7 +2885,15 @@ export default function PlannerClient() {
         for (let i = floor; i < quarters.length; i++) {
           if (quarterUnits[i] + u <= maxUnits) { chosen = i; break; }
         }
-        if (chosen === -1) chosen = quarters.length - 1; // tail full → overload the END
+        if (chosen === -1) {
+          // No under-cap quarter at/after the floor → minimum-load quarter at/
+          // after the floor (spread overflow as evenly as possible). The floor
+          // is clamped to a valid index above, so this loop always finds one.
+          for (let i = floor; i < quarters.length; i++) {
+            if (chosen === -1 || quarterUnits[i] < quarterUnits[chosen]) chosen = i;
+          }
+          if (chosen === -1) chosen = quarters.length - 1; // no slot at/after floor at all
+        }
         planned_courses[quarters[chosen]].push(c);
         quarterUnits[chosen] += u;
         assignedIdx.set(normId(c), chosen);
@@ -2956,82 +2966,110 @@ export default function PlannerClient() {
         }
       }
 
-      // (d.2) OR-gated prereq pullback. Strict (AND) prereqs are floored, but
-      // OR-gated prereqs (e.g. MATH 1B → MATH2A, BIO SCI 93 → BIOSCI94) carry no
-      // floor (FIX A), so an injected one can land in the same/later quarter than
-      // its dependent. Real, OR-aware check (requiredMissingCourses): a course's
-      // tree is satisfied if any OR option sits in an EARLIER quarter (or AP / a
-      // same-quarter coreq partner). When a representative prereq is found in the
-      // same/later quarter, move the prereq EARLIER — to the latest under-cap
-      // quarter before the dependent that is still after the prereq's OWN
-      // prerequisites (the guard that prevents pulling a course back past its own
-      // chain and oscillating). If no such slot exists, nudge the dependent one
-      // slot later instead. One fix per pass, then rescan; capped at
-      // (courses+1)·(quarters+1) passes (matches the other seed passes) — enough
-      // to spread a full prereq chain once unearned exam options no longer mask
-      // it, while still bounding the loop.
-      const haveBefore = (qi: number): Set<string> => {
-        const h = new Set<string>(apNorm);
-        for (let i = 0; i < qi; i++) for (const id of planned_courses[quarters[i]]) h.add(normId(id));
-        return h;
+      // (d.2) OR-aware re-placement. Strict (AND) prereqs are floored by Pass 1/
+      // stabilization, but OR-gated representative prereqs (e.g. MATH 1B → MATH2A,
+      // BIO SCI 93 → BIOSCI94) carry no floor (FIX A), so a whole OR-gated chain
+      // can land stacked in one quarter or out of order, and an injected prereq
+      // can sit AFTER its dependent. The previous patch nudged dependents one
+      // inversion at a time, which cascaded a chain toward the empty tail (a
+      // 32-unit final quarter) and emptied the front. Instead we re-derive an
+      // OR-aware floor and re-place every UNLOCKED course topologically from the
+      // front: each course lands in the earliest under-cap quarter at/after all of
+      // its already-placed OR-aware prereqs, so chains spread in order without
+      // overloading the tail. Locked courses keep their quarter and only constrain
+      // capacity. This makes the seed feasible up front instead of patching it.
+
+      // OR-aware in-pool prereqs of a course: the representative course set
+      // requiredMissingCourses would inject against AP-only (every AND course leaf
+      // plus the first option of each unsatisfied OR), restricted to the pool and
+      // with same-quarter coreq partners removed (those are a same-quarter floor,
+      // handled below — not a strict-before floor).
+      const orPrereqsInPool = (id: string): string[] => {
+        const tree = trees[id] ?? trees[normId(id)];
+        if (!tree) return [];
+        const coreqs = new Set(coreqPartnersInPool(id).map(normId));
+        return requiredMissingCourses(tree, new Set(apNorm), examScores).filter(
+          (p) => poolNorm.has(normId(p)) && normId(p) !== normId(id) && !coreqs.has(normId(p)),
+        );
       };
-      let pullSafety = 0;
-      let pullChanged = true;
-      const pullMaxIter = (ordered.length + 1) * (quarters.length + 1);
-      while (pullChanged && pullSafety++ < pullMaxIter) {
-        pullChanged = false;
-        const placedAt = new Map<string, number>();
-        for (let i = 0; i < quarters.length; i++)
-          for (const id of planned_courses[quarters[i]]) placedAt.set(normId(id), i);
 
-        outer:
-        for (let qi = 0; qi < quarters.length; qi++) {
-          for (const x of [...planned_courses[quarters[qi]]]) {
-            const tree = trees[x] ?? trees[normId(x)];
-            if (!tree) continue;
-            // have = AP + everything strictly before qi + x's same-quarter coreqs.
-            const have = haveBefore(qi);
-            const xCoreqs = new Set(coreqPartnersInPool(x).map(normId));
-            for (const id of planned_courses[quarters[qi]]) if (xCoreqs.has(normId(id))) have.add(normId(id));
+      // OR-aware topological order (prereqs before dependents); cycle-guarded the
+      // same way as the strict topo order so a representative-first-option loop
+      // (A's OR points at B, B's OR points at A) can't recurse forever.
+      const orderedOR: string[] = [];
+      const seenOR = new Set<string>();
+      const visitOR = (id: string, stack: Set<string>) => {
+        const nn = normId(id);
+        if (seenOR.has(nn) || stack.has(nn)) return;
+        stack.add(nn);
+        for (const p of orPrereqsInPool(id)) {
+          const dep = pool.find((x) => normId(x) === normId(p));
+          if (dep) visitOR(dep, stack);
+        }
+        stack.delete(nn);
+        if (!seenOR.has(nn)) { seenOR.add(nn); orderedOR.push(id); }
+      };
+      for (const c of pool) visitOR(c, new Set());
 
-            for (const m of requiredMissingCourses(tree, have, examScores)) {
-              const mn = normId(m);
-              const pj = placedAt.get(mn);
-              if (pj == null || pj < qi) continue;            // not placed / already earlier
-              const prereq = pool.find((c) => normId(c) === mn);
-              if (!prereq) continue;
-              const pu = unitsOf(prereq);
-              const ptree = trees[prereq] ?? trees[normId(prereq)];
-              // Latest under-cap quarter < qi where the prereq is itself valid
-              // (its own prereqs satisfied by still-earlier quarters).
-              let dest = -1;
-              for (let i = qi - 1; i >= 0; i--) {
-                if (quarterUnits[i] + pu > maxUnits) continue;
-                if (ptree && requiredMissingCourses(ptree, haveBefore(i), examScores).length > 0) continue;
-                dest = i;
-                break;
-              }
-              if (dest >= 0) {
-                planned_courses[quarters[pj]] = planned_courses[quarters[pj]].filter((c) => c !== prereq);
-                quarterUnits[pj] -= pu;
-                planned_courses[quarters[dest]].push(prereq);
-                quarterUnits[dest] += pu;
-                assignedIdx.set(mn, dest);
-              } else if (qi + 1 < quarters.length) {
-                // No valid room before the dependent — nudge the dependent later.
-                const xu = unitsOf(x);
-                planned_courses[quarters[qi]] = planned_courses[quarters[qi]].filter((c) => c !== x);
-                quarterUnits[qi] -= xu;
-                planned_courses[quarters[qi + 1]].push(x);
-                quarterUnits[qi + 1] += xu;
-                assignedIdx.set(normId(x), qi + 1);
-              } else {
-                continue; // dependent already in the last quarter — can't fix in this grid
-              }
-              pullChanged = true;
-              break outer; // placement changed — restart the scan from a clean state
-            }
+      // Clear every unlocked pool course; recompute per-quarter load from the
+      // locked courses that remain, then re-place from a clean slate.
+      for (const q of quarters)
+        planned_courses[q] = planned_courses[q].filter((id) => !poolNorm.has(normId(id)));
+      for (let i = 0; i < quarters.length; i++)
+        quarterUnits[i] = planned_courses[quarters[i]].reduce((s, id) => s + unitsOf(id), 0);
+      assignedIdx.clear();
+
+      // OR-aware floor: strictly after every placed OR-aware prereq; at/after every
+      // placed coreq partner (same quarter allowed).
+      const orFloorOf = (c: string): number => {
+        let floor = 0;
+        for (const p of orPrereqsInPool(c)) {
+          const pi = assignedIdx.get(normId(p));
+          if (pi != null) floor = Math.max(floor, pi + 1);
+        }
+        for (const p of coreqPartnersInPool(c)) {
+          const pi = assignedIdx.get(normId(p));
+          if (pi != null) floor = Math.max(floor, pi);
+        }
+        return floor;
+      };
+
+      // Place each course — or each genuine bidirectional coreq GROUP (a lecture
+      // plus its mutual-coreq partners, e.g. MATH105A + MATH105LA) — in the
+      // earliest quarter at/after the group's OR-aware floor with room for the
+      // WHOLE group under one cap check. Co-locating a pair as a unit avoids the
+      // old failure where the lab was placed separately and then moved up into an
+      // already-full lecture quarter, tipping it 1 unit over the cap. Ordinary
+      // courses are a group of one. Min-load fallback (Pass 2 FIX A) only when the
+      // pool genuinely can't fit the group under the cap at/after its floor.
+      const placedGroup = new Set<string>();
+      for (const c of orderedOR) {
+        if (placedGroup.has(normId(c))) continue;
+        const group = [
+          c,
+          ...pool.filter(
+            (x) => normId(x) !== normId(c) && isBidirCoreq(c, x) && !placedGroup.has(normId(x)),
+          ),
+        ];
+        const gu = group.reduce((s, g) => s + unitsOf(g), 0);
+        let floor = 0;
+        for (const g of group) floor = Math.max(floor, orFloorOf(g));
+        floor = Math.min(floor, quarters.length - 1);
+        let chosen = -1;
+        for (let i = floor; i < quarters.length; i++) {
+          if (quarterUnits[i] + gu <= maxUnits) { chosen = i; break; }
+        }
+        if (chosen === -1) {
+          for (let i = floor; i < quarters.length; i++) {
+            if (chosen === -1 || quarterUnits[i] < quarterUnits[chosen]) chosen = i;
           }
+          if (chosen === -1) chosen = quarters.length - 1;
+        }
+        for (const g of group) {
+          planned_courses[quarters[chosen]].push(g);
+          quarterUnits[chosen] += unitsOf(g);
+          assignedIdx.set(normId(g), chosen);
+          placedGroup.add(normId(g));
         }
       }
 
