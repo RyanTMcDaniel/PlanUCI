@@ -3040,7 +3040,14 @@ export default function PlannerClient() {
       const repackD2 = () => {
         // OR-aware topological order (prereqs before dependents); cycle-guarded the
         // same way as the strict topo order so a representative-first-option loop
-        // (A's OR points at B, B's OR points at A) can't recurse forever.
+        // (A's OR points at B, B's OR points at A) can't recurse forever. A course's
+        // coreq partners are visited first too: a "prereq-or-concurrent" coreq
+        // (e.g. PHYSICS7C → MATH 2B) carries no OR-aware prereq floor, so unless
+        // the partner is already placed when the dependent lands, orFloorOf's coreq
+        // term sees no index and the dependent can seed BEFORE its partner — a
+        // PREREQ_ORDER violation. Ordering the partner first makes the coreq floor
+        // always apply (genuine bidirectional pairs are still co-located by the
+        // group placement below, so their relative order here is harmless).
         const orderedOR: string[] = [];
         const seenOR = new Set<string>();
         const visitOR = (id: string, stack: Set<string>) => {
@@ -3050,6 +3057,10 @@ export default function PlannerClient() {
           for (const p of orPrereqsInPool(id)) {
             const dep = pool.find((x) => normId(x) === normId(p));
             if (dep) visitOR(dep, stack);
+          }
+          for (const p of coreqPartnersInPool(id)) {
+            const partner = pool.find((x) => normId(x) === normId(p));
+            if (partner) visitOR(partner, stack);
           }
           stack.delete(nn);
           if (!seenOR.has(nn)) { seenOR.add(nn); orderedOR.push(id); }
