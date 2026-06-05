@@ -2696,7 +2696,14 @@ export default function PlannerClient() {
   // availability. Locked courses never move. On infeasible/error the current
   // schedule is left untouched.
   const buildAndOptimizePool = useCallback(
-    async (newPicks: string[], newTags: Record<string, CoverageTag[]> = {}) => {
+    async (
+      newPicks: string[],
+      newTags: Record<string, CoverageTag[]> = {},
+      // Picks the overflow trim (d.3) protects from being dropped — kept over
+      // pick-N / injected courses when the pool can't fit the grid. Minor
+      // autofill passes its REQUIRED (non-pick-N) courses here.
+      protectedPicks: string[] = [],
+    ) => {
       // AP-credited courses are already satisfied (no quarter, never placeable);
       // they must never enter the pool or lockedMap — they're passed to the
       // optimizer as completed_courses instead.
@@ -3007,32 +3014,6 @@ export default function PlannerClient() {
       // capacity. This makes the seed feasible up front instead of patching it.
       // (orPrereqsInPool is defined above, alongside floorOf/earlyFloorPreferred.)
 
-      // OR-aware topological order (prereqs before dependents); cycle-guarded the
-      // same way as the strict topo order so a representative-first-option loop
-      // (A's OR points at B, B's OR points at A) can't recurse forever.
-      const orderedOR: string[] = [];
-      const seenOR = new Set<string>();
-      const visitOR = (id: string, stack: Set<string>) => {
-        const nn = normId(id);
-        if (seenOR.has(nn) || stack.has(nn)) return;
-        stack.add(nn);
-        for (const p of orPrereqsInPool(id)) {
-          const dep = pool.find((x) => normId(x) === normId(p));
-          if (dep) visitOR(dep, stack);
-        }
-        stack.delete(nn);
-        if (!seenOR.has(nn)) { seenOR.add(nn); orderedOR.push(id); }
-      };
-      for (const c of pool) visitOR(c, new Set());
-
-      // Clear every unlocked pool course; recompute per-quarter load from the
-      // locked courses that remain, then re-place from a clean slate.
-      for (const q of quarters)
-        planned_courses[q] = planned_courses[q].filter((id) => !poolNorm.has(normId(id)));
-      for (let i = 0; i < quarters.length; i++)
-        quarterUnits[i] = planned_courses[quarters[i]].reduce((s, id) => s + unitsOf(id), 0);
-      assignedIdx.clear();
-
       // OR-aware floor: strictly after every placed OR-aware prereq; at/after every
       // placed coreq partner (same quarter allowed). Lower-div / GE courses skip
       // the coreq term (earliness bias — see earlyFloorPreferred above) so they are
@@ -3053,43 +3034,131 @@ export default function PlannerClient() {
         return floor;
       };
 
-      // Place each course — or each genuine bidirectional coreq GROUP (a lecture
-      // plus its mutual-coreq partners, e.g. MATH105A + MATH105LA) — in the
-      // earliest quarter at/after the group's OR-aware floor with room for the
-      // WHOLE group under one cap check. Co-locating a pair as a unit avoids the
-      // old failure where the lab was placed separately and then moved up into an
-      // already-full lecture quarter, tipping it 1 unit over the cap. Ordinary
-      // courses are a group of one. Min-load fallback (Pass 2 FIX A) only when the
-      // pool genuinely can't fit the group under the cap at/after its floor.
-      const placedGroup = new Set<string>();
-      for (const c of orderedOR) {
-        if (placedGroup.has(normId(c))) continue;
-        const group = [
-          c,
-          ...pool.filter(
-            (x) => normId(x) !== normId(c) && isBidirCoreq(c, x) && !placedGroup.has(normId(x)),
-          ),
-        ];
-        const gu = group.reduce((s, g) => s + unitsOf(g), 0);
-        let floor = 0;
-        for (const g of group) floor = Math.max(floor, orFloorOf(g));
-        floor = Math.min(floor, quarters.length - 1);
-        let chosen = -1;
-        for (let i = floor; i < quarters.length; i++) {
-          if (quarterUnits[i] + gu <= maxUnits) { chosen = i; break; }
-        }
-        if (chosen === -1) {
-          for (let i = floor; i < quarters.length; i++) {
-            if (chosen === -1 || quarterUnits[i] < quarterUnits[chosen]) chosen = i;
+      // Re-pack every unlocked pool course OR-aware-topologically into the grid.
+      // Re-runnable: the (d.3) overflow trim calls it again after dropping a
+      // course so the freed capacity is reused.
+      const repackD2 = () => {
+        // OR-aware topological order (prereqs before dependents); cycle-guarded the
+        // same way as the strict topo order so a representative-first-option loop
+        // (A's OR points at B, B's OR points at A) can't recurse forever.
+        const orderedOR: string[] = [];
+        const seenOR = new Set<string>();
+        const visitOR = (id: string, stack: Set<string>) => {
+          const nn = normId(id);
+          if (seenOR.has(nn) || stack.has(nn)) return;
+          stack.add(nn);
+          for (const p of orPrereqsInPool(id)) {
+            const dep = pool.find((x) => normId(x) === normId(p));
+            if (dep) visitOR(dep, stack);
           }
-          if (chosen === -1) chosen = quarters.length - 1;
+          stack.delete(nn);
+          if (!seenOR.has(nn)) { seenOR.add(nn); orderedOR.push(id); }
+        };
+        for (const c of pool) visitOR(c, new Set());
+
+        // Clear every unlocked pool course; recompute per-quarter load from the
+        // locked courses that remain, then re-place from a clean slate.
+        for (const q of quarters)
+          planned_courses[q] = planned_courses[q].filter((id) => !poolNorm.has(normId(id)));
+        for (let i = 0; i < quarters.length; i++)
+          quarterUnits[i] = planned_courses[quarters[i]].reduce((s, id) => s + unitsOf(id), 0);
+        assignedIdx.clear();
+
+        // Place each course — or each genuine bidirectional coreq GROUP (a lecture
+        // plus its mutual-coreq partners, e.g. MATH105A + MATH105LA) — in the
+        // earliest quarter at/after the group's OR-aware floor with room for the
+        // WHOLE group under one cap check. Co-locating a pair as a unit avoids the
+        // old failure where the lab was placed separately and then moved up into an
+        // already-full lecture quarter, tipping it 1 unit over the cap. Ordinary
+        // courses are a group of one. Min-load fallback (Pass 2 FIX A) only when the
+        // pool genuinely can't fit the group under the cap at/after its floor.
+        const placedGroup = new Set<string>();
+        for (const c of orderedOR) {
+          if (placedGroup.has(normId(c))) continue;
+          const group = [
+            c,
+            ...pool.filter(
+              (x) => normId(x) !== normId(c) && isBidirCoreq(c, x) && !placedGroup.has(normId(x)),
+            ),
+          ];
+          const gu = group.reduce((s, g) => s + unitsOf(g), 0);
+          let floor = 0;
+          for (const g of group) floor = Math.max(floor, orFloorOf(g));
+          floor = Math.min(floor, quarters.length - 1);
+          let chosen = -1;
+          for (let i = floor; i < quarters.length; i++) {
+            if (quarterUnits[i] + gu <= maxUnits) { chosen = i; break; }
+          }
+          if (chosen === -1) {
+            for (let i = floor; i < quarters.length; i++) {
+              if (chosen === -1 || quarterUnits[i] < quarterUnits[chosen]) chosen = i;
+            }
+            if (chosen === -1) chosen = quarters.length - 1;
+          }
+          for (const g of group) {
+            planned_courses[quarters[chosen]].push(g);
+            quarterUnits[chosen] += unitsOf(g);
+            assignedIdx.set(normId(g), chosen);
+            placedGroup.add(normId(g));
+          }
         }
-        for (const g of group) {
-          planned_courses[quarters[chosen]].push(g);
-          quarterUnits[chosen] += unitsOf(g);
-          assignedIdx.set(normId(g), chosen);
-          placedGroup.add(normId(g));
-        }
+      };
+      repackD2();
+
+      // (d.3) Overflow trim. When the combined pool can't fit the 12-quarter grid
+      // under cap, the floor clamp (Math.min(floor, quarters.length-1)) can pin a
+      // course into the same quarter as — or before — a prerequisite it needs, a
+      // PREREQ_ORDER violation whatif rejects outright (e.g. minor autofill on a
+      // major-filled schedule stacking I&CSCI46 onto its prereqs in the last
+      // quarter). Rather than send an invalid plan, drop the offending courses and
+      // re-pack until the seed is prereq-valid: shed the lowest-priority TRIMMABLE
+      // course first (a freshly-added pick or injected prereq — never a locked or
+      // pre-existing course the user already placed), preferring non-protected
+      // (pick-N / injected) over protected (required) picks, and dropping the
+      // latest-placed candidate so deep-chained tail electives go before earlier
+      // required courses. Feasible seeds have no violation, so the loop is a no-op.
+      const preExistingNorm = new Set(
+        [...unlockedExisting, ...Object.keys(lockedMap)].map(normId),
+      );
+      const protectedNorm = new Set(protectedPicks.map(normId));
+      const isTrimmable = (id: string) => !preExistingNorm.has(normId(id));
+      // x in quarter qi is unsatisfied iff its tree isn't met by AP + everything
+      // strictly before qi + its same-quarter coreqs (mirrors whatif's check).
+      const courseUnsatisfied = (x: string, qi: number): boolean => {
+        const tree = trees[x] ?? trees[normId(x)];
+        if (!tree) return false;
+        const have = new Set<string>(apNorm);
+        for (let i = 0; i < qi; i++)
+          for (const id of planned_courses[quarters[i]]) have.add(normId(id));
+        const xCoreqs = new Set(coreqPartnersInPool(x).map(normId));
+        for (const id of planned_courses[quarters[qi]]) if (xCoreqs.has(normId(id))) have.add(normId(id));
+        return requiredMissingCourses(tree, have, examScores).length > 0;
+      };
+      const hasPrereqViolation = (): boolean => {
+        for (let qi = 0; qi < quarters.length; qi++)
+          for (const x of planned_courses[quarters[qi]]) if (courseUnsatisfied(x, qi)) return true;
+        return false;
+      };
+      // Latest-placed trimmable violator, non-protected first.
+      const pickTrimVictim = (): string | null => {
+        for (let qi = quarters.length - 1; qi >= 0; qi--)
+          for (const x of planned_courses[quarters[qi]])
+            if (isTrimmable(x) && !protectedNorm.has(normId(x)) && courseUnsatisfied(x, qi)) return x;
+        for (let qi = quarters.length - 1; qi >= 0; qi--)
+          for (const x of planned_courses[quarters[qi]])
+            if (isTrimmable(x) && courseUnsatisfied(x, qi)) return x;
+        return null;
+      };
+      let trimGuard = 0;
+      while (hasPrereqViolation() && trimGuard++ < pool.length + 1) {
+        const victim = pickTrimVictim();
+        if (victim == null) break; // only non-trimmable violators remain — can't fix here
+        const vi = pool.indexOf(victim);
+        if (vi >= 0) pool.splice(vi, 1);
+        poolNorm.delete(normId(victim));
+        for (const q of quarters)
+          planned_courses[q] = planned_courses[q].filter((c) => c !== victim);
+        repackD2();
       }
 
       // (e) send to /api/whatif — same shape as the Optimize Schedule button.
@@ -3292,6 +3361,7 @@ export default function PlannerClient() {
     const geCoveredUnfilled = (cid: string) => getCourseGECategories(info[cid], geUnfilled).slice(0, 2);
 
     const picks: string[] = [];
+    const requiredPicks: string[] = []; // non-pick-N minor courses — protected from the overflow trim
     const tags: Record<string, CoverageTag[]> = {};
     const chosen = new Set<string>();
 
@@ -3310,6 +3380,7 @@ export default function PlannerClient() {
         for (const c of req.courses) {
           if (!avail(c)) continue;
           picks.push(c);
+          requiredPicks.push(c);
           tags[c] = tagFor(c);
           chosen.add(normId(c));
         }
@@ -3335,7 +3406,7 @@ export default function PlannerClient() {
         // else: no cross-cover → skip this group entirely.
       }
     }
-    await buildAndOptimizePool(picks, tags);
+    await buildAndOptimizePool(picks, tags, requiredPicks);
   }, [plannedCourses, geRequirements, apSatisfiedGEs, minorRequirements, requirements, getCoverage, placedGECats, buildAndOptimizePool]);
 
   const toggleSummer = useCallback((year: number) => {

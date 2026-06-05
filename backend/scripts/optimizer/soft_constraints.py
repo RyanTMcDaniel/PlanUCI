@@ -68,13 +68,28 @@ def _load_difficulty_scores() -> dict[str, float]:
 
 
 def _load_course_meta(client, course_ids: list[str]) -> dict[str, dict]:
-    """Fetch ge_list, department and min_units for each course id from Supabase."""
+    """Fetch ge_list, department and min_units for each course id from Supabase.
+
+    The `courses.id` column stores ids with spaces stripped (catalog text like
+    "BIO SCI 93" / "I&C SCI 46" is stored as "BIOSCI93" / "I&CSCI46"), but plan
+    ids arrive in either form — injected prereqs keep the spaced catalog text.
+    A raw `.in_("id", course_ids)` therefore silently misses every spaced id, so
+    those courses' ge_list / min_units drop out of all meta-based soft
+    constraints (ge_earliness, ge_distribution, major_clustering, …) — making the
+    earliness weights effectively 0 for GE courses seeded with a spaced id. Query
+    both the raw id and a space-stripped, uppercased variant so both forms match;
+    the result stays keyed by _norm(id) so lookups via _norm(course) still hit.
+    """
     if not course_ids:
         return {}
+    query_ids = set()
+    for cid in course_ids:
+        query_ids.add(cid)
+        query_ids.add(cid.replace(" ", "").upper())
     rows = (
         client.table("courses")
         .select("id,department,ge_list,min_units")
-        .in_("id", course_ids)
+        .in_("id", list(query_ids))
         .execute()
         .data
     )
