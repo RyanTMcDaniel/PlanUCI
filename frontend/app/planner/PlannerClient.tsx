@@ -2841,24 +2841,31 @@ export default function PlannerClient() {
       // partner. So "prereq-or-concurrent" edges just push the dependent to its
       // partner's quarter or later — the partner is never dragged forward.
       const assignedIdx = new Map<string, number>();
-      // Earliness bias (seed preference, NOT a hard constraint): lower-division
-      // courses (catalogue number < 100) and GE-satisfying courses (non-empty
-      // ge_list) should sit as early as their PREREQS allow — they skip the
-      // same-quarter coreq ("prereq-or-concurrent") delay so they are never
-      // pushed later than their strict prereqs require. Upper-division non-GE
-      // courses keep the full prereq + coreq floor. The strict prereq floor is
-      // always applied, so this never overrides a real prereq ordering; genuine
-      // bidirectional coreq pairs are still co-located by the coreq alignment /
-      // d.2 group placement.
-      const courseNumberOf = (id: string): number => {
-        const m = id.match(/\d+/);
-        return m ? parseInt(m[0], 10) : 999;
+      // OR-aware in-pool prereqs of a course: the representative course set
+      // requiredMissingCourses would inject against AP-only (every AND course
+      // leaf plus the first option of each unsatisfied OR), restricted to the
+      // pool, with same-quarter coreq partners removed (those are a same-quarter
+      // floor, not a strict-before one). Hoisted here so floorOf, the d.2
+      // re-placement, and earlyFloorPreferred all share one definition.
+      const orPrereqsInPool = (id: string): string[] => {
+        const tree = trees[id] ?? trees[normId(id)];
+        if (!tree) return [];
+        const coreqs = new Set(coreqPartnersInPool(id).map(normId));
+        return requiredMissingCourses(tree, new Set(apNorm), examScores).filter(
+          (p) => poolNorm.has(normId(p)) && normId(p) !== normId(id) && !coreqs.has(normId(p)),
+        );
       };
-      const earlyFloorPreferred = (id: string): boolean => {
-        if (courseNumberOf(id) < 100) return true;
-        const ge = courseInfoMapRef.current[id]?.ge_list;
-        return !!(ge && ge.length > 0);
-      };
+      // Earliness bias (seed preference, NOT a hard constraint): drop the
+      // same-quarter coreq floor term ONLY for a true ROOT course — one with no
+      // in-pool prerequisites at all: no OR-aware strict/representative prereq
+      // (orPrereqsInPool empty) AND no in-pool coreq partner. A course with ANY
+      // in-pool dependency (strict OR coreq) keeps the full prereq + coreq floor,
+      // so it can never seed ahead of a prereq it can only satisfy via a coreq
+      // edge (e.g. CHEM1A, whose only in-pool satisfier is the coreq PHYSICS 7C /
+      // MATH 2A). Note orPrereqsInPool excludes coreq partners, so the coreq
+      // check is required in addition for the predicate to mean "no deps at all".
+      const earlyFloorPreferred = (id: string): boolean =>
+        orPrereqsInPool(id).length === 0 && coreqPartnersInPool(id).length === 0;
       const floorOf = (c: string): number => {
         let floor = 0;
         for (const p of prereqsInPool(c)) {
@@ -2998,20 +3005,7 @@ export default function PlannerClient() {
       // its already-placed OR-aware prereqs, so chains spread in order without
       // overloading the tail. Locked courses keep their quarter and only constrain
       // capacity. This makes the seed feasible up front instead of patching it.
-
-      // OR-aware in-pool prereqs of a course: the representative course set
-      // requiredMissingCourses would inject against AP-only (every AND course leaf
-      // plus the first option of each unsatisfied OR), restricted to the pool and
-      // with same-quarter coreq partners removed (those are a same-quarter floor,
-      // handled below — not a strict-before floor).
-      const orPrereqsInPool = (id: string): string[] => {
-        const tree = trees[id] ?? trees[normId(id)];
-        if (!tree) return [];
-        const coreqs = new Set(coreqPartnersInPool(id).map(normId));
-        return requiredMissingCourses(tree, new Set(apNorm), examScores).filter(
-          (p) => poolNorm.has(normId(p)) && normId(p) !== normId(id) && !coreqs.has(normId(p)),
-        );
-      };
+      // (orPrereqsInPool is defined above, alongside floorOf/earlyFloorPreferred.)
 
       // OR-aware topological order (prereqs before dependents); cycle-guarded the
       // same way as the strict topo order so a representative-first-option loop
