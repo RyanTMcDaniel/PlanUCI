@@ -2841,15 +2841,35 @@ export default function PlannerClient() {
       // partner. So "prereq-or-concurrent" edges just push the dependent to its
       // partner's quarter or later — the partner is never dragged forward.
       const assignedIdx = new Map<string, number>();
+      // Earliness bias (seed preference, NOT a hard constraint): lower-division
+      // courses (catalogue number < 100) and GE-satisfying courses (non-empty
+      // ge_list) should sit as early as their PREREQS allow — they skip the
+      // same-quarter coreq ("prereq-or-concurrent") delay so they are never
+      // pushed later than their strict prereqs require. Upper-division non-GE
+      // courses keep the full prereq + coreq floor. The strict prereq floor is
+      // always applied, so this never overrides a real prereq ordering; genuine
+      // bidirectional coreq pairs are still co-located by the coreq alignment /
+      // d.2 group placement.
+      const courseNumberOf = (id: string): number => {
+        const m = id.match(/\d+/);
+        return m ? parseInt(m[0], 10) : 999;
+      };
+      const earlyFloorPreferred = (id: string): boolean => {
+        if (courseNumberOf(id) < 100) return true;
+        const ge = courseInfoMapRef.current[id]?.ge_list;
+        return !!(ge && ge.length > 0);
+      };
       const floorOf = (c: string): number => {
         let floor = 0;
         for (const p of prereqsInPool(c)) {
           const pi = assignedIdx.get(normId(p));
           if (pi != null) floor = Math.max(floor, pi + 1);
         }
-        for (const p of coreqPartnersInPool(c)) {
-          const pi = assignedIdx.get(normId(p));
-          if (pi != null) floor = Math.max(floor, pi);
+        if (!earlyFloorPreferred(c)) {
+          for (const p of coreqPartnersInPool(c)) {
+            const pi = assignedIdx.get(normId(p));
+            if (pi != null) floor = Math.max(floor, pi);
+          }
         }
         return floor;
       };
@@ -3020,16 +3040,21 @@ export default function PlannerClient() {
       assignedIdx.clear();
 
       // OR-aware floor: strictly after every placed OR-aware prereq; at/after every
-      // placed coreq partner (same quarter allowed).
+      // placed coreq partner (same quarter allowed). Lower-div / GE courses skip
+      // the coreq term (earliness bias — see earlyFloorPreferred above) so they are
+      // not held back past their strict prereqs; genuine bidirectional coreqs are
+      // still co-located by the group placement below.
       const orFloorOf = (c: string): number => {
         let floor = 0;
         for (const p of orPrereqsInPool(c)) {
           const pi = assignedIdx.get(normId(p));
           if (pi != null) floor = Math.max(floor, pi + 1);
         }
-        for (const p of coreqPartnersInPool(c)) {
-          const pi = assignedIdx.get(normId(p));
-          if (pi != null) floor = Math.max(floor, pi);
+        if (!earlyFloorPreferred(c)) {
+          for (const p of coreqPartnersInPool(c)) {
+            const pi = assignedIdx.get(normId(p));
+            if (pi != null) floor = Math.max(floor, pi);
+          }
         }
         return floor;
       };

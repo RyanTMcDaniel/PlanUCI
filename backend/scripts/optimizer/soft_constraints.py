@@ -45,8 +45,8 @@ WEIGHTS = {
     # adjacent_smoothing (0.40) so they never override difficulty/feasibility,
     # but raised enough that their per-move deltas (≈ weight × 1/n) actually
     # register against difficulty_balance moves instead of being drowned out.
-    "lower_div_earliness":  0.35,
-    "ge_earliness":         0.30,
+    "lower_div_earliness":  0.60,
+    "ge_earliness":         0.50,
 }
 
 _DEFAULT_DIFFICULTY = 5.0   # used when a course has no entry in the CSV
