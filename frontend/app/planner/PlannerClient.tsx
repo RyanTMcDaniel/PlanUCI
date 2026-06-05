@@ -114,37 +114,54 @@ function getCourseGECategories(course: CourseDetail | undefined, geRequirements:
 }
 
 // Prerequisite-tree node/leaf shape: { AND|OR|NOT: item[] }, where a leaf has a
-// prereqType ("course" | "exam") and (for courses) a courseId / coreq flag.
+// prereqType ("course" | "exam"); course leaves carry a courseId / coreq flag,
+// exam leaves carry an examName + minGrade (string threshold, e.g. "4").
 type PrereqItem = {
   prereqType?: string;
   courseId?: string;
   coreq?: boolean;
+  examName?: string;
+  minGrade?: string;
 } & Record<string, unknown>;
+
+// An exam prereq leaf is satisfied only if the student actually earned a
+// qualifying score. examScores is keyed by UPPERCASED exam name (prereq leaves
+// store "AP CALCULUS BC"; apScores keys are "AP Calculus BC"). If the leaf is
+// missing an exam name or a numeric threshold we can't evaluate, treat it as
+// NOT satisfied (conservative — let the backend decide).
+function examSatisfied(i: PrereqItem, examScores: Map<string, number>): boolean {
+  const name = String(i.examName ?? "").trim().toUpperCase();
+  const min = parseInt(String(i.minGrade ?? ""), 10);
+  if (!name || Number.isNaN(min)) return false;
+  const score = examScores.get(name);
+  return score != null && score >= min;
+}
 
 // ── Prereq closure ─────────────────────────────────────────────────────────
 // Course-leaf ids that must be ADDED so a prereq tree is satisfiable given what
 // is already available. AND → every child; OR → nothing if any option already
-// available, else pull the first course option; NOT/exam → ignored.
-function itemSatisfied(i: PrereqItem, have: Set<string>): boolean {
+// satisfied, else pull the first course option; NOT → ignored; exam → satisfied
+// only if the qualifying AP score is present in examScores.
+function itemSatisfied(i: PrereqItem, have: Set<string>, examScores: Map<string, number>): boolean {
   if (i?.prereqType === "course") return have.has(normId(String(i.courseId ?? "")));
-  if (i?.prereqType === "exam") return true;
-  return requiredMissingCourses(i, have).length === 0;
+  if (i?.prereqType === "exam") return examSatisfied(i, examScores);
+  return requiredMissingCourses(i, have, examScores).length === 0;
 }
-function missingFromItem(i: PrereqItem, have: Set<string>): string[] {
+function missingFromItem(i: PrereqItem, have: Set<string>, examScores: Map<string, number>): string[] {
   if (i?.prereqType === "course") {
     const cid = String(i.courseId ?? "");
     return cid && !have.has(normId(cid)) ? [cid] : [];
   }
-  if (i?.prereqType === "exam") return [];
-  return requiredMissingCourses(i, have);
+  if (i?.prereqType === "exam") return []; // an exam can't be satisfied by adding a course
+  return requiredMissingCourses(i, have, examScores);
 }
-function requiredMissingCourses(node: unknown, have: Set<string>): string[] {
+function requiredMissingCourses(node: unknown, have: Set<string>, examScores: Map<string, number>): string[] {
   if (!node || typeof node !== "object") return [];
   const n = node as Record<string, unknown>;
-  if (Array.isArray(n.AND)) return (n.AND as PrereqItem[]).flatMap((i) => missingFromItem(i, have));
+  if (Array.isArray(n.AND)) return (n.AND as PrereqItem[]).flatMap((i) => missingFromItem(i, have, examScores));
   if (Array.isArray(n.OR)) {
     const items = n.OR as PrereqItem[];
-    if (items.some((i) => itemSatisfied(i, have))) return [];
+    if (items.some((i) => itemSatisfied(i, have, examScores))) return [];
     const firstCourse = items.find((i) => i?.prereqType === "course" && i.courseId);
     return firstCourse?.courseId ? [String(firstCourse.courseId)] : [];
   }
@@ -2684,6 +2701,11 @@ export default function PlannerClient() {
       // they must never enter the pool or lockedMap — they're passed to the
       // optimizer as completed_courses instead.
       const apNorm = new Set([...apCreditedSet].map(normId));
+      // Earned AP scores keyed by UPPERCASED exam name, so the prereq closure can
+      // tell whether an exam-gated OR branch is actually satisfied (vs. assuming
+      // every exam is earned, which diverged from the backend).
+      const examScores = new Map<string, number>();
+      for (const [name, score] of Object.entries(apScores)) examScores.set(name.trim().toUpperCase(), score);
 
       // (a) unlocked existing + locked positions (AP-credited courses excluded).
       const lockedMap: Record<string, string> = {};
@@ -2716,7 +2738,7 @@ export default function PlannerClient() {
         for (const cid of frontier) {
           const tree = trees[cid] ?? trees[normId(cid)];
           if (!tree) continue;
-          for (const m of requiredMissingCourses(tree, have)) {
+          for (const m of requiredMissingCourses(tree, have, examScores)) {
             const nn = normId(m);
             if (!have.has(nn)) { have.add(nn); missing.push(m); pool.push(m); }
           }
@@ -2944,7 +2966,10 @@ export default function PlannerClient() {
       // quarter before the dependent that is still after the prereq's OWN
       // prerequisites (the guard that prevents pulling a course back past its own
       // chain and oscillating). If no such slot exists, nudge the dependent one
-      // slot later instead. One fix per pass, then rescan; capped at 20 passes.
+      // slot later instead. One fix per pass, then rescan; capped at
+      // (courses+1)·(quarters+1) passes (matches the other seed passes) — enough
+      // to spread a full prereq chain once unearned exam options no longer mask
+      // it, while still bounding the loop.
       const haveBefore = (qi: number): Set<string> => {
         const h = new Set<string>(apNorm);
         for (let i = 0; i < qi; i++) for (const id of planned_courses[quarters[i]]) h.add(normId(id));
@@ -2952,7 +2977,8 @@ export default function PlannerClient() {
       };
       let pullSafety = 0;
       let pullChanged = true;
-      while (pullChanged && pullSafety++ < 20) {
+      const pullMaxIter = (ordered.length + 1) * (quarters.length + 1);
+      while (pullChanged && pullSafety++ < pullMaxIter) {
         pullChanged = false;
         const placedAt = new Map<string, number>();
         for (let i = 0; i < quarters.length; i++)
@@ -2968,7 +2994,7 @@ export default function PlannerClient() {
             const xCoreqs = new Set(coreqPartnersInPool(x).map(normId));
             for (const id of planned_courses[quarters[qi]]) if (xCoreqs.has(normId(id))) have.add(normId(id));
 
-            for (const m of requiredMissingCourses(tree, have)) {
+            for (const m of requiredMissingCourses(tree, have, examScores)) {
               const mn = normId(m);
               const pj = placedAt.get(mn);
               if (pj == null || pj < qi) continue;            // not placed / already earlier
@@ -2981,7 +3007,7 @@ export default function PlannerClient() {
               let dest = -1;
               for (let i = qi - 1; i >= 0; i--) {
                 if (quarterUnits[i] + pu > maxUnits) continue;
-                if (ptree && requiredMissingCourses(ptree, haveBefore(i)).length > 0) continue;
+                if (ptree && requiredMissingCourses(ptree, haveBefore(i), examScores).length > 0) continue;
                 dest = i;
                 break;
               }
