@@ -3278,15 +3278,18 @@ export default function PlannerClient() {
     const tags: Record<string, CoverageTag[]> = {};
     const chosen = new Set<string>();
     const available = (cid: string) => !!info[cid] && !placedIds.has(normId(cid)) && !chosen.has(normId(cid));
-    // Data-quality bonus: prefer courses that carry real GPA / unit data. Applied
+    // Data-quality score: prefer courses that carry real GPA / unit data. Applied
     // as a SECONDARY tie-break only (after cross-cover score, before random), so a
     // course with data never outranks one with a higher cross-cover score.
+    // Courses with neither avg_gpa nor units are actively deprioritized (-2);
+    // having at least one is neutral (0); having both keeps the +1 bonus.
     const dataQuality = (cid: string): number => {
       const ci = info[cid];
-      let b = 0;
-      if (ci?.avg_gpa != null && ci.avg_gpa !== 0) b += 1;
-      if (ci?.min_units != null && ci.min_units !== 0) b += 1;
-      return b;
+      const hasGpa = ci?.avg_gpa != null && ci.avg_gpa !== 0;
+      const hasUnits = ci?.min_units != null && ci.min_units !== 0;
+      if (!hasGpa && !hasUnits) return -2;
+      if (hasGpa && hasUnits) return 1;
+      return 0;
     };
 
     let guard = 0;

@@ -374,8 +374,11 @@ def ge_earliness(
 ) -> float:
     """Earliness preference for GE-satisfying courses (non-empty ge_list).
 
-    Same shape as lower_div_earliness: mean of (quarter_index / total_quarters)
-    over UNLOCKED GE courses. Front-loads GE completion. Soft only.
+    Mean of a per-course penalty over UNLOCKED GE courses. The base penalty is
+    (quarter_index / total_quarters), but GE courses landing in the BACK HALF of
+    the plan (i >= n/2) have their penalty doubled. This soft-discourages — but
+    never hard-blocks — late GEs, strongly motivating the optimizer to pull GE
+    completion forward. Soft only.
     """
     sorted_q = sorted(plan.planned_courses.keys(), key=_qkey)
     n = len(sorted_q)
@@ -387,7 +390,8 @@ def ge_earliness(
             if _norm(c) in locked_norm:
                 continue
             if course_meta.get(_norm(c), {}).get("ge_list"):
-                penalties.append(i / n)
+                base = i / n
+                penalties.append(2 * base if i >= n / 2 else base)
     return sum(penalties) / len(penalties) if penalties else 0.0
 
 
