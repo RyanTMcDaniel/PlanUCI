@@ -31,6 +31,7 @@ from .hard_constraints import (
     _qkey,
     _course_units_by_norm,
     coreq_split_pairs,
+    ge_deadline_violations,
     quarter_units,
     unit_cap_tiers,
     units_valid,
@@ -383,6 +384,12 @@ def _whatif_optimize(
     base_viols = set(_check_prereqs(plan, trees, extra_available))
     # Coreq pairs already split in the input — moves may not add new ones.
     base_coreq_split = coreq_split_pairs(plan, trees)
+    # GE courses already past the Year-2 deadline (incl. user-locked ones) — moves
+    # may not add new late GE placements, but pre-existing ones (e.g. a locked GE
+    # in Year 3+) are grandfathered in via this diff so the lock is respected.
+    base_ge_deadline = {
+        v["course"] for v in ge_deadline_violations(plan, meta, plan.graduation_year)
+    }
 
     for _ in range(max_iter):
         # Quarters with at least one unlocked course
@@ -416,6 +423,16 @@ def _whatif_optimize(
 
         # Coreqs must share a quarter — reject moves that newly split a pair
         if coreq_split_pairs(candidate, trees) - base_coreq_split:
+            continue
+
+        # GE deadline — reject moves that newly place a GE course in Year 3+
+        # (all GEs must finish by the end of Year 2). Pre-existing late GEs are
+        # in base_ge_deadline and never block; only NEW late placements do.
+        cand_ge_deadline = {
+            v["course"]
+            for v in ge_deadline_violations(candidate, meta, candidate.graduation_year)
+        }
+        if cand_ge_deadline - base_ge_deadline:
             continue
 
         cand_score, cand_bd = _soft_score(candidate, diff_scores, meta, frozenset(locked_norm))

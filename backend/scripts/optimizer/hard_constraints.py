@@ -75,6 +75,7 @@ CODE_PREREQ_ORDER  = "PREREQ_ORDER"
 CODE_UNIT_CAP      = "UNIT_CAP"
 CODE_DUPLICATE     = "DUPLICATE"
 CODE_REQ_UNCOVERED = "REQ_UNCOVERED"
+CODE_GE_DEADLINE   = "GE_DEADLINE"
 
 
 # ── CSE ↔ ICS alias map (FIX 6) ─────────────────────────────────────────────
@@ -237,6 +238,48 @@ def coreq_split_pairs(
             if partner in quarter_of and quarter_of[partner] != q:
                 split.add(frozenset((c_norm, partner)))
     return split
+
+
+def ge_deadline_violations(
+    plan: CoursePlan,
+    course_meta: dict[str, dict],
+    graduation_year: int,
+) -> list[dict]:
+    """GE courses must be finished by the end of Year 2 — before Year 3 Fall.
+
+    Year 3 Fall is calendar year (graduation_year - 2), season fall: e.g. for a
+    2030 graduation the boundary is 2028_fall.  Any quarter at or after that
+    boundary is off-limits for GE-satisfying courses (non-empty ge_list).  Note
+    QUARTER_ORDER puts fall last within a calendar year, so Year 2's winter /
+    spring / summer (which carry the same calendar year as Year 3 Fall only when
+    they don't) stay strictly below the boundary tuple.
+
+    Returns one dict per offending placement: {course, quarter, reason, code}.
+    This flags ALL GE courses past the boundary, including locked ones.  Callers
+    that only want to block *new* late placements (the whatif hill-climber) diff
+    candidate violations against the pre-move set, so a course the user manually
+    locked into Year 3+ is present in both and never newly rejected.
+    """
+    boundary = (graduation_year - 2, QUARTER_ORDER["fall"])
+    deadline_q = _pretty_quarter(f"{graduation_year - 2}_fall")
+    violations: list[dict] = []
+    for q, courses in plan.planned_courses.items():
+        if _qkey(q) < boundary:
+            continue
+        for c in courses:
+            meta = course_meta.get(_norm(c))
+            if meta and meta.get("ge_list"):
+                violations.append({
+                    "course": _norm(c),
+                    "quarter": q,
+                    "reason": (
+                        f"{c} satisfies a GE but is placed in {_pretty_quarter(q)}; "
+                        f"all GE courses must be completed by the end of Year 2 "
+                        f"(before {deadline_q})."
+                    ),
+                    "code": CODE_GE_DEADLINE,
+                })
+    return violations
 
 
 def _representative_unmet(
