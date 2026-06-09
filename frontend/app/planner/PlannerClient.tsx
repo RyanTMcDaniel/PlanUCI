@@ -1230,7 +1230,7 @@ function CoursePill({
 }) {
   // Pick-N pools list many courses; keep their codes compact. Everywhere else
   // uses the larger, easier-to-read size.
-  const codeSize = compact ? "text-[9px]" : "text-[15px]";
+  const codeSize = compact ? "text-[10px]" : "text-[16px]";
 
   const { attributes, listeners, setNodeRef, transform, isDragging } = useDraggable({
     id: `sidebar|${courseId}`,
@@ -1252,7 +1252,7 @@ function CoursePill({
     return (
       <div
         title={`${tooltip} — satisfied by AP credit`}
-        className="flex items-center gap-1 rounded-full px-2.5 py-1 bg-emerald-950/40 border border-emerald-700/40 min-w-0 overflow-hidden"
+        className="flex items-center gap-1 rounded-full px-3 py-1.5 bg-emerald-950/40 border border-emerald-700/40 min-w-0 overflow-hidden"
       >
         {dot}
         <span className={`${codeSize} font-medium leading-none truncate text-emerald-400`}>{courseId}</span>
@@ -1265,7 +1265,7 @@ function CoursePill({
     return (
       <div
         title={tooltip}
-        className="flex items-center justify-center rounded-full px-2.5 py-1 bg-[#3b82f6]/20 border border-[#3b82f6]/35 min-w-0 overflow-hidden"
+        className="flex items-center justify-center rounded-full px-3 py-1.5 bg-[#3b82f6]/20 border border-[#3b82f6]/35 min-w-0 overflow-hidden"
       >
         {dot}
         <span className={`${codeSize} font-medium leading-none truncate text-[#93c5fd]`}>
@@ -1282,7 +1282,7 @@ function CoursePill({
       {...listeners}
       {...attributes}
       title={tooltip}
-      className={`flex items-center justify-center rounded-full px-2.5 py-1 border cursor-grab active:cursor-grabbing select-none transition-colors min-w-0 overflow-hidden
+      className={`flex items-center justify-center rounded-full px-3 py-1.5 border cursor-grab active:cursor-grabbing select-none transition-colors min-w-0 overflow-hidden
         ${unavailable
           ? "border-dashed border-[#252525] bg-transparent"
           : isDragging
@@ -1337,10 +1337,10 @@ function RequirementGroup({
     >
       <button
         onClick={() => setOpen((o) => !o)}
-        className="w-full flex items-center px-2.5 py-2 hover:bg-[#1c1c1c] transition-colors text-left gap-2 bg-[#141414]"
+        className="w-full flex items-center px-2.5 py-3 hover:bg-[#1c1c1c] transition-colors text-left gap-2 bg-[#141414]"
       >
         <div className="flex-1 min-w-0">
-          <span className="text-[12px] font-normal text-[#ccc] block truncate">
+          <span className="text-[13px] font-normal text-[#ccc] block truncate">
             {req.group_name}
           </span>
           {req.courses_needed < req.courses.length && (
