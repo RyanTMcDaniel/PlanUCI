@@ -1078,7 +1078,7 @@ function PlacedCardRow({
       {tipVisible && (
         <CourseTooltip
           courseId={courseId}
-          info={courseInfoMap[courseId]}
+          info={courseInfoMap[normId(courseId)]}
           style={{
             position: "fixed",
             top: tipPos.top,
@@ -1126,12 +1126,12 @@ function QuarterCell({
   const quarterDiff = calculateQuarterDifficulty(
     courseIds.map((id) => ({
       difficulty_score: difficultyMap[id] ?? null,
-      units: courseInfoMap[id]?.min_units ?? null,
+      units: courseInfoMap[normId(id)]?.min_units ?? null,
     })),
   );
 
   const units = courseIds.reduce(
-    (sum, id) => sum + (courseInfoMap[id]?.min_units ?? 4),
+    (sum, id) => sum + (courseInfoMap[normId(id)]?.min_units ?? 4),
     0,
   );
 
@@ -1195,11 +1195,11 @@ function QuarterCell({
             key={cid}
             courseId={cid}
             quarterKey={qKey}
-            title={courseInfoMap[cid]?.title}
-            units={courseInfoMap[cid]?.min_units}
-            level={courseInfoMap[cid]?.course_level}
+            title={courseInfoMap[normId(cid)]?.title}
+            units={courseInfoMap[normId(cid)]?.min_units}
+            level={courseInfoMap[normId(cid)]?.course_level}
             diffScore={difficultyMap[cid] ?? null}
-            gpa={courseInfoMap[cid]?.avg_gpa ?? null}
+            gpa={courseInfoMap[normId(cid)]?.avg_gpa ?? null}
             isLocked={lockedCourses.has(cid)}
             onToggleLock={onToggleLock}
             onRemove={onRemove}
@@ -1320,7 +1320,7 @@ function RequirementGroup({
     return req.courses.filter(
       (cid) =>
         cid.toLowerCase().includes(q) ||
-        (courseInfoMap[cid]?.title ?? "").toLowerCase().includes(q),
+        (courseInfoMap[normId(cid)]?.title ?? "").toLowerCase().includes(q),
     );
   }, [req.courses, searchQuery, courseInfoMap]);
 
@@ -1362,11 +1362,11 @@ function RequirementGroup({
             <CoursePill
               key={cid}
               courseId={cid}
-              title={courseInfoMap[cid]?.title}
-              units={courseInfoMap[cid]?.min_units}
+              title={courseInfoMap[normId(cid)]?.title}
+              units={courseInfoMap[normId(cid)]?.min_units}
               isPlaced={placedSet.has(normId(cid))}
               isApCredit={apCreditedSet.has(cid)}
-              unavailable={!courseInfoMap[cid]}
+              unavailable={!courseInfoMap[normId(cid)]}
               diffScore={difficultyMap[cid] ?? null}
               compact={req.courses_needed < req.courses.length}
             />
@@ -1394,7 +1394,7 @@ function FlatGroup({
     if (!searchQuery) return req.courses;
     const q = searchQuery.toLowerCase();
     return req.courses.filter(
-      (cid) => cid.toLowerCase().includes(q) || (courseInfoMap[cid]?.title ?? "").toLowerCase().includes(q),
+      (cid) => cid.toLowerCase().includes(q) || (courseInfoMap[normId(cid)]?.title ?? "").toLowerCase().includes(q),
     );
   }, [req.courses, searchQuery, courseInfoMap]);
 
@@ -1421,11 +1421,11 @@ function FlatGroup({
           <CoursePill
             key={cid}
             courseId={cid}
-            title={courseInfoMap[cid]?.title}
-            units={courseInfoMap[cid]?.min_units}
+            title={courseInfoMap[normId(cid)]?.title}
+            units={courseInfoMap[normId(cid)]?.min_units}
             isPlaced={placedSet.has(normId(cid))}
             isApCredit={apCreditedSet.has(cid)}
-            unavailable={!courseInfoMap[cid]}
+            unavailable={!courseInfoMap[normId(cid)]}
             diffScore={difficultyMap[cid] ?? null}
           />
         ))}
@@ -1535,7 +1535,7 @@ function GESection({
     return req.courses.filter(
       (cid) =>
         cid.toLowerCase().includes(q) ||
-        (courseInfoMap[cid]?.title ?? "").toLowerCase().includes(q),
+        (courseInfoMap[normId(cid)]?.title ?? "").toLowerCase().includes(q),
     );
   }, [req.courses, searchQuery, courseInfoMap]);
 
@@ -1585,11 +1585,11 @@ function GESection({
             <CoursePill
               key={cid}
               courseId={cid}
-              title={courseInfoMap[cid]?.title}
-              units={courseInfoMap[cid]?.min_units}
+              title={courseInfoMap[normId(cid)]?.title}
+              units={courseInfoMap[normId(cid)]?.min_units}
               isPlaced={placedSet.has(normId(cid))}
               isApCredit={apCreditedSet.has(cid)}
-              unavailable={!courseInfoMap[cid]}
+              unavailable={!courseInfoMap[normId(cid)]}
               diffScore={difficultyMap[cid] ?? null}
             />
           ))}
@@ -1969,7 +1969,7 @@ export default function PlannerClient() {
   const totalUnits = useMemo(
     () =>
       Object.values(plannedCourses).reduce(
-        (sum, ids) => sum + ids.reduce((s, id) => s + (courseInfoMap[id]?.min_units ?? 4), 0),
+        (sum, ids) => sum + ids.reduce((s, id) => s + (courseInfoMap[normId(id)]?.min_units ?? 4), 0),
         0,
       ),
     [plannedCourses, courseInfoMap],
@@ -2187,14 +2187,17 @@ export default function PlannerClient() {
 
   // ── Auto-fetch details for placed courses not in courseInfoMap ────────────
   useEffect(() => {
-    const placed = [...new Set(Object.values(plannedCourses).flat())];
+    // Normalize planned IDs to canonical form so non-canonical entries (spaced
+    // "MATH 1B", aliases like "CSE31") both hit the courseInfoMap key space AND
+    // fetch against the canonical courses.id in the DB.
+    const placed = [...new Set(Object.values(plannedCourses).flat().map(normId))];
     const missing = placed.filter((id) => !courseInfoMapRef.current[id]);
     if (missing.length === 0) return;
     fetchCourseDetails(missing).then((details) => {
       if (!details.length) return;
       setCourseInfoMap((prev) => {
         const next = { ...prev };
-        for (const c of details) next[c.id] = c;
+        for (const c of details) next[normId(c.id)] = c;
         return next;
       });
       fetchDifficulties(missing);
@@ -2234,7 +2237,7 @@ export default function PlannerClient() {
         if (results.length > 0) {
           setCourseInfoMap((prev) => {
             const next = { ...prev };
-            for (const c of results) next[c.id] = c;
+            for (const c of results) next[normId(c.id)] = c;
             return next;
           });
           fetchDifficulties(results.map((c) => c.id));
@@ -2288,7 +2291,7 @@ export default function PlannerClient() {
         const details = await fetchCourseDetails(allIds);
         setCourseInfoMap((prev) => {
           const next = { ...prev };
-          for (const c of details) next[c.id] = c;
+          for (const c of details) next[normId(c.id)] = c;
           return next;
         });
         fetchDifficulties(allIds);
@@ -2315,7 +2318,7 @@ export default function PlannerClient() {
         const details = await fetchCourseDetails(allIds);
         setCourseInfoMap((prev) => {
           const next = { ...prev };
-          for (const c of details) next[c.id] = c;
+          for (const c of details) next[normId(c.id)] = c;
           return next;
         });
         fetchDifficulties(allIds);
@@ -2339,7 +2342,7 @@ export default function PlannerClient() {
         const details = await fetchCourseDetails(allIds);
         setCourseInfoMap((prev) => {
           const next = { ...prev };
-          for (const c of details) next[c.id] = c;
+          for (const c of details) next[normId(c.id)] = c;
           return next;
         });
         fetchDifficulties(allIds);
@@ -2443,11 +2446,11 @@ export default function PlannerClient() {
           const ids = plannedCourses[qkey(y, s.key)] ?? [];
           return {
             label: s.label,
-            units: ids.reduce((sum, id) => sum + (courseInfoMap[id]?.min_units ?? 4), 0),
+            units: ids.reduce((sum, id) => sum + (courseInfoMap[normId(id)]?.min_units ?? 4), 0),
             courses: ids.map((id) => ({
               code: id,
-              title: courseInfoMap[id]?.title ?? null,
-              units: courseInfoMap[id]?.min_units ?? null,
+              title: courseInfoMap[normId(id)]?.title ?? null,
+              units: courseInfoMap[normId(id)]?.min_units ?? null,
               difficulty: difficultyMap[id] ?? null,
             })),
           };
@@ -2684,7 +2687,7 @@ export default function PlannerClient() {
           .map((x) => GE_LABEL_TO_GROUP[x.code] ?? "")
           .filter((g) => g && groups.some((r) => (r.requirement_group ?? "") === g));
       }
-      return getCourseGECategories(courseInfoMapRef.current[id], groups);
+      return getCourseGECategories(courseInfoMapRef.current[normId(id)], groups);
     },
     [coverageTags],
   );
@@ -2775,7 +2778,7 @@ export default function PlannerClient() {
       for (const q of quarters) planned_courses[q] = [];
       const quarterUnits = new Array(quarters.length).fill(0);
       const qIndex = new Map(quarters.map((q, i) => [q, i] as const));
-      const unitsOf = (id: string) => courseInfoMapRef.current[id]?.min_units ?? 4;
+      const unitsOf = (id: string) => courseInfoMapRef.current[normId(id)]?.min_units ?? 4;
 
       // Locked courses stay in their quarters; count their units against them.
       for (const [cid, q] of Object.entries(lockedMap)) {
@@ -3277,14 +3280,14 @@ export default function PlannerClient() {
     const picks: string[] = [];
     const tags: Record<string, CoverageTag[]> = {};
     const chosen = new Set<string>();
-    const available = (cid: string) => !!info[cid] && !placedIds.has(normId(cid)) && !chosen.has(normId(cid));
+    const available = (cid: string) => !!info[normId(cid)] && !placedIds.has(normId(cid)) && !chosen.has(normId(cid));
     // Data-quality score: prefer courses that carry real GPA / unit data. Applied
     // as a SECONDARY tie-break only (after cross-cover score, before random), so a
     // course with data never outranks one with a higher cross-cover score.
     // Courses with neither avg_gpa nor units are actively deprioritized (-2);
     // having at least one is neutral (0); having both keeps the +1 bonus.
     const dataQuality = (cid: string): number => {
-      const ci = info[cid];
+      const ci = info[normId(cid)];
       const hasGpa = ci?.avg_gpa != null && ci.avg_gpa !== 0;
       const hasUnits = ci?.min_units != null && ci.min_units !== 0;
       if (!hasGpa && !hasUnits) return -2;
@@ -3300,13 +3303,13 @@ export default function PlannerClient() {
       if (!g) { need.delete(key); continue; }
 
       // Pool from array membership; coverage filter is authoritative.
-      const candidates = g.courses.filter((c) => available(c) && getCourseGECategories(info[c], unfilled).includes(key));
+      const candidates = g.courses.filter((c) => available(c) && getCourseGECategories(info[normId(c)], unfilled).includes(key));
       if (candidates.length === 0) { need.delete(key); continue; }
 
       // Scarcity: how many other available courses authoritatively cover each unfilled cat.
       const universe = [...new Set(unfilled.flatMap((x) => x.courses))].filter(available);
       const catsOf = new Map<string, string[]>();
-      for (const c of universe) catsOf.set(c, getCourseGECategories(info[c], unfilled));
+      for (const c of universe) catsOf.set(c, getCourseGECategories(info[normId(c)], unfilled));
       const eligibleCount = new Map<string, number>();
       for (const c of universe) for (const cat of catsOf.get(c)!) eligibleCount.set(cat, (eligibleCount.get(cat) ?? 0) + 1);
       const scarcity = (cat: string) => {
@@ -3324,7 +3327,7 @@ export default function PlannerClient() {
       let fallback: string | null = null;
       for (const c of candidates) {
         if (!fallback) fallback = c;
-        const capped = capTo2(catsOf.get(c) ?? getCourseGECategories(info[c], unfilled));
+        const capped = capTo2(catsOf.get(c) ?? getCourseGECategories(info[normId(c)], unfilled));
         if (!capped.includes(key)) continue; // this course is better spent on scarcer cats
         let score = capped.length >= 2 ? 3 : 2;
         if (unmetMajor.has(normId(c))) score += 1;
@@ -3387,14 +3390,14 @@ export default function PlannerClient() {
 
     // GE categories this course authoritatively covers among still-unfilled
     // groups, capped at 2 (canonical order) to match the GE-autofill cap.
-    const geCoveredUnfilled = (cid: string) => getCourseGECategories(info[cid], geUnfilled).slice(0, 2);
+    const geCoveredUnfilled = (cid: string) => getCourseGECategories(info[normId(cid)], geUnfilled).slice(0, 2);
 
     const picks: string[] = [];
     const requiredPicks: string[] = []; // non-pick-N minor courses — protected from the overflow trim
     const tags: Record<string, CoverageTag[]> = {};
     const chosen = new Set<string>();
 
-    const avail = (cid: string) => !!info[cid] && !placedIds.has(normId(cid)) && !chosen.has(normId(cid));
+    const avail = (cid: string) => !!info[normId(cid)] && !placedIds.has(normId(cid)) && !chosen.has(normId(cid));
     const tagFor = (cid: string): CoverageTag[] => {
       const t: CoverageTag[] = [{ kind: "minor" }];
       for (const cat of geCoveredUnfilled(cid)) t.push({ kind: "ge", code: GE_CODE_LABELS[cat] ?? cat });
