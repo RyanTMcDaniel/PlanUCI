@@ -3576,7 +3576,7 @@ export default function PlannerClient() {
 
           {/* Fixed top */}
           <div className="px-2 pt-2 flex flex-col gap-1.5 shrink-0">
-            {sidebarTab !== "minor" && (
+            {sidebarTab === "major" && (
               majorListError ? (
                 <ErrorBanner
                   message="Failed to load majors"
@@ -3592,7 +3592,7 @@ export default function PlannerClient() {
               )
             )}
 
-            {sidebarTab !== "minor" && specializations.length > 0 && (
+            {sidebarTab !== "minor" && specializations.length > 1 && (
               <SpecializationCombobox
                 options={specializations}
                 selectedMajorId={selectedMajorId}
