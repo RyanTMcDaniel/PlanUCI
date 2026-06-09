@@ -1357,7 +1357,7 @@ function RequirementGroup({
         </div>
       </button>
       {open && (
-        <div className="grid grid-cols-3 gap-1.5 p-2 bg-[#0f0f0f]">
+        <div className="grid [grid-template-columns:repeat(auto-fill,minmax(80px,1fr))] gap-1.5 p-2 bg-[#0f0f0f]">
           {filtered.map((cid) => (
             <CoursePill
               key={cid}
@@ -1580,7 +1580,7 @@ function GESection({
         </div>
       </button>
       {open && (
-        <div className="grid grid-cols-3 gap-1 p-1.5 bg-[#0f0f0f] max-h-[300px] overflow-y-auto">
+        <div className="grid [grid-template-columns:repeat(auto-fill,minmax(80px,1fr))] gap-1 p-1.5 bg-[#0f0f0f] max-h-[300px] overflow-y-auto">
           {filtered.map((cid) => (
             <CoursePill
               key={cid}
@@ -1900,6 +1900,29 @@ export default function PlannerClient() {
 
   // ── UI state ───────────────────────────────────────────────────────────────
   const [sidebarTab, setSidebarTab] = useState<"major" | "ge" | "minor">("major");
+  // Resizable sidebar width (px). Persists for the session; clamped on drag.
+  const SIDEBAR_MIN = 220;
+  const SIDEBAR_MAX = 480;
+  const [sidebarWidth, setSidebarWidth] = useState(280);
+  const startSidebarResize = useCallback((e: React.PointerEvent) => {
+    e.preventDefault();
+    const startX = e.clientX;
+    const startW = sidebarWidth;
+    const onMove = (ev: PointerEvent) => {
+      const next = Math.min(SIDEBAR_MAX, Math.max(SIDEBAR_MIN, startW + ev.clientX - startX));
+      setSidebarWidth(next);
+    };
+    const onUp = () => {
+      window.removeEventListener("pointermove", onMove);
+      window.removeEventListener("pointerup", onUp);
+      document.body.style.cursor = "";
+      document.body.style.userSelect = "";
+    };
+    document.body.style.cursor = "col-resize";
+    document.body.style.userSelect = "none";
+    window.addEventListener("pointermove", onMove);
+    window.addEventListener("pointerup", onUp);
+  }, [sidebarWidth]);
   const [selectedDisplayName, setSelectedDisplayName] = useState("");
   const [selectedMajorId, setSelectedMajorId] = useState("");
   const [selectedMinorId, setSelectedMinorId] = useState("");
@@ -3530,7 +3553,10 @@ export default function PlannerClient() {
       <div className="flex overflow-hidden" style={{ height: "calc(100vh - 56px)" }}>
 
         {/* ── Sidebar ──────────────────────────────────────────────────────── */}
-        <aside className="w-[260px] shrink-0 flex flex-col bg-[#181818] border-r border-[#2a2a2a]">
+        <aside
+          style={{ width: sidebarWidth }}
+          className="shrink-0 flex flex-col bg-[#181818] border-r border-[#2a2a2a]"
+        >
 
           {/* Tabs */}
           <div className="flex border-b border-[#2a2a2a] shrink-0">
@@ -3673,7 +3699,7 @@ export default function PlannerClient() {
                         <p className="text-[8px] font-bold uppercase tracking-[0.15em] text-[#444] px-1 pb-1">
                           All Courses
                         </p>
-                        <div className="grid grid-cols-3 gap-1 p-1.5 bg-[#0f0f0f] rounded">
+                        <div className="grid [grid-template-columns:repeat(auto-fill,minmax(80px,1fr))] gap-1 p-1.5 bg-[#0f0f0f] rounded">
                           {globalResults.map((c) => (
                             <CoursePill
                               key={c.id}
@@ -4006,6 +4032,15 @@ export default function PlannerClient() {
             )}
           </div>
         </aside>
+
+        {/* ── Sidebar resize handle ────────────────────────────────────────── */}
+        <div
+          onPointerDown={startSidebarResize}
+          role="separator"
+          aria-orientation="vertical"
+          aria-label="Resize sidebar"
+          className="w-1.5 shrink-0 cursor-col-resize bg-transparent hover:bg-[#3b82f6]/40 active:bg-[#3b82f6]/60 transition-colors"
+        />
 
         {/* ── Clear Schedule confirmation dialog ───────────────────────────── */}
         {pendingLock && (
