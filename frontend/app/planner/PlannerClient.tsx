@@ -1,6 +1,7 @@
 "use client";
 
 import { useState, useEffect, useMemo, useCallback, useRef } from "react";
+import { createPortal } from "react-dom";
 import {
   DndContext,
   DragEndEvent,
@@ -955,7 +956,7 @@ function PlacedCard({
       ref={setNodeRef}
       style={style}
       className={`group/card flex items-stretch gap-1.5 rounded-r-md pl-1 pr-0 select-none
-        bg-[#1e1e1e] border border-l-0 border-[#2a2a2a] shadow-sm transition-colors min-h-[44px]
+        bg-[#1e1e1e] border border-l-0 border-[#2a2a2a] shadow-sm transition-colors min-h-[32px]
         ${isDragging ? "opacity-20" : "hover:bg-[#252525] hover:border-[#333]"}`}
     >
       {/* drag handle — left, vertically centered */}
@@ -968,24 +969,24 @@ function PlacedCard({
       </span>
 
       {/* content — course code + GE pills (inline, right of the code) over name */}
-      <div className="flex-1 min-w-0 flex flex-col justify-center gap-0.5 py-1">
+      <div className="flex-1 min-w-0 flex flex-col justify-center gap-0 py-0.5">
         <div className="flex flex-wrap items-center gap-1.5">
-          <p className="text-[19px] font-bold text-[#e8e8e8] leading-tight truncate">{courseId}</p>
+          <p className="text-[19px] font-bold text-[#e8e8e8] leading-none truncate">{courseId}</p>
           {tags && <CoverageTags tags={tags} />}
         </div>
         {title && (
-          <p title={title} className="text-[10px] text-[#999] leading-snug overflow-hidden text-ellipsis whitespace-nowrap">{title}</p>
+          <p title={title} className="text-[10px] text-[#999] leading-tight overflow-hidden text-ellipsis whitespace-nowrap">{title}</p>
         )}
       </div>
 
-      {/* units (top) + avg gpa (below) — right side, left of action strip */}
-      <div className="flex flex-col items-end justify-center gap-0.5 shrink-0 py-1.5 pr-1 text-right">
-        <span className="text-[11px] font-medium text-[#888] tabular-nums">{units ?? "?"} <span className="font-normal text-[#5a5a5a]">UNITS</span></span>
+      {/* avg gpa (left) + units (right) — single line, right of action strip */}
+      <div className="flex flex-row items-center justify-end gap-2 shrink-0 py-0.5 pr-1 text-right">
         {gpa != null && isFinite(gpa) ? (
           <span className="text-[10px] font-mono font-medium" style={{ color: "#9a9a9a" }}>{gpa.toFixed(2)} AVG GPA</span>
         ) : (
           <span className="text-[9px] font-mono text-[#5a5a5a] whitespace-nowrap">No GPA Data</span>
         )}
+        <span className="text-[11px] font-medium text-[#888] tabular-nums">{units ?? "?"} <span className="font-normal text-[#5a5a5a]">UNITS</span></span>
       </div>
 
       {/* right-edge action strip — full card height: remove (top) / lock (bottom) */}
@@ -1138,8 +1139,8 @@ function QuarterCell({
   return (
     <div className={`flex flex-col border-r border-[#2a2a2a] last:border-r-0 ${dim ? "opacity-55" : ""}`}>
       {/* header */}
-      <div className={`flex items-center px-2 h-7 border-b border-[#2a2a2a] shrink-0 bg-[#242424] border-l-2 ${dim ? "border-l-[#FFC72C]/30" : "border-l-[#3b82f6]/40"}`}>
-        <span className={`text-[11px] font-bold tracking-wide ${dim ? "text-[#5a5648]" : "text-[#888]"}`}>
+      <div className={`flex items-center px-2 h-7 border-b border-[#2a2a2a] shrink-0 bg-[#242424] border-l-[3px] ${dim ? "border-l-[#FFC72C]/40" : "border-l-[#3b82f6]/70"}`}>
+        <span className={`text-[12px] font-bold tracking-wide ${dim ? "text-[#6a655a]" : "text-[#a5a5a5]"}`}>
           {label}
         </span>
         {quarterDiff != null && (
@@ -1186,8 +1187,10 @@ function QuarterCell({
           ${isOver ? "bg-[#0d1a2d]" : "bg-[#1e1e1e]"}`}
       >
         {courseIds.length === 0 && !isOver && (
-          <div className="m-0.5 flex-1 flex items-center justify-center border border-dashed border-[#2c2c2c] rounded-md">
-            <span className="text-[9px] text-[#3a3a3a] font-medium select-none">Drop courses here</span>
+          <div className="m-0.5 flex-1 flex items-center justify-center border border-dotted border-[#262626] rounded-md">
+            <span className="inline-flex items-center gap-1 rounded-md px-2.5 py-1 text-[10px] font-medium text-[#4a4a4a] hover:text-[#7a7a7a] hover:bg-white/[0.02] cursor-pointer transition-colors select-none">
+              <span className="text-[12px] leading-none">+</span> Add Course
+            </span>
           </div>
         )}
         {courseIds.map((cid) => (
@@ -1899,7 +1902,7 @@ export default function PlannerClient() {
   const [loadingMinorReqs, setLoadingMinorReqs] = useState(false);
 
   // ── UI state ───────────────────────────────────────────────────────────────
-  const [sidebarTab, setSidebarTab] = useState<"major" | "ge" | "minor">("major");
+  const [sidebarTab, setSidebarTab] = useState<"major" | "ge" | "minor" | "help">("major");
   // Resizable sidebar width (px). Persists for the session; clamped on drag.
   const SIDEBAR_MIN = 220;
   const SIDEBAR_MAX = 480;
@@ -1932,6 +1935,18 @@ export default function PlannerClient() {
   const [activeData, setActiveData] = useState<DragData | null>(null);
   const [loadingReqs, setLoadingReqs] = useState(false);
   const [summerYears, setSummerYears] = useState<Set<number>>(new Set());
+  const [collapsedYears, setCollapsedYears] = useState<Set<number>>(new Set());
+  const toggleYearCollapse = useCallback((year: number) => {
+    setCollapsedYears((prev) => {
+      const next = new Set(prev);
+      if (next.has(year)) next.delete(year);
+      else next.add(year);
+      return next;
+    });
+  }, []);
+  // Portal target inside the global Navbar; page-level actions render here.
+  const [navActionsSlot, setNavActionsSlot] = useState<HTMLElement | null>(null);
+  useEffect(() => { setNavActionsSlot(document.getElementById("navbar-actions")); }, []);
   const [lockedCourses, setLockedCourses] = useState<Set<string>>(new Set());
   const [searchQuery, setSearchQuery] = useState("");
   const [autoFillLoading, setAutoFillLoading] = useState(false);
@@ -3555,12 +3570,12 @@ export default function PlannerClient() {
         {/* ── Sidebar ──────────────────────────────────────────────────────── */}
         <aside
           style={{ width: sidebarWidth }}
-          className="shrink-0 flex flex-col bg-[#181818] border-r border-[#2a2a2a]"
+          className="shrink-0 flex flex-col bg-[#1a1a1a] border-r-2 border-[#303030] shadow-[1px_0_6px_rgba(0,0,0,0.35)]"
         >
 
           {/* Tabs */}
           <div className="flex border-b border-[#2a2a2a] shrink-0">
-            {(["major", "ge", "minor"] as const).map((tab) => (
+            {(["major", "ge", "minor", "help"] as const).map((tab) => (
               <button
                 key={tab}
                 onClick={() => setSidebarTab(tab)}
@@ -3569,12 +3584,13 @@ export default function PlannerClient() {
                     ? "text-[#f0f0f0] border-b-2 border-[#3b82f6]"
                     : "text-[#444] hover:text-[#666]"}`}
               >
-                {tab === "major" ? "Major" : tab === "ge" ? "GE" : "Minor"}
+                {tab === "major" ? "Major" : tab === "ge" ? "GE" : tab === "minor" ? "Minor" : "Help"}
               </button>
             ))}
           </div>
 
           {/* Fixed top */}
+          {sidebarTab !== "help" && (
           <div className="px-2 pt-2 flex flex-col gap-1.5 shrink-0">
             {sidebarTab === "major" && (
               majorListError ? (
@@ -3655,11 +3671,47 @@ export default function PlannerClient() {
               </p>
             )}
           </div>
+          )}
 
-          <div className="border-t border-[#2a2a2a] mt-1 shrink-0" />
+          {sidebarTab !== "help" && (
+            <div className="border-t border-[#2a2a2a] mt-1 shrink-0" />
+          )}
 
           {/* Scrollable list */}
           <div className="flex-1 overflow-y-auto py-1 min-h-0">
+            {sidebarTab === "help" && (
+              <div className="flex flex-col h-full px-3 py-3">
+                <div className="flex flex-col gap-4 flex-1">
+                  <section>
+                    <h3 className="text-[12px] font-bold text-[#e8e8e8] tracking-tight">How to use PlanUCI</h3>
+                    <p className="mt-1 text-[10px] text-[#555] leading-relaxed">Coming soon.</p>
+                  </section>
+                  <section>
+                    <h3 className="text-[12px] font-bold text-[#e8e8e8] tracking-tight">Features</h3>
+                    <p className="mt-1 text-[10px] text-[#555] leading-relaxed">Coming soon.</p>
+                  </section>
+                  <section>
+                    <h3 className="text-[12px] font-bold text-[#e8e8e8] tracking-tight">FAQ</h3>
+                    <p className="mt-1 text-[10px] text-[#555] leading-relaxed">Coming soon.</p>
+                  </section>
+                </div>
+
+                {/* Contact / feedback */}
+                <div className="mt-4 pt-3 border-t border-[#2a2a2a]">
+                  <p className="text-[9px] font-bold uppercase tracking-[0.12em] text-[#444]">Feedback</p>
+                  <a
+                    href="mailto:rtmcdani@uci.edu"
+                    className="mt-1 inline-flex items-center gap-1.5 text-[10px] text-[#888] hover:text-[#3b82f6] transition-colors"
+                  >
+                    <svg viewBox="0 0 16 16" className="w-3 h-3" fill="none">
+                      <rect x="2" y="3.5" width="12" height="9" rx="1.5" stroke="currentColor" strokeWidth="1.2" />
+                      <path d="M2.5 4.5L8 8.5l5.5-4" stroke="currentColor" strokeWidth="1.2" strokeLinecap="round" strokeLinejoin="round" />
+                    </svg>
+                    rtmcdani@uci.edu
+                  </a>
+                </div>
+              </div>
+            )}
             {sidebarTab === "major" && (
               <>
                 {loadingReqs && (
@@ -3792,6 +3844,7 @@ export default function PlannerClient() {
           </div>
 
           {/* Auto-fill */}
+          {sidebarTab !== "help" && (
           <div className="px-2.5 py-2.5 border-t border-[#2a2a2a] shrink-0">
 
             {/* Unit load selector */}
@@ -4022,15 +4075,16 @@ export default function PlannerClient() {
 
             <button
               onClick={() => setShowClearConfirm(true)}
-              className="w-full mt-1.5 rounded py-2 text-[11px] font-medium tracking-wide border border-red-900/50 text-red-500 hover:bg-red-950/30 hover:border-red-700/60 transition-all"
+              className="block mx-auto mt-2 text-[10px] font-normal text-[#555] hover:text-[#888] underline-offset-2 hover:underline transition-colors"
             >
-              Clear Schedule
+              Clear schedule
             </button>
 
             {clearSuccess && (
               <p className="mt-1.5 text-center text-[10px] text-green-500">Schedule cleared</p>
             )}
           </div>
+          )}
         </aside>
 
         {/* ── Sidebar resize handle ────────────────────────────────────────── */}
@@ -4159,38 +4213,44 @@ export default function PlannerClient() {
         {/* ── Main ─────────────────────────────────────────────────────────── */}
         <main className="flex-1 flex flex-col overflow-hidden bg-[#111]">
 
+          {/* Page actions — rendered into the global navbar's right side. */}
+          {navActionsSlot && createPortal(
+            <>
+              <APCreditsMenu apScores={apScores} setApScores={setApScores} apExamNames={apExamNames} />
+
+              <PlansMenu
+                signedIn={signedIn}
+                savedPlans={savedPlans}
+                maxPlans={MAX_SAVED_PLANS}
+                onSave={handleSaveNamed}
+                onLoad={handleLoadNamed}
+                onDelete={handleDeleteNamed}
+                onSignIn={handleSignIn}
+              />
+
+              <button
+                onClick={handleDownloadPDF}
+                title="Download a PDF of this schedule"
+                className="flex items-center gap-1.5 rounded-md border border-white/[0.12] bg-white/[0.04] px-2.5 h-7 text-[11px] font-medium text-[#cfcfe0] hover:text-white hover:border-white/25 transition-colors"
+              >
+                <svg viewBox="0 0 16 16" className="w-3.5 h-3.5" fill="none">
+                  <path d="M8 2v8m0 0L5 7m3 3l3-3" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round" strokeLinejoin="round"/>
+                  <path d="M3 12.5h10" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round"/>
+                </svg>
+                PDF
+              </button>
+
+              <div className="w-px h-5 bg-white/15" />
+            </>,
+            navActionsSlot,
+          )}
+
           {/* Top bar */}
           <div className="h-12 shrink-0 flex items-center px-6 border-b border-[#2a2a2a] bg-[#141414] gap-3">
             <span className="text-[13px] font-medium text-[#bbb] truncate max-w-[240px]">
               {selectedLabel || <span className="text-[#555] font-normal">No major selected</span>}
             </span>
             <div className="flex-1" />
-
-            <APCreditsMenu apScores={apScores} setApScores={setApScores} apExamNames={apExamNames} />
-
-            <PlansMenu
-              signedIn={signedIn}
-              savedPlans={savedPlans}
-              maxPlans={MAX_SAVED_PLANS}
-              onSave={handleSaveNamed}
-              onLoad={handleLoadNamed}
-              onDelete={handleDeleteNamed}
-              onSignIn={handleSignIn}
-            />
-
-            <button
-              onClick={handleDownloadPDF}
-              title="Download a PDF of this schedule"
-              className="flex items-center gap-1.5 rounded-md border border-[#2a2a2a] bg-[#1a1a1a] px-2.5 h-7 text-[11px] font-medium text-[#999] hover:text-[#e8e8e8] hover:border-[#3a3a3a] transition-colors"
-            >
-              <svg viewBox="0 0 16 16" className="w-3.5 h-3.5" fill="none">
-                <path d="M8 2v8m0 0L5 7m3 3l3-3" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round" strokeLinejoin="round"/>
-                <path d="M3 12.5h10" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round"/>
-              </svg>
-              PDF
-            </button>
-
-            <div className="w-px h-5 bg-[#2a2a2a]" />
 
             <div className="flex items-baseline gap-1.5">
               <span className="text-[16px] font-bold text-[#e8e8e8] tabular-nums leading-none">{totalUnits}</span>
@@ -4208,44 +4268,114 @@ export default function PlannerClient() {
           )}
 
           {/* Grid */}
-          <div className="flex-1 overflow-auto p-4">
+          <div className="relative flex-1 overflow-auto p-4">
+            {/* Empty-state hint — only when nothing is selected or placed yet */}
+            {!selectedMajorId && !hasPlacedCourses && (
+              <div className="pointer-events-none absolute inset-0 z-10 flex items-center justify-center">
+                <div className="flex items-center gap-2 text-[#5a5a5a] select-none">
+                  <svg viewBox="0 0 24 24" className="w-5 h-5 shrink-0" fill="none">
+                    <path d="M20 12H4m0 0l5-5m-5 5l5 5" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
+                  </svg>
+                  <span className="text-[13px] font-normal">Select a major to get started</span>
+                </div>
+              </div>
+            )}
             <div className="border border-[#2a2a2a] rounded-lg overflow-hidden">
               {Array.from({ length: numYears }, (_, i) => i + 1).map((year) => {
                 const hasSummer = summerYears.has(year);
                 const summerQk = qkey(year, "summer");
+                const collapsed = collapsedYears.has(year);
+                const fallYear = START_YEAR + year - 1;
+
+                // Year totals across its quarters (+ summer when present).
+                const yearQks = [
+                  ...BASE_QUARTERS.map((q) => qkey(year, q.key)),
+                  ...(hasSummer ? [summerQk] : []),
+                ];
+                const yearCourseIds = yearQks.flatMap((qk) => plannedCourses[qk] ?? []);
+                const yearCourseCount = yearCourseIds.length;
+                const yearUnits = yearCourseIds.reduce(
+                  (sum, id) => sum + (courseInfoMap[normId(id)]?.min_units ?? 4),
+                  0,
+                );
 
                 return (
-                  <div key={year} className="flex border-b border-[#2a2a2a] last:border-b-0">
-                    {/* Year label + remove */}
-                    <div className="w-9 shrink-0 flex flex-col items-center justify-center gap-1.5 py-1.5 border-r border-[#2a2a2a] bg-gradient-to-b from-[#141414] to-[#0d0d0d]">
-                      <span
-                        className="flex-1 flex items-center text-[9px] font-bold uppercase tracking-[0.2em] text-[#6a6a6a] select-none"
-                        style={{ writingMode: "vertical-rl", transform: "rotate(180deg)" }}
+                  <div key={year} className="border-b border-[#2a2a2a] last:border-b-0">
+                    {/* Year header bar — full width, lighter than quarter cards */}
+                    <div className="flex items-center gap-2 h-9 px-3 bg-[#2a2a2e] border-b border-[#2a2a2a]">
+                      <button
+                        onClick={() => toggleYearCollapse(year)}
+                        title={collapsed ? "Expand year" : "Collapse year"}
+                        aria-expanded={!collapsed}
+                        className="flex items-center gap-2 min-w-0 text-left group/yr"
                       >
-                        {`Year ${year}`}
+                        <span className="text-[13px] font-bold text-[#e8e8e8] tracking-tight whitespace-nowrap">
+                          Year {year}
+                        </span>
+                        <span className="text-[11px] font-medium text-[#7a7a85] tabular-nums whitespace-nowrap">
+                          ({fallYear}–{fallYear + 1})
+                        </span>
+                      </button>
+
+                      <div className="flex-1" />
+
+                      <span className="text-[10px] font-medium text-[#8a8a95] tabular-nums whitespace-nowrap">
+                        {yearCourseCount} {yearCourseCount === 1 ? "course" : "courses"}
+                        <span className="mx-1 text-[#4a4a52]">·</span>
+                        {yearUnits} units
                       </span>
+
                       {year > 1 && (
                         <button
                           onClick={() => removeYear(year)}
                           title={`Remove Year ${year} — its courses return to the sidebar`}
-                          className="shrink-0 flex items-center justify-center w-5 h-5 rounded border border-dashed border-[#2a2a2a] text-[10px] leading-none text-[#5a5a5a] hover:text-red-400 hover:border-red-700/50 hover:bg-red-950/30 transition-colors"
+                          className="shrink-0 flex items-center justify-center w-5 h-5 rounded border border-[#3a3a3a] text-[10px] leading-none text-[#6a6a6a] hover:text-red-400 hover:border-red-700/50 hover:bg-red-950/30 transition-colors"
                         >
                           ✕
                         </button>
                       )}
+
+                      <button
+                        onClick={() => toggleYearCollapse(year)}
+                        title={collapsed ? "Expand year" : "Collapse year"}
+                        aria-expanded={!collapsed}
+                        className="shrink-0 flex items-center justify-center w-5 h-5 text-[#7a7a85] hover:text-[#e8e8e8] transition-colors"
+                      >
+                        <svg viewBox="0 0 12 12" className={`w-3 h-3 transition-transform ${collapsed ? "" : "rotate-180"}`} fill="none">
+                          <path d="M2 4l4 4 4-4" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" strokeLinejoin="round" />
+                        </svg>
+                      </button>
                     </div>
 
-                    {/* Quarter grid */}
-                    <div
-                      className="flex-1 grid"
-                      style={{ gridTemplateColumns: hasSummer ? "1fr 1fr 1fr 0.6fr" : "1fr 1fr 1fr" }}
-                    >
-                      {BASE_QUARTERS.map((q) => {
-                        const qk = qkey(year, q.key);
-                        return (
+                    {!collapsed && (
+                    <div className="flex">
+                      {/* Quarter grid */}
+                      <div
+                        className="flex-1 grid"
+                        style={{ gridTemplateColumns: hasSummer ? "1fr 1fr 1fr 0.6fr" : "1fr 1fr 1fr" }}
+                      >
+                        {BASE_QUARTERS.map((q) => {
+                          const qk = qkey(year, q.key);
+                          return (
+                            <QuarterCell
+                              key={qk} qKey={qk} label={q.label} dim={false}
+                              courseIds={plannedCourses[qk] ?? []}
+                              courseInfoMap={courseInfoMap}
+                              difficultyMap={difficultyMap}
+                              lockedCourses={lockedCourses}
+                              onToggleLock={toggleLock}
+                              onRemove={removeCourse}
+                              prereqWarnings={prereqWarnings}
+                              onDismissWarning={dismissWarning}
+                              maxUnitsPerQuarter={maxUnits}
+                              coverageTags={coverageTags}
+                            />
+                          );
+                        })}
+                        {hasSummer && (
                           <QuarterCell
-                            key={qk} qKey={qk} label={q.label} dim={false}
-                            courseIds={plannedCourses[qk] ?? []}
+                            key={summerQk} qKey={summerQk} label="Summer" dim
+                            courseIds={plannedCourses[summerQk] ?? []}
                             courseInfoMap={courseInfoMap}
                             difficultyMap={difficultyMap}
                             lockedCourses={lockedCourses}
@@ -4253,47 +4383,33 @@ export default function PlannerClient() {
                             onRemove={removeCourse}
                             prereqWarnings={prereqWarnings}
                             onDismissWarning={dismissWarning}
-                            maxUnitsPerQuarter={maxUnits}
                             coverageTags={coverageTags}
+                            removable onRemoveQuarter={() => toggleSummer(year)}
+                            maxUnitsPerQuarter={maxUnits}
                           />
-                        );
-                      })}
-                      {hasSummer && (
-                        <QuarterCell
-                          key={summerQk} qKey={summerQk} label="Summer" dim
-                          courseIds={plannedCourses[summerQk] ?? []}
-                          courseInfoMap={courseInfoMap}
-                          difficultyMap={difficultyMap}
-                          lockedCourses={lockedCourses}
-                          onToggleLock={toggleLock}
-                          onRemove={removeCourse}
-                          prereqWarnings={prereqWarnings}
-                          onDismissWarning={dismissWarning}
-                          coverageTags={coverageTags}
-                          removable onRemoveQuarter={() => toggleSummer(year)}
-                          maxUnitsPerQuarter={maxUnits}
-                        />
-                      )}
-                    </div>
+                        )}
+                      </div>
 
-                    {/* + Summer */}
-                    <div className="w-6 shrink-0 flex items-center justify-center border-l border-[#2a2a2a] bg-[#0f0f0f]">
-                      {!hasSummer && (
-                        <button
-                          onClick={() => toggleSummer(year)}
-                          title="Add Summer"
-                          className="flex flex-col items-center gap-1 text-[#5a5a5a] hover:text-[#FFC72C]/70 transition-colors"
-                        >
-                          <span className="text-[11px] font-bold leading-none">+</span>
-                          <span
-                            className="text-[8px] font-semibold uppercase tracking-[0.15em] leading-none"
-                            style={{ writingMode: "vertical-rl" }}
+                      {/* + Summer */}
+                      <div className="w-6 shrink-0 flex items-center justify-center border-l border-[#2a2a2a] bg-[#0f0f0f]">
+                        {!hasSummer && (
+                          <button
+                            onClick={() => toggleSummer(year)}
+                            title="Add Summer"
+                            className="flex flex-col items-center gap-1 text-[#5a5a5a] hover:text-[#FFC72C]/70 transition-colors"
                           >
-                            Summer
-                          </span>
-                        </button>
-                      )}
+                            <span className="text-[11px] font-bold leading-none">+</span>
+                            <span
+                              className="text-[8px] font-semibold uppercase tracking-[0.15em] leading-none"
+                              style={{ writingMode: "vertical-rl" }}
+                            >
+                              Summer
+                            </span>
+                          </button>
+                        )}
+                      </div>
                     </div>
+                    )}
                   </div>
                 );
               })}
@@ -4309,14 +4425,6 @@ export default function PlannerClient() {
           </div>
         </main>
       </div>
-
-      {/* Feedback link — subtle, fixed bottom-right */}
-      <a
-        href="mailto:rtmcdani@uci.edu"
-        className="fixed bottom-3 right-4 z-40 text-[10px] text-[#444] hover:text-[#888] transition-colors"
-      >
-        Mail any feedback to rtmcdani@uci.edu
-      </a>
 
       {/* Drag overlay */}
       <DragOverlay dropAnimation={null}>
