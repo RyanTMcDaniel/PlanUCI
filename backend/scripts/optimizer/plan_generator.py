@@ -1316,6 +1316,8 @@ def _perturb(
     rng: random.Random,
     n_swaps: int,
     trees: dict[str, dict] | None = None,
+    ge_norms: set[str] | None = None,
+    ge_allowed_quarters: set[str] | None = None,
 ) -> CoursePlan:
     """Swap n_swaps random course pairs between quarters.
 
@@ -1323,9 +1325,32 @@ def _perturb(
     immediately undone if it would introduce a prereq violation.  This prevents
     the optimizer from receiving a pre-broken starting plan that it would
     immediately return unchanged (the early-exit path in optimize()).
+
+    Hard GE earliness (CHANGE 1): a swap is also undone if it would move a GE
+    course (not already past the Year-2 deadline in the input plan) out of
+    ge_allowed_quarters — so the perturbed starting plan never violates the GE
+    deadline that optimize() then has to preserve.
     """
     p = deepcopy(plan)
     quarters = list(p.planned_courses.keys())
+
+    ge_norms = ge_norms or set()
+    base_late_ge: set[str] = set()
+    if ge_norms and ge_allowed_quarters is not None:
+        for q, cs in plan.planned_courses.items():
+            if q not in ge_allowed_quarters:
+                for c in cs:
+                    if _norm(c) in ge_norms:
+                        base_late_ge.add(_norm(c))
+
+    def _ge_deadline_bad(course: str, dest_q: str) -> bool:
+        return (
+            ge_allowed_quarters is not None
+            and _norm(course) in ge_norms
+            and _norm(course) not in base_late_ge
+            and dest_q not in ge_allowed_quarters
+        )
+
     for _ in range(n_swaps):
         non_empty = [q for q in quarters if p.planned_courses.get(q)]
         if len(non_empty) < 2:
@@ -1338,10 +1363,15 @@ def _perturb(
         p.planned_courses[q2].remove(c2)
         p.planned_courses[q1].append(c2)
         p.planned_courses[q2].append(c1)
-        # Reject swap if it introduces a prereq violation or splits a coreq pair
-        if trees and (
-            _check_prereqs(p, trees)
-            or (coreq_split_pairs(p, trees) - before_split)
+        # Reject swap if it introduces a prereq violation, splits a coreq pair, or
+        # pushes a GE course past the Year-2 deadline (c1 now in q2, c2 now in q1).
+        if (
+            (trees and (
+                _check_prereqs(p, trees)
+                or (coreq_split_pairs(p, trees) - before_split)
+            ))
+            or _ge_deadline_bad(c1, q2)
+            or _ge_deadline_bad(c2, q1)
         ):
             p.planned_courses[q1].remove(c2)
             p.planned_courses[q2].remove(c1)
@@ -1653,11 +1683,23 @@ def generate(
         (17, 16),
     ]
 
+    # Quarters in which a GE course may legally sit (Year 1-2 = first 6 quarters).
+    # Passed to both _perturb and optimize so neither layer can push a GE past the
+    # Year-2 deadline that _asap_schedule already enforced on the seed.
+    ge_allowed_quarters = set(working_quarters[: GE_LAST_QUARTER_IDX + 1])
+
     variants: list[OptimizationResult] = []
     for seed, n_swaps in configs:
         rng = random.Random(seed)
-        starting = _perturb(base_plan, rng, n_swaps, trees=trees) if n_swaps else base_plan
-        result = optimize(starting, max_iter=150, seed=seed)
+        starting = (
+            _perturb(base_plan, rng, n_swaps, trees=trees,
+                     ge_norms=ge_norms, ge_allowed_quarters=ge_allowed_quarters)
+            if n_swaps else base_plan
+        )
+        result = optimize(
+            starting, max_iter=150, seed=seed,
+            ge_norms=ge_norms, ge_allowed_quarters=ge_allowed_quarters,
+        )
         variants.append(result)
 
     variants.sort(key=lambda r: r.soft_score)
