@@ -13,6 +13,7 @@ export interface PlanData {
   maxUnits:            number;
   lockedCourses:       string[];          // Set<string> serialized as array
   apScores:            Record<string, number>;
+  languageReqSatisfied?: boolean;         // GE VI satisfied outside a course; absent on older plans
   summerYears:         number[];          // Set<number> serialized as array
   savedAt:             string;            // ISO timestamp
 }

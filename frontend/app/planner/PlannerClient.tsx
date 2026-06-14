@@ -92,6 +92,10 @@ const GE_LABEL_TO_GROUP: Record<string, string> = Object.fromEntries(
   Object.entries(GE_CODE_LABELS).map(([g, label]) => [label, g]),
 );
 
+// UCI GE category VI = "Language Other Than English" — the only GE satisfiable
+// outside a placed course (heritage language, placement test, or HS equivalent).
+const LANGUAGE_GE_GROUP = "GE_VI";
+
 // Authoritative GE coverage for a course, derived ONLY from its ge_list (never
 // array membership). Returns requirement_group codes that also appear in the
 // passed geRequirements (so already-filled / not-needed categories are skipped
@@ -1518,12 +1522,16 @@ function BucketSection({
 // ── GE section ─────────────────────────────────────────────────────────────────
 
 function GESection({
-  req, placedSet, apCreditedSet, apSatisfiedGEs, courseInfoMap, difficultyMap, searchQuery, initialOpen, getCoverage,
+  req, placedSet, apCreditedSet, apSatisfiedGEs, extraSatisfied, courseInfoMap, difficultyMap, searchQuery, initialOpen, getCoverage,
 }: {
   req: ReqGroup;
   placedSet: Set<string>;
   apCreditedSet: Set<string>;
   apSatisfiedGEs: Set<string>;
+  // Satisfied outside a placed course by a non-AP source (e.g. the language
+  // requirement checkbox). Marks the category complete but shows no AP badge —
+  // identical to having a course placed for it.
+  extraSatisfied?: boolean;
   courseInfoMap: Record<string, CourseDetail>;
   difficultyMap: Record<string, number>;
   searchQuery: string;
@@ -1546,10 +1554,12 @@ function GESection({
 
   // AP exam directly satisfies this GE category (e.g. AP World History → GE-VIII)
   const apDirect = apSatisfiedGEs.has(req.requirement_group ?? "");
+  // Satisfied without a course (AP badge only for the AP source).
+  const directDone = apDirect || !!extraSatisfied;
 
   const cov = getCoverage(req);
-  const satisfied = apDirect ? cov.needed : Math.min(cov.placed, cov.needed);
-  const done = apDirect ? true : cov.done;
+  const satisfied = directDone ? cov.needed : Math.min(cov.placed, cov.needed);
+  const done = directDone ? true : cov.done;
   const partial = !done && satisfied > 0;
   const accentColor = done ? "#22c55e" : partial ? "#3b82f6" : "transparent";
 
@@ -1606,10 +1616,13 @@ function GESection({
 
 function APCreditsMenu({
   apScores, setApScores, apExamNames,
+  languageReqSatisfied, setLanguageReqSatisfied,
 }: {
   apScores: Record<string, number>;
   setApScores: React.Dispatch<React.SetStateAction<Record<string, number>>>;
   apExamNames: string[];
+  languageReqSatisfied: boolean;
+  setLanguageReqSatisfied: React.Dispatch<React.SetStateAction<boolean>>;
 }) {
   const [open, setOpen] = useState(false);
   const [query, setQuery] = useState("");
@@ -1660,6 +1673,31 @@ function APCreditsMenu({
             <p className="text-[9.5px] text-[#666] mt-0.5 leading-snug">
               Add your scores so satisfied courses are pre-filled.
             </p>
+          </div>
+          <div className="px-2.5 pt-2.5">
+            <button
+              onClick={() => setLanguageReqSatisfied((v) => !v)}
+              className="w-full flex items-start gap-2 rounded border border-[#2a2a2a] bg-[#141414] px-2 py-1.5 text-left hover:border-[#3a3a3a] transition-colors"
+            >
+              <span
+                className={`mt-[1px] w-3.5 h-3.5 shrink-0 rounded-[3px] border flex items-center justify-center transition-colors
+                  ${languageReqSatisfied
+                    ? "bg-[#3b82f6] border-[#3b82f6]"
+                    : "border-[#3a3a3a] bg-[#1a1a1a]"}`}
+              >
+                {languageReqSatisfied && (
+                  <svg viewBox="0 0 12 12" className="w-2.5 h-2.5" fill="none">
+                    <path d="M2.5 6l2.5 2.5 4.5-5" stroke="white" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round"/>
+                  </svg>
+                )}
+              </span>
+              <span className="min-w-0">
+                <span className="text-[10px] text-[#ccc] leading-tight block">Language requirement satisfied</span>
+                <span className="text-[9px] text-[#666] leading-snug block mt-0.5">
+                  e.g. via heritage language, placement test, or high school equivalent
+                </span>
+              </span>
+            </button>
           </div>
           <div className="px-2.5 pt-2">
             <input
@@ -1962,6 +2000,8 @@ export default function PlannerClient() {
   const [apExamNames, setApExamNames] = useState<string[]>([]);
   const [apCreditedSet, setApCreditedSet] = useState<Set<string>>(new Set());
   const [apSatisfiedGEs, setApSatisfiedGEs] = useState<Set<string>>(new Set());
+  // Language Other Than English (GE VI) satisfied outside a placed course.
+  const [languageReqSatisfied, setLanguageReqSatisfied] = useState(false);
   const [showClearConfirm, setShowClearConfirm] = useState(false);
   const [lockConflictErrors, setLockConflictErrors] = useState<string[] | null>(null);
   const [pendingLock, setPendingLock] = useState<{ courseId: string; warnings: string[] } | null>(null);
@@ -2182,6 +2222,7 @@ export default function PlannerClient() {
     setMaxUnits(plan.maxUnits);
     setLockedCourses(new Set(plan.lockedCourses));
     setApScores(plan.apScores);
+    setLanguageReqSatisfied(plan.languageReqSatisfied ?? false);
     setSummerYears(new Set(plan.summerYears));
   }, []);
 
@@ -2217,11 +2258,12 @@ export default function PlannerClient() {
         maxUnits,
         lockedCourses: [...lockedCourses],
         apScores,
+        languageReqSatisfied,
         summerYears: [...summerYears],
       }).catch(() => {});
     }, 500);
     return () => { if (saveTimerRef.current) clearTimeout(saveTimerRef.current); };
-  }, [plannedCourses, selectedMajorId, selectedDisplayName, selectedMinorId, numYears, gradQuarter, maxUnits, lockedCourses, apScores, summerYears]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [plannedCourses, selectedMajorId, selectedDisplayName, selectedMinorId, numYears, gradQuarter, maxUnits, lockedCourses, apScores, languageReqSatisfied, summerYears]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // ── Auto-fetch details for placed courses not in courseInfoMap ────────────
   useEffect(() => {
@@ -2445,11 +2487,11 @@ export default function PlannerClient() {
     const res = await saveNamedPlan(name, {
       plannedCourses, selectedMajorId, selectedDisplayName, selectedMinorId,
       numYears, gradQuarter, maxUnits,
-      lockedCourses: [...lockedCourses], apScores, summerYears: [...summerYears],
+      lockedCourses: [...lockedCourses], apScores, languageReqSatisfied, summerYears: [...summerYears],
     });
     if (res.ok) listNamedPlans().then(setSavedPlans).catch(() => {});
     return res.ok ? { ok: true } : { ok: false, reason: res.reason };
-  }, [plannedCourses, selectedMajorId, selectedDisplayName, selectedMinorId, numYears, gradQuarter, maxUnits, lockedCourses, apScores, summerYears]);
+  }, [plannedCourses, selectedMajorId, selectedDisplayName, selectedMinorId, numYears, gradQuarter, maxUnits, lockedCourses, apScores, languageReqSatisfied, summerYears]);
 
   const handleLoadNamed = useCallback(async (id: number) => {
     const plan = await loadPlanById(id);
@@ -3296,7 +3338,7 @@ export default function PlannerClient() {
   // membership. Array membership only supplies the candidate POOL per category.
   const handleGEAutofill = useCallback(async () => {
     const info = courseInfoMapRef.current;
-    const allGroups = geRequirements.filter((r) => !apSatisfiedGEs.has(r.requirement_group ?? ""));
+    const allGroups = geRequirements.filter((r) => !apSatisfiedGEs.has(r.requirement_group ?? "") && !(languageReqSatisfied && r.requirement_group === LANGUAGE_GE_GROUP));
     const keyOf = (r: ReqGroup) => r.requirement_group ?? r.group_name;
     const groupByKey = new Map(allGroups.map((g) => [keyOf(g), g] as const));
 
@@ -3406,13 +3448,13 @@ export default function PlannerClient() {
       }
     }
     await buildAndOptimizePool(picks, tags);
-  }, [plannedCourses, geRequirements, apSatisfiedGEs, requirements, getCoverage, placedGECats, buildAndOptimizePool]);
+  }, [plannedCourses, geRequirements, apSatisfiedGEs, languageReqSatisfied, requirements, getCoverage, placedGECats, buildAndOptimizePool]);
 
   // ── Minor autofill (no optimizer) ──────────────────────────────────────────
   const handleMinorAutofill = useCallback(async () => {
     const info = courseInfoMapRef.current;
     const placedIds = new Set(Object.values(plannedCourses).flat().map(normId));
-    const geGroups = geRequirements.filter((r) => !apSatisfiedGEs.has(r.requirement_group ?? ""));
+    const geGroups = geRequirements.filter((r) => !apSatisfiedGEs.has(r.requirement_group ?? "") && !(languageReqSatisfied && r.requirement_group === LANGUAGE_GE_GROUP));
     const keyOf = (r: ReqGroup) => r.requirement_group ?? r.group_name;
 
     // Unfilled GE groups, authoritative (ge_list) — never array membership.
@@ -3480,7 +3522,7 @@ export default function PlannerClient() {
       }
     }
     await buildAndOptimizePool(picks, tags, requiredPicks);
-  }, [plannedCourses, geRequirements, apSatisfiedGEs, minorRequirements, requirements, getCoverage, placedGECats, buildAndOptimizePool]);
+  }, [plannedCourses, geRequirements, apSatisfiedGEs, languageReqSatisfied, minorRequirements, requirements, getCoverage, placedGECats, buildAndOptimizePool]);
 
   const toggleSummer = useCallback((year: number) => {
     setSummerYears((prev) => {
@@ -3563,7 +3605,9 @@ export default function PlannerClient() {
     return order.find((k) => minorBucketed[k].some((r) => !clientCoverage(r).done)) ?? null;
   }, [minorBucketed, clientCoverage]);
 
-  const firstIncompleteGE = geRequirements.findIndex((r) => !getCoverage(r).done);
+  const firstIncompleteGE = geRequirements.findIndex(
+    (r) => !getCoverage(r).done && !(languageReqSatisfied && r.requirement_group === LANGUAGE_GE_GROUP),
+  );
 
   // ── Render ──────────────────────────────────────────────────────────────────
   return (
@@ -3794,6 +3838,7 @@ export default function PlannerClient() {
                         key={r.id} req={r} placedSet={placedSet}
                         apCreditedSet={apCreditedSet}
                         apSatisfiedGEs={apSatisfiedGEs}
+                        extraSatisfied={languageReqSatisfied && r.requirement_group === LANGUAGE_GE_GROUP}
                         courseInfoMap={courseInfoMap} difficultyMap={difficultyMap}
                         searchQuery={searchQuery}
                         initialOpen={i === firstIncompleteGE}
@@ -4219,7 +4264,7 @@ export default function PlannerClient() {
           {/* Page actions — rendered into the global navbar's right side. */}
           {navActionsSlot && createPortal(
             <>
-              <APCreditsMenu apScores={apScores} setApScores={setApScores} apExamNames={apExamNames} />
+              <APCreditsMenu apScores={apScores} setApScores={setApScores} apExamNames={apExamNames} languageReqSatisfied={languageReqSatisfied} setLanguageReqSatisfied={setLanguageReqSatisfied} />
 
               <PlansMenu
                 signedIn={signedIn}
