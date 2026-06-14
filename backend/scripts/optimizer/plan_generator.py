@@ -206,6 +206,30 @@ def _fetch_course_terms(client, course_ids: list[str]) -> dict[str, list[str]]:
     return {r["id"]: (r.get("terms") or []) for r in rows}
 
 
+def _fetch_ge_course_norms(client, course_ids: list[str]) -> set[str]:
+    """Return the normalized ids of courses that satisfy at least one GE category.
+
+    A course is a GE course iff its ``ge_list`` is non-empty.  Used by the hard
+    GE-earliness deadline in _asap_schedule.  Plan ids arrive in either the spaced
+    catalogue form ("I&C SCI 46") or the stripped DB form ("I&CSCI46"); query both
+    so spaced GE ids still match (same pattern as soft_constraints._load_course_meta).
+    """
+    if not course_ids:
+        return set()
+    query_ids: set[str] = set()
+    for cid in course_ids:
+        query_ids.add(cid)
+        query_ids.add(cid.replace(" ", "").upper())
+    rows = (
+        client.table("courses")
+        .select("id,ge_list")
+        .in_("id", list(query_ids))
+        .execute()
+        .data
+    )
+    return {_norm(r["id"]) for r in rows if r.get("ge_list")}
+
+
 # ── Prereq depth helper (FIX 4) ──────────────────────────────────────────────
 
 def _get_prereq_depths(client, norm_ids: list[str]) -> dict[str, int]:
@@ -995,6 +1019,13 @@ def _collect_and_coreq_norms(tree: dict | None) -> set[str]:
 
 # ── ASAP scheduler ────────────────────────────────────────────────────────────
 
+# Hard GE-earliness deadline: a GE course must land no later than this 0-indexed
+# quarter (5 = end of Year 2: Fall Y1, Winter Y1, Spring Y1, Fall Y2, Winter Y2,
+# Spring Y2).  Enforced in _asap_schedule.  The ONLY exception is a GE whose
+# prerequisites are not themselves schedulable within Y1-Y2 ("prereq blocked").
+GE_LAST_QUARTER_IDX = 5
+
+
 def _asap_schedule(
     courses: list[str],
     prereq_trees: dict[str, dict],
@@ -1003,6 +1034,7 @@ def _asap_schedule(
     completed_norm: set[str],
     terms_by_course: dict[str, list[str]] | None = None,
     units_by_course: dict[str, int] | None = None,
+    ge_norms: set[str] | None = None,
 ) -> tuple[dict[str, list[str]], list[str]]:
     """Schedule each course in the earliest quarter its prerequisites allow.
 
@@ -1014,10 +1046,28 @@ def _asap_schedule(
     - Unit cap: cumulative units of placed courses must not exceed units_per_quarter.
       Actual min_units from the courses table are used when units_by_course is
       provided; otherwise UNITS_PER_COURSE (4) is assumed per course.
+
+    Hard GE earliness (CHANGE 1): when ``ge_norms`` is supplied, GE-satisfying
+    courses are subject to a hard deadline — they may not be placed beyond quarter
+    index ``GE_LAST_QUARTER_IDX`` (end of Year 2).  Within the Y1-Y2 window GEs are
+    sorted AHEAD of non-GE upper-division electives so they claim early slots
+    before those electives ("make room for the GE before non-GE electives").  A GE
+    whose prerequisites only become available after Y2 is genuinely "prereq
+    blocked": such a GE is allowed to land in Y3 at its earliest feasible slot and
+    is flagged.  A GE that WAS prereq-ready during Y1-Y2 but didn't fit (capacity)
+    is held out of Y3+ entirely — pure-elective GEs must land in Y1 or Y2.
     """
+    ge_norms = ge_norms or set()
     available: set[str] = set(completed_norm)
     remaining: list[str] = list(courses)
     plan: dict[str, list[str]] = {q: [] for q in quarters}
+
+    # GE norms that became prereq-ready (prereq tree satisfiable) at some point
+    # during the Y1-Y2 window.  Used to tell a capacity-blocked GE (was ready, must
+    # NOT spill into Y3) from a prereq-blocked GE (never ready in Y1-Y2, may spill).
+    ge_prereq_ready: set[str] = set()
+    # Prereq-blocked GEs that were allowed to land after Y2 (for the flag print).
+    late_ge_blocked: set[str] = set()
 
     def _course_units(course: str) -> int:
         """Actual units for a course, falling back to the global assumed constant."""
@@ -1041,7 +1091,21 @@ def _asap_schedule(
             for t in terms
         )
 
-    for quarter in quarters:
+    def _placement_key(course_id: str) -> tuple[int, int, str]:
+        """Candidate ordering: lower-division courses (course number < 100) first
+        so they unlock their upper-div successors early; then, AMONG upper-division
+        courses only, GE-satisfying courses ahead of non-GE electives so GEs claim
+        scarce Y1-Y2 slots before deadline-free electives.  Lower-div ordering is
+        left untouched (alpha) so required prereq chains aren't displaced by a
+        lower-div GE.  Alphabetical final tiebreak keeps output stable.
+        """
+        m = re.search(r'\d+', course_id)
+        num = int(m.group(0)) if m else 9999
+        is_lower = 0 if num < 100 else 1
+        ge_rank = (0 if _norm(course_id) in ge_norms else 1) if is_lower else 0
+        return (is_lower, ge_rank, course_id)
+
+    for q_idx, quarter in enumerate(quarters):
         while remaining:
             q_units = sum(_course_units(c) for c in plan[quarter])
             if q_units >= units_per_quarter:
@@ -1056,14 +1120,9 @@ def _asap_schedule(
                 if n not in remaining_norm_to_raw:
                     remaining_norm_to_raw[n] = raw
 
-            # Collect all eligible candidates for this quarter slot, then pick
-            # the highest-priority one.  Lower-division courses (course number
-            # < 100) are always preferred so they unlock their upper-div
-            # successors as early as possible.
-            def _lower_div_key(course_id: str) -> tuple[int, str]:
-                m = re.search(r'\d+', course_id)
-                num = int(m.group(0)) if m else 9999
-                return (0 if num < 100 else 1, course_id)
+            # Collect all eligible candidates for this quarter slot, then pick the
+            # highest-priority one via _placement_key (lower-div first; GEs ahead of
+            # non-GE upper-div electives).
 
             # Norms that are an AND-coreq of some still-unplaced course.  Such a
             # course (e.g. MATH105LA, the lab coreq of MATH105A) must NEVER be
@@ -1096,6 +1155,20 @@ def _asap_schedule(
                 hypothetical_q = same_q_norms | set(unresolved)
                 if tree and not _eval_tree(tree, available, hypothetical_q):
                     continue  # non-coreq prereq still missing — truly ineligible
+
+                # Hard GE earliness deadline (CHANGE 1).  Once a GE's prereqs are
+                # satisfiable it is "prereq-ready"; a prereq-ready GE must land by
+                # the end of Year 2 (GE_LAST_QUARTER_IDX).  Beyond that, only a GE
+                # that was NEVER prereq-ready in Y1-Y2 (genuinely prereq-blocked)
+                # may be placed; a GE that was ready but didn't fit (capacity) is
+                # held back so pure-elective GEs cannot spill into Y3+.
+                if _norm(c) in ge_norms:
+                    if q_idx <= GE_LAST_QUARTER_IDX:
+                        ge_prereq_ready.add(_norm(c))
+                    elif _norm(c) in ge_prereq_ready:
+                        continue  # capacity-blocked GE — never spill into Y3+
+                    else:
+                        late_ge_blocked.add(_norm(c))  # prereq-blocked — allow late
 
                 if not _offered_in_quarter(c, quarter):
                     continue
@@ -1131,8 +1204,8 @@ def _asap_schedule(
             if not eligible_candidates:
                 break  # nothing eligible this quarter; advance to next
 
-            # Sort: lower-div first, then alphabetically to keep output stable.
-            eligible_candidates.sort(key=lambda t: _lower_div_key(t[0]))
+            # Sort: lower-div first, GEs ahead of non-GE upper-div, then alpha.
+            eligible_candidates.sort(key=lambda t: _placement_key(t[0]))
             main_course, coreqs_to_place = eligible_candidates[0]
 
             # Place coreqs first so they're in the quarter when validation runs.
@@ -1174,6 +1247,15 @@ def _asap_schedule(
                 hypothetical_q = same_q_norms_fill | set(unresolved)
                 if tree and not _eval_tree(tree, available, hypothetical_q):
                     continue
+                # Hard GE deadline (CHANGE 1) — mirror the main pass so the
+                # min-units sweep can't backfill a prereq-ready GE past Year 2.
+                if _norm(c) in ge_norms:
+                    if q_idx <= GE_LAST_QUARTER_IDX:
+                        ge_prereq_ready.add(_norm(c))
+                    elif _norm(c) in ge_prereq_ready:
+                        continue
+                    else:
+                        late_ge_blocked.add(_norm(c))
                 if not _offered_in_quarter(c, quarter):
                     continue
                 candidate_coreqs: list[str] = []
@@ -1198,7 +1280,7 @@ def _asap_schedule(
                 if q_units_now + _course_units(c) + extra_units > units_per_quarter:
                     continue
                 fill_candidates.append((c, candidate_coreqs))
-            fill_candidates.sort(key=lambda t: _lower_div_key(t[0]))
+            fill_candidates.sort(key=lambda t: _placement_key(t[0]))
             for fill_course, fill_coreqs in fill_candidates:
                 if fill_course not in remaining:
                     continue
@@ -1217,6 +1299,12 @@ def _asap_schedule(
 
         # Make this quarter's courses available to all subsequent quarters.
         available.update(_norm(c) for c in plan[quarter])
+
+    if late_ge_blocked:
+        print(
+            f"  [GE deadline] {len(late_ge_blocked)} prereq-blocked GE(s) allowed "
+            f"past Year 2 (prereqs not schedulable in Y1-Y2): {sorted(late_ge_blocked)}"
+        )
 
     return plan, remaining  # remaining = overflow
 
@@ -1276,6 +1364,7 @@ def _try_swap_elective_overflow(
     course_terms: dict[str, list[str]],
     diff_scores: dict[str, float],
     units_by_course: dict[str, int] | None = None,
+    ge_norms: set[str] | None = None,
 ) -> tuple[list[str], list[str]]:
     """For overflow courses that come from elective rows, try swapping them with
     simpler (lower difficulty + prereq depth) alternatives from the same pool.
@@ -1357,7 +1446,7 @@ def _try_swap_elective_overflow(
             _, trial_overflow = _asap_schedule(
                 trial, trees, quarters, units_per_quarter,
                 completed_norm, terms_by_course=course_terms,
-                units_by_course=units_by_course,
+                units_by_course=units_by_course, ge_norms=ge_norms,
             )
             if oc not in trial_overflow and alt not in trial_overflow:
                 print(f"  [Step 3] Swapped elective overflow {oc!r} → {alt!r}")
@@ -1466,6 +1555,8 @@ def generate(
     # Fetch term availability and actual unit counts before scheduling
     course_terms = _fetch_course_terms(client, courses_to_plan)
     course_units = _fetch_course_units(client, courses_to_plan)
+    # GE-satisfying course norms drive the hard GE-earliness deadline (CHANGE 1).
+    ge_norms = _fetch_ge_course_norms(client, courses_to_plan)
 
     # Dynamic window extension — retry ASAP adding 1 quarter at a time if
     # overflow exists, up to MAX_QUARTERS total.  The stricter per-quarter prereq
@@ -1480,6 +1571,7 @@ def generate(
     plan_dict, overflow = _asap_schedule(
         courses_to_plan, trees, working_quarters, effective_units,
         completed_norm, terms_by_course=course_terms, units_by_course=course_units,
+        ge_norms=ge_norms,
     )
     for cap in unit_cap_tiers(units_per_quarter)[1:]:
         if not overflow:
@@ -1487,6 +1579,7 @@ def generate(
         trial_plan, trial_overflow = _asap_schedule(
             courses_to_plan, trees, working_quarters, cap,
             completed_norm, terms_by_course=course_terms, units_by_course=course_units,
+            ge_norms=ge_norms,
         )
         if len(trial_overflow) < len(overflow):
             effective_units, plan_dict, overflow = cap, trial_plan, trial_overflow
@@ -1501,6 +1594,7 @@ def generate(
         plan_dict, overflow = _asap_schedule(
             courses_to_plan, trees, working_quarters, effective_units,
             completed_norm, terms_by_course=course_terms, units_by_course=course_units,
+            ge_norms=ge_norms,
         )
 
     if extended_by:
@@ -1520,6 +1614,7 @@ def generate(
             client, major_id, overflow, courses_to_plan, trees,
             working_quarters, effective_units, completed_norm,
             course_terms, diff_scores, units_by_course=course_units,
+            ge_norms=ge_norms,
         )
         if overflow:
             print(
@@ -1532,6 +1627,7 @@ def generate(
         plan_dict, overflow = _asap_schedule(
             courses_to_plan, trees, working_quarters, effective_units,
             completed_norm, terms_by_course=course_terms, units_by_course=course_units,
+            ge_norms=ge_norms,
         )
 
     # graduation_year: use the last quarter in the working window

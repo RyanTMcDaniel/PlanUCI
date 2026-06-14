@@ -40,13 +40,16 @@ WEIGHTS = {
     # over-cap quarters (e.g. into otherwise-empty later quarters) rather than
     # leaving them packed.
     "over_cap_penalty":     0.50,
-    # Earliness preferences: nudge lower-division courses and GE-satisfying
-    # courses toward earlier quarters. Kept below difficulty_balance (0.40) and
-    # adjacent_smoothing (0.40) so they never override difficulty/feasibility,
-    # but raised enough that their per-move deltas (≈ weight × 1/n) actually
-    # register against difficulty_balance moves instead of being drowned out.
+    # Earliness preference: nudge lower-division courses toward earlier quarters.
+    # Kept below difficulty_balance (0.40) and adjacent_smoothing (0.40) so it
+    # never overrides difficulty/feasibility, but raised enough that its per-move
+    # deltas (≈ weight × 1/n) actually register against difficulty_balance moves
+    # instead of being drowned out.
+    #
+    # GE earliness is NO LONGER a soft term: it is enforced as a HARD scheduling
+    # rule in plan_generator._asap_schedule (GE courses must land by the end of
+    # Year 2, quarter index 5, unless a prereq genuinely blocks them).
     "lower_div_earliness":  0.60,
-    "ge_earliness":         0.50,
 }
 
 _DEFAULT_DIFFICULTY = 5.0   # used when a course has no entry in the CSV
@@ -75,8 +78,8 @@ def _load_course_meta(client, course_ids: list[str]) -> dict[str, dict]:
     ids arrive in either form — injected prereqs keep the spaced catalog text.
     A raw `.in_("id", course_ids)` therefore silently misses every spaced id, so
     those courses' ge_list / min_units drop out of all meta-based soft
-    constraints (ge_earliness, ge_distribution, major_clustering, …) — making the
-    earliness weights effectively 0 for GE courses seeded with a spaced id. Query
+    constraints (ge_distribution, major_clustering, …) — making those weights
+    effectively 0 for GE courses seeded with a spaced id. Query
     both the raw id and a space-stripped, uppercased variant so both forms match;
     the result stays keyed by _norm(id) so lookups via _norm(course) still hit.
     """
@@ -366,32 +369,6 @@ def lower_div_earliness(plan: CoursePlan, locked_norm: frozenset[str] = frozense
             num = _course_number(c)
             if num is not None and num < 100:
                 penalties.append(i / n)
-    return sum(penalties) / len(penalties) if penalties else 0.0
-
-
-def ge_earliness(
-    plan: CoursePlan, course_meta: dict[str, dict], locked_norm: frozenset[str] = frozenset()
-) -> float:
-    """Earliness preference for GE-satisfying courses (non-empty ge_list).
-
-    Mean of a per-course penalty over UNLOCKED GE courses. The base penalty is
-    (quarter_index / total_quarters), but GE courses landing in the BACK HALF of
-    the plan (i >= n/2) have their penalty doubled. This soft-discourages — but
-    never hard-blocks — late GEs, strongly motivating the optimizer to pull GE
-    completion forward. Soft only.
-    """
-    sorted_q = sorted(plan.planned_courses.keys(), key=_qkey)
-    n = len(sorted_q)
-    if n == 0:
-        return 0.0
-    penalties: list[float] = []
-    for i, q in enumerate(sorted_q):
-        for c in plan.planned_courses[q]:
-            if _norm(c) in locked_norm:
-                continue
-            if course_meta.get(_norm(c), {}).get("ge_list"):
-                base = i / n
-                penalties.append(2 * base if i >= n / 2 else base)
     return sum(penalties) / len(penalties) if penalties else 0.0
 
 

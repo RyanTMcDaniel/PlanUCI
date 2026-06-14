@@ -43,7 +43,6 @@ from .soft_constraints import (
     adjacent_smoothing,
     difficulty_balance,
     ge_distribution,
-    ge_earliness,
     lower_div_earliness,
     major_clustering,
     min_units_load,
@@ -135,7 +134,6 @@ def _soft_score(
         "min_units_load":       min_units_load(plan, meta),
         "over_cap_penalty":     over_cap_penalty(plan, plan.units_per_quarter, meta),
         "lower_div_earliness":  lower_div_earliness(plan, locked_norm),
-        "ge_earliness":         ge_earliness(plan, meta, locked_norm),
     }
     return sum(WEIGHTS[k] * v for k, v in breakdown.items()), breakdown
 

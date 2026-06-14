@@ -3319,11 +3319,10 @@ export default function PlannerClient() {
     const tags: Record<string, CoverageTag[]> = {};
     const chosen = new Set<string>();
     const available = (cid: string) => !!info[normId(cid)] && !placedIds.has(normId(cid)) && !chosen.has(normId(cid));
-    // Data-quality score: prefer courses that carry real GPA / unit data. Applied
-    // as a SECONDARY tie-break only (after cross-cover score, before random), so a
-    // course with data never outranks one with a higher cross-cover score.
-    // Courses with neither avg_gpa nor units are actively deprioritized (-2);
-    // having at least one is neutral (0); having both keeps the +1 bonus.
+    // Data-quality term, folded directly into the candidate score (CHANGE 2):
+    // +1 when a course carries BOTH real GPA and unit data, -2 when it has
+    // NEITHER, 0 when it has just one. Courses with no data are actively
+    // deprioritized so the autofill prefers well-documented courses.
     const dataQuality = (cid: string): number => {
       const ci = info[normId(cid)];
       const hasGpa = ci?.avg_gpa != null && ci.avg_gpa !== 0;
@@ -3360,15 +3359,23 @@ export default function PlannerClient() {
           ? cats
           : [...cats].sort((a, b) => scarcity(b) - scarcity(a) || (GE_ORDER[a] ?? 99) - (GE_ORDER[b] ?? 99)).slice(0, 2);
 
-      let bestScore = -1;
+      // Score every candidate that covers `key` (CHANGE 2 cross-cover scheme):
+      //   +3 also satisfies a major requirement not yet placed on the schedule
+      //   +2 also covers another unfilled GE category (capped to 2 → length ≥ 2)
+      //   +1 / -2 / 0 data-quality term (both / neither / one of avg_gpa & units)
+      // The pool is authoritative: g.courses is the full set of courses that
+      // satisfy this category, including ones NOT yet on the schedule.
+      let bestScore = -Infinity;
       let best: { c: string; capped: string[] }[] = [];
       let fallback: string | null = null;
       for (const c of candidates) {
         if (!fallback) fallback = c;
         const capped = capTo2(catsOf.get(c) ?? getCourseGECategories(info[normId(c)], unfilled));
         if (!capped.includes(key)) continue; // this course is better spent on scarcer cats
-        let score = capped.length >= 2 ? 3 : 2;
-        if (unmetMajor.has(normId(c))) score += 1;
+        let score = 0;
+        if (unmetMajor.has(normId(c))) score += 3;
+        if (capped.length >= 2) score += 2;
+        score += dataQuality(c);
         if (score > bestScore) { bestScore = score; best = [{ c, capped }]; }
         else if (score === bestScore) best.push({ c, capped });
       }
@@ -3376,12 +3383,8 @@ export default function PlannerClient() {
       let pick: string;
       let capped: string[];
       if (best.length) {
-        // Within the top cross-cover tier, prefer the highest data-quality bonus,
-        // then break remaining ties randomly.
-        let bestDq = -1;
-        for (const b of best) bestDq = Math.max(bestDq, dataQuality(b.c));
-        const top = best.filter((b) => dataQuality(b.c) === bestDq);
-        const ch = top[Math.floor(Math.random() * top.length)];
+        // Highest score wins; remaining exact ties broken randomly.
+        const ch = best[Math.floor(Math.random() * best.length)];
         pick = ch.c;
         capped = ch.capped;
       } else {
