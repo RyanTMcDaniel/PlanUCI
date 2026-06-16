@@ -3361,6 +3361,23 @@ export default function PlannerClient() {
     const tags: Record<string, CoverageTag[]> = {};
     const chosen = new Set<string>();
     const available = (cid: string) => !!info[normId(cid)] && !placedIds.has(normId(cid)) && !chosen.has(normId(cid));
+    // Exclude major-specific writing seminars that carry a GE writing tag but only
+    // satisfy the requirement for specific majors — the generic GE autofill must
+    // not place them (manual drag-and-drop is unaffected). Excluded when ANY holds:
+    //   1. an upper-division WRITING-department course (WRITING ≥ 100)
+    //   2. a GE-writing-tagged course whose `restriction` names a major
+    //   3. a title naming a major-specific seminar (e.g. "…Majors…")
+    const isMajorSpecificGE = (cid: string): boolean => {
+      const ci = info[normId(cid)];
+      if (!ci) return false;
+      const id = normId(cid);
+      const num = parseInt(id.match(/\d+/)?.[0] ?? "", 10);
+      if (id.startsWith("WRITING") && num >= 100) return true;
+      const isWritingGE = (ci.ge_list ?? []).some((g) => /\bGE\s+I[ab]\b/i.test(g));
+      if (isWritingGE && /\bmajors?\b/i.test(ci.restriction ?? "")) return true;
+      if (/\bmajors\b/i.test(ci.title ?? "")) return true;
+      return false;
+    };
     // Data-quality term, folded directly into the candidate score (CHANGE 2):
     // +1 when a course carries BOTH real GPA and unit data, -2 when it has
     // NEITHER, 0 when it has just one. Courses with no data are actively
@@ -3381,12 +3398,13 @@ export default function PlannerClient() {
       const g = groupByKey.get(key);
       if (!g) { need.delete(key); continue; }
 
-      // Pool from array membership; coverage filter is authoritative.
-      const candidates = g.courses.filter((c) => available(c) && getCourseGECategories(info[normId(c)], unfilled).includes(key));
+      // Pool from array membership; coverage filter is authoritative. Major-specific
+      // writing seminars masquerading as GEs are excluded from the candidate pool.
+      const candidates = g.courses.filter((c) => available(c) && !isMajorSpecificGE(c) && getCourseGECategories(info[normId(c)], unfilled).includes(key));
       if (candidates.length === 0) { need.delete(key); continue; }
 
       // Scarcity: how many other available courses authoritatively cover each unfilled cat.
-      const universe = [...new Set(unfilled.flatMap((x) => x.courses))].filter(available);
+      const universe = [...new Set(unfilled.flatMap((x) => x.courses))].filter((c) => available(c) && !isMajorSpecificGE(c));
       const catsOf = new Map<string, string[]>();
       for (const c of universe) catsOf.set(c, getCourseGECategories(info[normId(c)], unfilled));
       const eligibleCount = new Map<string, number>();

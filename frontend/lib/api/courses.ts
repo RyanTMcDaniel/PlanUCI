@@ -20,6 +20,9 @@ export interface CourseDetail {
   avg_gpa: number | null;
   // Authoritative per-course GE designations, e.g. ["GE III: Social & Behavioral Sciences"].
   ge_list: string[] | null;
+  // Enrollment restriction text, e.g. "Anthropology majors only". Used to exclude
+  // major-specific writing seminars from the generic GE autofill candidate pool.
+  restriction: string | null;
 }
 
 // Extract course IDs embedded in group_name strings like "POLSCI 192A" or
@@ -212,7 +215,7 @@ export async function fetchCourseDetails(ids: string[]): Promise<CourseDetail[]>
   for (let i = 0; i < ids.length; i += BATCH) {
     const { data, error } = await supabase
       .from("courses")
-      .select("id, title, min_units, description, course_level, terms, avg_gpa, ge_list")
+      .select("id, title, min_units, description, course_level, terms, avg_gpa, ge_list, restriction")
       .in("id", ids.slice(i, i + BATCH));
 
     if (error) throw new Error(error.message);
