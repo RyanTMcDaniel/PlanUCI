@@ -22,8 +22,10 @@ Supabase error) returns None so callers always fall back to computing the result
 import hashlib
 import json
 import os
+import threading
 from datetime import datetime, timedelta, timezone
 
+from cachetools import TTLCache
 from dotenv import load_dotenv
 from supabase import create_client
 
@@ -32,6 +34,43 @@ load_dotenv(_ENV)
 
 _TABLE   = "optimizer_cache"
 _TTL     = timedelta(days=7)
+
+
+# ── L1: in-process memory cache ───────────────────────────────────────────────
+# Sits in front of the Supabase L2 cache. Same key space; shorter TTL (1 h)
+# since the process may restart between requests.  Thread-safe via RLock.
+
+_L1_TTL = 3600  # seconds — evict after 1 hour even if the process stays up
+_L1_MAX = 256   # max entries before LRU eviction kicks in
+
+_l1: TTLCache = TTLCache(maxsize=_L1_MAX, ttl=_L1_TTL)
+_l1_lock = threading.RLock()
+
+
+def get_l1(cache_key: str) -> dict | None:
+    """Return the in-memory cached result, or None on miss."""
+    with _l1_lock:
+        return _l1.get(cache_key)
+
+
+def set_l1(cache_key: str, result: dict) -> None:
+    """Store result in the in-memory cache."""
+    with _l1_lock:
+        _l1[cache_key] = result
+
+
+def invalidate_l1(cache_key: str | None = None) -> None:
+    """Evict one entry (or everything) from the in-memory cache.
+
+    Call this whenever the underlying course/requirement data changes so the
+    next request re-runs the optimizer instead of returning a stale snapshot.
+    Passing None clears the entire L1 cache.
+    """
+    with _l1_lock:
+        if cache_key is None:
+            _l1.clear()
+        else:
+            _l1.pop(cache_key, None)
 
 MIGRATION_SQL = """\
 -- Run once in the Supabase SQL editor:

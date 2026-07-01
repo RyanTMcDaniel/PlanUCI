@@ -126,12 +126,21 @@ def optimizer_generate(req: GenerateRequest):
         ap_scores          = req.ap_scores,
         start_quarter      = req.start_quarter or None,
     )
-    client = _supabase_client()
+
     if use_cache:
-        cached = optimizer_cache.get(client, cache_key)
-        if cached is not None:
-            cached["cached"] = True
-            return cached
+        # L1: in-process memory — zero network cost for repeated identical requests.
+        l1_hit = optimizer_cache.get_l1(cache_key)
+        if l1_hit is not None:
+            return {**l1_hit, "cached": True}
+
+        # L2: Supabase — survives restarts, shared across instances.
+        client = _supabase_client()
+        l2_hit = optimizer_cache.get(client, cache_key)
+        if l2_hit is not None:
+            optimizer_cache.set_l1(cache_key, l2_hit)   # backfill L1
+            return {**l2_hit, "cached": True}
+    else:
+        client = _supabase_client()
 
     try:
         result = generate(
@@ -175,7 +184,8 @@ def optimizer_generate(req: GenerateRequest):
         "cached":               False,
     }
     if use_cache:
-        optimizer_cache.set(client, cache_key, response)
+        optimizer_cache.set_l1(cache_key, response)   # L1: in-process
+        optimizer_cache.set(client, cache_key, response)  # L2: Supabase
     _increment_stat("schedules_saved")  # fire-and-forget; never blocks the response
     return response
 
