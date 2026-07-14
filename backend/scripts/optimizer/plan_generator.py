@@ -20,7 +20,7 @@ import datetime
 import math
 import os
 import random
-import re  # FIX 1
+import re
 from copy import deepcopy
 from dataclasses import dataclass, field
 
@@ -31,7 +31,7 @@ from .hard_constraints import (
     CoursePlan,
     UNITS_PER_COURSE,
     _eval_tree,
-    _load_aliases,  # FIX 6
+    _load_aliases,
     _norm,
     _qkey,
     coreq_split_pairs,
@@ -39,8 +39,7 @@ from .hard_constraints import (
 )
 from .optimizer import OptimizationResult, optimize, _check_prereqs  # _check_prereqs for prereq-safe _perturb
 from .offering_patterns import is_likely_offered
-from .soft_constraints import _load_difficulty_scores  # FIX 4
-
+from .soft_constraints import _load_difficulty_scores
 _ENV = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", ".env")
 load_dotenv(_ENV)
 
@@ -190,7 +189,7 @@ def _fetch_course_units(client, course_ids: list[str]) -> dict[str, int]:
     }
 
 
-# ── Course term helper (FIX 5) ───────────────────────────────────────────────
+# ── Course term helper ───────────────────────────────────────────────
 
 def _fetch_course_terms(client, course_ids: list[str]) -> dict[str, list[str]]:
     """Return {course_id: [term_strings]} for each course, e.g. ['2026 Fall', '2025 Winter']."""
@@ -230,7 +229,7 @@ def _fetch_ge_course_norms(client, course_ids: list[str]) -> set[str]:
     return {_norm(r["id"]) for r in rows if r.get("ge_list")}
 
 
-# ── Prereq depth helper (FIX 4) ──────────────────────────────────────────────
+# ── Prereq depth helper ──────────────────────────────────────────────
 
 def _get_prereq_depths(client, norm_ids: list[str]) -> dict[str, int]:
     """Count direct prereq edges per course as a proxy for scheduling complexity."""
@@ -341,7 +340,7 @@ def _load_requirement_rows(
         .data
     )
 
-    # FIX 1: Specialization parent merge — if major_id ends with a letter suffix
+    # Specialization parent merge — if major_id ends with a letter suffix
     # (e.g. "BS-075A") also load the parent ("BS-075") and merge, deduplicating
     # by requirement_group + group_name so the spec's own rows take precedence.
     if re.search(r"[A-Z]$", major_id):
@@ -364,20 +363,20 @@ def _load_requirement_rows(
                 major_rows.append(row)
                 existing_keys.add(key)
         print(
-            f"[FIX 1] Spec {major_id!r}: {before_count} spec rows + "
+            f"Spec {major_id!r}: {before_count} spec rows + "
             f"{len(parent_rows)} parent ({parent_id!r}) rows → "
             f"{len(major_rows)} total after dedup"
         )
     else:
-        print(f"[FIX 1] {major_id!r}: {len(major_rows)} rows (no parent merge needed)")
+        print(f"{major_id!r}: {len(major_rows)} rows (no parent merge needed)")
 
     # Catalogue merge — supplement/override API rows with scraped catalogue data.
     # The catalogue scraper uses its own major_id values that may differ from the
     # Anteater API IDs (e.g. Applied Math stores all specs under "BS-0K6C" while
     # the API uses "BS-0K6A" for Data Science).  Resolve dynamically:
-    #   1. Look up major_name + specialization_name for this major_id
-    #   2. Find which sibling major_id (same major_name) has catalogue rows
-    #   3. Derive the spec slug from specialization_name (e.g. "Data Science" → "data-science")
+    # 1. Look up major_name + specialization_name for this major_id
+    # 2. Find which sibling major_id (same major_name) has catalogue rows
+    # 3. Derive the spec slug from specialization_name (e.g. "Data Science" → "data-science")
     try:
         # ── Step 1: resolve catalogue major_id and spec slug ──────────────────
         cat_major_id = major_id
@@ -509,7 +508,7 @@ def _collect_courses(
     seen: set[str] = set()
     group_map: dict[str, list[str]] = {}
 
-    # FIX 4: load difficulty scores once for elective sorting
+    # load difficulty scores once for elective sorting
     diff_scores = _load_difficulty_scores()
 
     def _pick(req: dict, use_plan_norm: set[str] | None = None) -> None:
@@ -530,11 +529,11 @@ def _collect_courses(
         needed: int = req.get("courses_needed") or len(course_list)
 
         if use_plan_norm is not None:
-            # FIX 2a: GE rows — count satisfaction using the live `seen` set
+            # GE rows — count satisfaction using the live `seen` set
             # (which includes major rows AND previously processed GE rows), so that
             # a GE course selected by an earlier GE row isn't re-counted here.
-            # `use_plan_norm` is kept for the 2b overlap detection print but not
-            # used for the count because plan_courses_norm would miss GE-to-GE picks.
+            # `use_plan_norm` is not used for the count because plan_courses_norm
+            # would miss GE-to-GE picks.
             ge_pool_norm = {_norm(c) for c in course_list}
             already_satisfied = len(ge_pool_norm & (completed_norm | seen))
             still_needed = max(0, needed - already_satisfied)
@@ -555,7 +554,7 @@ def _collect_courses(
 
         req_type_str = (req.get("requirement_type") or "required").lower()
         if "elective" in req_type_str:
-            # FIX 4: elective rows — sort by difficulty ASC, prereq_depth ASC, alpha.
+            # elective rows — sort by difficulty ASC, prereq_depth ASC, alpha.
             # Simpler courses (lower difficulty, fewer upstream prereqs) slot earlier.
             prereq_counts = _get_prereq_depths(client, [_norm(c) for c in candidates])
             candidates.sort(key=lambda c: (
@@ -575,7 +574,7 @@ def _collect_courses(
             selected.append(course)
             seen.add(_norm(course))
         if chosen:
-            # FIX 2: accumulate instead of overwriting so multiple rows for the
+            # accumulate instead of overwriting so multiple rows for the
             # same requirement_group all appear in the map.
             group_map.setdefault(req_group, []).extend(chosen)
 
@@ -583,34 +582,18 @@ def _collect_courses(
     for req in major_rows:
         _pick(req)
 
-    # FIX 2: snapshot after major rows so GE rows can see what is already covered
+    # snapshot after major rows so GE rows can see what is already covered
     plan_courses_norm = set(seen)
 
-    # FIX 2b: identify required rows whose pool overlaps >50% with any GE pool
-    all_ge_norms: set[str] = set()
-    for ge_req in ge_rows:
-        all_ge_norms.update(_norm(c) for c in (ge_req.get("courses") or []))
-
-    for req in major_rows:
-        if (req.get("requirement_type") or "").lower() == "required":
-            pool = {_norm(c) for c in (req.get("courses") or [])}
-            if pool:
-                overlap = len(pool & all_ge_norms) / len(pool)
-                if overlap > 0.5:
-                    print(
-                        f"[FIX 2b] Required row {req.get('group_name')!r} treated as "
-                        f"GE-satisfying ({overlap:.0%} overlap with GE pools)"
-                    )
-
     # Print GE course counts before GE processing (for test visibility)
-    print(f"[FIX 2] Before GE rows: plan has {len(selected)} major courses")
+    print(f"Before GE rows: plan has {len(selected)} major courses")
 
     # Process GE rows using the major-row snapshot for already_satisfied
     for req in ge_rows:
         _pick(req, use_plan_norm=plan_courses_norm)
 
-    # FIX 2: Print GE group counts after processing
-    print(f"[FIX 2] GE group counts after processing ({major_id!r}):")
+    # Print GE group counts after processing
+    print(f"GE group counts after processing ({major_id!r}):")
     for ge_req in ge_rows:
         rg = ge_req.get("requirement_group") or ""
         if rg in group_map:
@@ -684,8 +667,7 @@ def collect_requirements(
     Choice-group options are NOT placed into any plan.
     """
     waived_ges = waived_ges or []
-    _load_aliases(client)  # FIX 6
-
+    _load_aliases(client)
     major_rows, ge_rows, ap_credited, ap_units = _load_requirement_rows(
         client, major_id, completed_norm, ap_scores
     )
@@ -785,7 +767,7 @@ def get_requirements_state(
         }
     """
     client = create_client(os.getenv("SUPABASE_URL"), os.getenv("SUPABASE_SERVICE_KEY"))
-    _load_aliases(client)  # FIX 6
+    _load_aliases(client)
     completed_norm = {_norm(c) for c in plan.completed_courses}
 
     required, choice_groups, _, _ = collect_requirements(
@@ -1042,12 +1024,12 @@ def _asap_schedule(
     not be placed within the graduation window.
 
     Placement respects two constraints per quarter:
-    - Term availability (FIX 5): course must be historically offered that season.
+    - Term availability: course must be historically offered that season.
     - Unit cap: cumulative units of placed courses must not exceed units_per_quarter.
       Actual min_units from the courses table are used when units_by_course is
       provided; otherwise UNITS_PER_COURSE (4) is assumed per course.
 
-    Hard GE earliness (CHANGE 1): when ``ge_norms`` is supplied, GE-satisfying
+    Hard GE earliness: when ``ge_norms`` is supplied, GE-satisfying
     courses are subject to a hard deadline — they may not be placed beyond quarter
     index ``GE_LAST_QUARTER_IDX`` (end of Year 2).  Within the Y1-Y2 window GEs are
     sorted AHEAD of non-GE upper-division electives so they claim early slots
@@ -1156,7 +1138,7 @@ def _asap_schedule(
                 if tree and not _eval_tree(tree, available, hypothetical_q):
                     continue  # non-coreq prereq still missing — truly ineligible
 
-                # Hard GE earliness deadline (CHANGE 1).  Once a GE's prereqs are
+                # Hard GE earliness deadline.  Once a GE's prereqs are
                 # satisfiable it is "prereq-ready"; a prereq-ready GE must land by
                 # the end of Year 2 (GE_LAST_QUARTER_IDX).  Beyond that, only a GE
                 # that was NEVER prereq-ready in Y1-Y2 (genuinely prereq-blocked)
@@ -1247,7 +1229,7 @@ def _asap_schedule(
                 hypothetical_q = same_q_norms_fill | set(unresolved)
                 if tree and not _eval_tree(tree, available, hypothetical_q):
                     continue
-                # Hard GE deadline (CHANGE 1) — mirror the main pass so the
+                # Hard GE deadline — mirror the main pass so the
                 # min-units sweep can't backfill a prereq-ready GE past Year 2.
                 if _norm(c) in ge_norms:
                     if q_idx <= GE_LAST_QUARTER_IDX:
@@ -1326,7 +1308,7 @@ def _perturb(
     the optimizer from receiving a pre-broken starting plan that it would
     immediately return unchanged (the early-exit path in optimize()).
 
-    Hard GE earliness (CHANGE 1): a swap is also undone if it would move a GE
+    Hard GE earliness: a swap is also undone if it would move a GE
     course (not already past the Year-2 deadline in the input plan) out of
     ge_allowed_quarters — so the perturbed starting plan never violates the GE
     deadline that optimize() then has to preserve.
@@ -1531,7 +1513,7 @@ def generate(
         waived_ges = []
 
     client = create_client(os.getenv("SUPABASE_URL"), os.getenv("SUPABASE_SERVICE_KEY"))
-    _load_aliases(client)  # FIX 6: build alias map before any _norm() calls
+    _load_aliases(client)  # build alias map before any _norm() calls
     completed_norm = {_norm(c) for c in completed_courses}
 
     # 1. Editor model: seed ONLY required (take-all) courses. "Choose N of M"
@@ -1585,7 +1567,7 @@ def generate(
     # Fetch term availability and actual unit counts before scheduling
     course_terms = _fetch_course_terms(client, courses_to_plan)
     course_units = _fetch_course_units(client, courses_to_plan)
-    # GE-satisfying course norms drive the hard GE-earliness deadline (CHANGE 1).
+    # GE-satisfying course norms drive the hard GE-earliness deadline.
     ge_norms = _fetch_ge_course_norms(client, courses_to_plan)
 
     # Dynamic window extension — retry ASAP adding 1 quarter at a time if

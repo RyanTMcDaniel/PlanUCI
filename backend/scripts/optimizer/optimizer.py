@@ -179,7 +179,7 @@ def optimize(
     major_requirements_met and no_duplicate_courses are invariant under simple
     moves (the course set doesn't change) so they are checked once upfront.
 
-    Hard GE earliness (CHANGE 1, optimizer layer): ``ge_norms`` is the set of
+    Hard GE earliness (optimizer layer): ``ge_norms`` is the set of
     normalized GE course ids; ``ge_allowed_quarters`` is the set of quarter strings
     (Year 1-2) in which a GE may legally sit.  A GE that is ALREADY past the
     deadline in the starting plan (prereq-blocked) is exempt — it can't be pulled
@@ -218,7 +218,7 @@ def optimize(
     quarters = sorted(plan.planned_courses.keys(), key=_qkey)
     improved = False
 
-    # Hard GE earliness guard (CHANGE 1).  Pre-compute the GE courses that are
+    # Hard GE earliness guard.  Pre-compute the GE courses that are
     # already past the Year-2 deadline in the starting plan; those are exempt
     # (prereq-blocked).  Every other GE must stay inside ge_allowed_quarters.
     ge_norms = ge_norms or set()

@@ -1,9 +1,22 @@
 {
   "model_name": "sentiment_v1",
   "architecture": "all-MiniLM-L6-v2 encoder (fine-tuned) + nn.Linear(384, 4)",
-  "professors_labeled": 1291,
-  "val_macro_f1": 0.8313,
-  "test_macro_f1": 0.8093,
+  "produced_by": "ml/models/train_sentiment.py",
+  "rmp_records": 591,
+  "split": {
+    "train": 472,
+    "val": 59,
+    "test": 60
+  },
+  "train_rows_after_oversampling": 700,
+  "val_macro_f1": 0.5383,
+  "test_macro_f1": 0.5222,
+  "test_f1_per_class": {
+    "teaches_well": 0.3704,
+    "easy_grade": 0.7059,
+    "harsh_grader": 0.2,
+    "avoid": 0.8125
+  },
   "classes": [
     "teaches_well",
     "easy_grade",
@@ -17,7 +30,8 @@
     "avoid": "overall <= 2.5 AND would_take_again_pct <= 40",
     "priority": "avoid > harsh_grader > teaches_well > easy_grade"
   },
-  "input_format": "raw professor review text (concatenated reviews per professor)",
-  "output_format": "softmax probabilities over [teaches_well, easy_grade, harsh_grader, avoid]; argmax \u2192 label",
-  "created_at": "2026-05-24T22:59:02Z"
+  "input_format": "One string per professor: all RateMyProfessor comments for that instructor concatenated with ' | ' at scrape time (backend/scripts/fetch_rmp.py). Rows are de-duplicated on review_text before splitting, because instructor\u2192RMP name matching maps multiple ucinetids onto the same RMP record.",
+  "output_format": "softmax over [teaches_well, easy_grade, harsh_grader, avoid]; argmax \u2192 label",
+  "known_limitations": "Test set is 60 records \u2014 per-class F1 has wide confidence intervals. Labels are weak supervision over RMP numeric ratings, so the model's ceiling is recovering that rule from text; its value is labeling professors whose numeric ratings are missing.",
+  "created_at": "2026-07-13T21:29:48Z"
 }

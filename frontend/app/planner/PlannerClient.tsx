@@ -313,6 +313,43 @@ function diffScoreColor(score: number): string {
   return "#ef4444";
 }
 
+// How far to trust a difficulty score, keyed on which signals actually backed it.
+// Roughly a third of the catalogue is scored from the course description alone, and
+// that must not look as authoritative as a course corroborated by real grade history
+// and professor ratings. The score is always shown — only the caveat changes.
+const CONFIDENCE_META: Record<string, { color: string; label: string; tip: string }> = {
+  high: {
+    color: "#9a9a9a",
+    label: "FULL DATA",
+    tip: "High confidence — difficulty is backed by the course description, historical grade distributions, and professor ratings.",
+  },
+  medium: {
+    color: "#b08947",
+    label: "PARTIAL DATA",
+    tip: "Medium confidence — difficulty is backed by two of the three signals (course description, historical grades, professor ratings).",
+  },
+  low: {
+    color: "#b06060",
+    label: "LOW DATA",
+    tip: "Low confidence — no grade or professor data for this course. Difficulty is estimated from the course description alone.",
+  },
+};
+
+function ConfidenceBadge({ confidence }: { confidence?: string | null }) {
+  const meta = confidence ? CONFIDENCE_META[confidence] : undefined;
+  if (!meta) return null;
+  return (
+    <span
+      title={meta.tip}
+      className="flex items-center gap-0.5 text-[9px] font-mono whitespace-nowrap cursor-help"
+      style={{ color: meta.color }}
+    >
+      <span className="text-[7px] leading-none">●</span>
+      {meta.label}
+    </span>
+  );
+}
+
 // ── Bucket classification ──────────────────────────────────────────────────────
 
 type BucketKey = "lower" | "upper" | "choice" | "elective";
@@ -925,7 +962,7 @@ function CoverageTags({ tags }: { tags: CoverageTag[] }) {
 // ── Placed card ────────────────────────────────────────────────────────────────
 
 function PlacedCard({
-  courseId, quarterKey, title, units, level, diffScore, gpa, isLocked, onToggleLock, onRemove, tags,
+  courseId, quarterKey, title, units, level, diffScore, diffConfidence, gpa, isLocked, onToggleLock, onRemove, tags,
 }: {
   courseId: string;
   quarterKey: string;
@@ -933,6 +970,7 @@ function PlacedCard({
   units?: number | null;
   level?: string | null;
   diffScore?: number | null;
+  diffConfidence?: string | null;
   gpa?: number | null;
   isLocked: boolean;
   onToggleLock: (id: string) => void;
@@ -985,6 +1023,7 @@ function PlacedCard({
 
       {/* avg gpa (left) + units (right) — single line, right of action strip */}
       <div className="flex flex-row items-center justify-end gap-2 shrink-0 py-0.5 pr-1 text-right">
+        <ConfidenceBadge confidence={diffConfidence} />
         {gpa != null && isFinite(gpa) ? (
           <span className="text-[10px] font-mono font-medium" style={{ color: "#9a9a9a" }}>{gpa.toFixed(2)} AVG GPA</span>
         ) : (
@@ -1102,7 +1141,7 @@ function PlacedCardRow({
 
 function QuarterCell({
   qKey, label, dim,
-  courseIds, courseInfoMap, difficultyMap, lockedCourses, onToggleLock, onRemove,
+  courseIds, courseInfoMap, difficultyMap, confidenceMap, lockedCourses, onToggleLock, onRemove,
   prereqWarnings, onDismissWarning,
   removable, onRemoveQuarter,
   maxUnitsPerQuarter, coverageTags,
@@ -1113,6 +1152,7 @@ function QuarterCell({
   courseIds: string[];
   courseInfoMap: Record<string, CourseDetail>;
   difficultyMap: Record<string, number>;
+  confidenceMap: Record<string, string>;
   lockedCourses: Set<string>;
   onToggleLock: (id: string) => void;
   onRemove: (id: string, qKey: string) => void;
@@ -1206,6 +1246,7 @@ function QuarterCell({
             units={courseInfoMap[normId(cid)]?.min_units}
             level={courseInfoMap[normId(cid)]?.course_level}
             diffScore={difficultyMap[cid] ?? null}
+            diffConfidence={confidenceMap[cid] ?? null}
             gpa={courseInfoMap[normId(cid)]?.avg_gpa ?? null}
             isLocked={lockedCourses.has(cid)}
             onToggleLock={onToggleLock}
@@ -1995,6 +2036,8 @@ export default function PlannerClient() {
   // on each autofill, auto-pruned when a course leaves the plan; not persisted).
   const [coverageTags, setCoverageTags] = useState<Record<string, CoverageTag[]>>({});
   const [difficultyMap, setDifficultyMap] = useState<Record<string, number>>({});
+  // course_id -> "high" | "medium" | "low": which signals backed the difficulty score.
+  const [confidenceMap, setConfidenceMap] = useState<Record<string, string>>({});
   const [optimizerOnline, setOptimizerOnline] = useState<boolean | null>(null);
   const [apScores, setApScores] = useState<Record<string, number>>({});
   const [apExamNames, setApExamNames] = useState<string[]>([]);
@@ -2208,6 +2251,7 @@ export default function PlannerClient() {
       if (!res.ok) return;
       const d = await res.json();
       if (d?.scores) setDifficultyMap((prev) => ({ ...prev, ...d.scores }));
+      if (d?.confidence) setConfidenceMap((prev) => ({ ...prev, ...d.confidence }));
     } catch {}
   }, []);
 
@@ -4428,6 +4472,7 @@ export default function PlannerClient() {
                               courseIds={plannedCourses[qk] ?? []}
                               courseInfoMap={courseInfoMap}
                               difficultyMap={difficultyMap}
+                              confidenceMap={confidenceMap}
                               lockedCourses={lockedCourses}
                               onToggleLock={toggleLock}
                               onRemove={removeCourse}
@@ -4444,6 +4489,7 @@ export default function PlannerClient() {
                             courseIds={plannedCourses[summerQk] ?? []}
                             courseInfoMap={courseInfoMap}
                             difficultyMap={difficultyMap}
+                            confidenceMap={confidenceMap}
                             lockedCourses={lockedCourses}
                             onToggleLock={toggleLock}
                             onRemove={removeCourse}

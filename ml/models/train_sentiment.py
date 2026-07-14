@@ -1,3 +1,4 @@
+import datetime
 import json
 import os
 
@@ -102,7 +103,7 @@ def encode(encoder: SentenceTransformer, texts: list[str], device: torch.device)
     return encoder(features)["sentence_embedding"]
 
 
-def evaluate(encoder, classifier, loader, device) -> tuple[float, str]:
+def evaluate(encoder, classifier, loader, device) -> tuple[float, str, dict[str, float]]:
     encoder.eval()
     classifier.eval()
     all_preds, all_true = [], []
@@ -116,7 +117,10 @@ def evaluate(encoder, classifier, loader, device) -> tuple[float, str]:
     true_labels = [LABELS[t] for t in all_true]
     macro_f1 = f1_score(true_labels, pred_labels, labels=LABELS, average="macro", zero_division=0)
     report = classification_report(true_labels, pred_labels, labels=LABELS, digits=4, zero_division=0)
-    return macro_f1, report
+    per_class = dict(zip(LABELS, f1_score(
+        true_labels, pred_labels, labels=LABELS, average=None, zero_division=0
+    )))
+    return macro_f1, report, {k: float(v) for k, v in per_class.items()}
 
 
 def main() -> None:
@@ -137,7 +141,18 @@ def main() -> None:
     print(f"  {len(df)} total rows")
 
     df = df[df["review_text"].notna() & (df["review_text"].str.len() >= 20)].copy()
-    print(f"  {len(df)} rows after filtering short/null review_text\n")
+    print(f"  {len(df)} rows after filtering short/null review_text")
+
+    # Instructor→RMP name matching maps many ucinetids onto the same RateMyProfessor
+    # record, so the same review blob (and the same ratings, hence the same label)
+    # is duplicated across up to 80 rows.  A stratified split over the raw rows put
+    # 56% of the test set's exact text in train, letting the model score by
+    # memorization.  Collapse to distinct review texts so each RMP record is counted
+    # once and no text can straddle a split boundary.
+    before = len(df)
+    df = df.drop_duplicates(subset=["review_text"], keep="first").copy()
+    print(f"  {len(df)} rows after de-duplicating review_text "
+          f"({before - len(df)} duplicate rows from RMP match collisions)\n")
 
     # ── Weak labeling ────────────────────────────────────────────────────────
     df["label"] = df.apply(assign_label, axis=1)
@@ -163,7 +178,22 @@ def main() -> None:
     )
     print(f"\nSplit — train: {len(train_df)}, val: {len(val_df)}, test: {len(test_df)}")
 
+    # No review text may appear in more than one split.  Guards the de-duplication
+    # above: if a collision survives, the test score is memorization, not skill.
+    splits = {"train": set(train_df["review_text"]),
+              "val":   set(val_df["review_text"]),
+              "test":  set(test_df["review_text"])}
+    for a, b in (("train", "val"), ("train", "test"), ("val", "test")):
+        overlap = splits[a] & splits[b]
+        if overlap:
+            raise AssertionError(
+                f"{len(overlap)} review_text value(s) shared between {a} and {b} — "
+                f"splits are contaminated, refusing to train."
+            )
+    print("No review_text overlap between splits — OK")
+
     # ── Oversample training set ──────────────────────────────────────────────
+    n_train_records = len(train_df)   # pre-oversampling, for the model card
     train_df = oversample(train_df)
     print("\nLabel distribution after oversampling:")
     counts = train_df["label"].value_counts().reindex(LABELS)
@@ -210,7 +240,7 @@ def main() -> None:
             optimizer.step()
             total_loss += loss.item()
 
-        val_f1, report = evaluate(encoder, classifier, val_loader, device)
+        val_f1, report, _ = evaluate(encoder, classifier, val_loader, device)
         avg_loss = total_loss / len(train_loader)
 
         if val_f1 > best_val_f1:
@@ -238,7 +268,9 @@ def main() -> None:
     best_classifier.load_state_dict(
         torch.load(os.path.join(SAVE_DIR, "classifier.pt"), map_location=device)
     )
-    test_f1, test_report = evaluate(best_encoder, best_classifier, test_loader, device)
+    test_f1, test_report, test_per_class = evaluate(
+        best_encoder, best_classifier, test_loader, device
+    )
     print(f"\nTest set classification report:")
     print(test_report)
     print(f"Test macro F1: {test_f1:.4f}")
@@ -246,8 +278,50 @@ def main() -> None:
     with open(os.path.join(SAVE_DIR, "label_map.json"), "w") as f:
         json.dump({"labels": LABELS, "label2idx": LABEL2IDX}, f, indent=2)
 
+    # Model card is written HERE, from the run that produced the checkpoint, so
+    # every published number has this script as its producer.
+    card = {
+        "model_name": "sentiment_v1",
+        "architecture": "all-MiniLM-L6-v2 encoder (fine-tuned) + nn.Linear(384, 4)",
+        "produced_by": "ml/models/train_sentiment.py",
+        "rmp_records": len(df),
+        "split": {"train": n_train_records, "val": len(val_df), "test": len(test_df)},
+        "train_rows_after_oversampling": len(train_df),
+        "val_macro_f1": round(float(best_val_f1), 4),
+        "test_macro_f1": round(float(test_f1), 4),
+        "test_f1_per_class": {k: round(v, 4) for k, v in test_per_class.items()},
+        "classes": LABELS,
+        "weak_supervision_rules": {
+            "teaches_well": "overall >= 4.0 AND difficulty >= 3.0 AND would_take_again_pct >= 75",
+            "easy_grade":   "overall >= 3.8 AND difficulty <= 2.5 AND would_take_again_pct >= 70",
+            "harsh_grader": "difficulty >= 3.8 AND would_take_again_pct <= 50",
+            "avoid":        "overall <= 2.5 AND would_take_again_pct <= 40",
+            "priority":     "avoid > harsh_grader > teaches_well > easy_grade",
+        },
+        "input_format": (
+            "One string per professor: all RateMyProfessor comments for that "
+            "instructor concatenated with ' | ' at scrape time "
+            "(backend/scripts/fetch_rmp.py). Rows are de-duplicated on review_text "
+            "before splitting, because instructor→RMP name matching maps multiple "
+            "ucinetids onto the same RMP record."
+        ),
+        "output_format": (
+            "softmax over [teaches_well, easy_grade, harsh_grader, avoid]; argmax → label"
+        ),
+        "known_limitations": (
+            f"Test set is {len(test_df)} records — per-class F1 has wide confidence "
+            "intervals. Labels are weak supervision over RMP numeric ratings, so the "
+            "model's ceiling is recovering that rule from text; its value is labeling "
+            "professors whose numeric ratings are missing."
+        ),
+        "created_at": datetime.datetime.now(datetime.UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    }
+    with open(os.path.join(SAVE_DIR, "model_card.json"), "w") as f:
+        json.dump(card, f, indent=2)
+
     print(f"\nBest val macro F1: {best_val_f1:.4f}")
     print(f"Model saved to {SAVE_DIR}/")
+    print(f"Model card written → {SAVE_DIR}/model_card.json")
 
 
 if __name__ == "__main__":

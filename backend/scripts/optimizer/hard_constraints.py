@@ -78,7 +78,7 @@ CODE_REQ_UNCOVERED = "REQ_UNCOVERED"
 CODE_GE_DEADLINE   = "GE_DEADLINE"
 
 
-# ── CSE ↔ ICS alias map (FIX 6) ─────────────────────────────────────────────
+# ── CSE ↔ ICS alias map ─────────────────────────────────────────────
 # CSE was the old department prefix; current catalog uses I&CSCI / ICS after norm.
 # Hardcoded known aliases; _load_aliases() extends this from the DB at runtime.
 _ALIASES: dict[str, str] = {
@@ -91,7 +91,7 @@ _ALIASES_INITIALIZED = False
 
 
 def _load_aliases(client) -> None:
-    """FIX 6: query major_requirements to discover additional CSE↔ICS aliases."""
+    """query major_requirements to discover additional CSE↔ICS aliases."""
     global _ALIASES, _ALIASES_INITIALIZED
     if _ALIASES_INITIALIZED:
         return
@@ -115,7 +115,7 @@ def _load_aliases(client) -> None:
             _ALIASES.setdefault("CSE" + num, "ICS" + num)
 
     _ALIASES_INITIALIZED = True
-    print(f"[FIX 6] Alias map ({len(_ALIASES)} entries): {dict(sorted(_ALIASES.items()))}")
+    print(f"Alias map ({len(_ALIASES)} entries): {dict(sorted(_ALIASES.items()))}")
 
 
 def _norm(course_id: str) -> str:
@@ -123,7 +123,7 @@ def _norm(course_id: str) -> str:
     s = course_id.replace(" ", "").upper()
     # prereq_edges stores raw catalog text like "I&C SCI 46"; courses table uses "ICS46"
     s = s.replace("I&CSCI", "ICS")
-    # FIX 6: resolve CSE→ICS aliases so CSE46 == ICS46 in all comparisons
+    # resolve CSE→ICS aliases so CSE46 == ICS46 in all comparisons
     return _ALIASES.get(s, s)
 
 
@@ -349,7 +349,7 @@ def _probe_group_column(client) -> str | None:
 # ── Validators ───────────────────────────────────────────────────────────────
 
 def prereqs_satisfied(plan: CoursePlan, client) -> tuple[bool, list[CheckResult]]:
-    # FIX 6 — ensure alias map is populated before any _norm() comparisons
+    # ensure alias map is populated before any _norm() comparisons
     _load_aliases(client)
     """Every planned course must have its prerequisites completed or planned earlier.
 
@@ -458,7 +458,7 @@ def major_requirements_met(plan: CoursePlan, client) -> tuple[bool, list[CheckRe
     Returns (all_passed, violations) where each violation is a CheckResult with
     code REQ_UNCOVERED.
     """
-    _load_aliases(client)  # FIX 6
+    _load_aliases(client)
     violations: list[CheckResult] = []
 
     all_courses = {_norm(c) for c in plan.completed_courses}
@@ -519,7 +519,7 @@ def major_requirements_met(plan: CoursePlan, client) -> tuple[bool, list[CheckRe
                 code=CODE_REQ_UNCOVERED,
             ))
 
-    # FIX 3: Also validate university-wide GE requirements (major_id = "ALL_MAJORS").
+    # Also validate university-wide GE requirements (major_id = "ALL_MAJORS").
     # A plan fails if any GE group has fewer courses than courses_needed.
     ge_rows = (
         client.table("major_requirements")
@@ -657,8 +657,7 @@ def validate(plan: CoursePlan) -> tuple[bool, list[CheckResult]]:
     when the plan is fully valid.
     """
     client = create_client(os.getenv("SUPABASE_URL"), os.getenv("SUPABASE_SERVICE_KEY"))
-    _load_aliases(client)  # FIX 6
-
+    _load_aliases(client)
     checks = [
         ("prereqs_satisfied",      prereqs_satisfied(plan, client)),
         ("major_requirements_met", major_requirements_met(plan, client)),

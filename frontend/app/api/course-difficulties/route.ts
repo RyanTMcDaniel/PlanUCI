@@ -17,20 +17,26 @@ export async function POST(req: Request) {
   const BATCH = 200;
   const supabase = serviceClient();
   const scores: Record<string, number> = {};
+  // How much the score is worth trusting, keyed on which signals backed it:
+  // high = NLP + GPA + RateMyProfessor, medium = two of them, low = NLP text only.
+  const confidence: Record<string, string> = {};
 
   for (let i = 0; i < ids.length; i += BATCH) {
     const { data, error } = await supabase
       .from("course_features")
-      .select("course_id, difficulty_score")
+      .select("course_id, difficulty_score, confidence")
       .in("course_id", ids.slice(i, i + BATCH));
 
     if (error || !data) continue;
     for (const row of data) {
       if (row.course_id && row.difficulty_score != null) {
         scores[row.course_id as string] = row.difficulty_score as number;
+        if (row.confidence != null) {
+          confidence[row.course_id as string] = row.confidence as string;
+        }
       }
     }
   }
 
-  return NextResponse.json({ scores });
+  return NextResponse.json({ scores, confidence });
 }
