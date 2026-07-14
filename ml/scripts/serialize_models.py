@@ -2,6 +2,7 @@ import json
 import os
 from datetime import datetime, timezone
 
+import pandas as pd
 import torch
 import torch.nn as nn
 from sentence_transformers import SentenceTransformer
@@ -9,6 +10,7 @@ from sentence_transformers import SentenceTransformer
 SCRIPTS_DIR = os.path.dirname(os.path.abspath(__file__))
 MODELS_DIR = os.path.join(SCRIPTS_DIR, "..", "models")
 EVALS_DIR = os.path.join(SCRIPTS_DIR, "..", "evals", "results")
+DATA_DIR = os.path.join(SCRIPTS_DIR, "..", "data")
 
 DIFFICULTY_MODEL_DIR = os.path.join(MODELS_DIR, "difficulty_nlp_v2")
 SENTIMENT_MODEL_DIR = os.path.join(MODELS_DIR, "sentiment_v1")
@@ -123,8 +125,14 @@ def main() -> None:
     diff_card = {
         "model_name": "difficulty_nlp_v2",
         "architecture": "all-MiniLM-L6-v2 encoder (fine-tuned) + nn.Linear(384, 3)",
-        "training_courses": 1171,
-        "val_macro_f1": 0.6100,
+        "training_courses": len(pd.read_csv(os.path.join(DATA_DIR, "train.csv"))),
+        # No val_macro_f1 here, deliberately. It used to be hardcoded as 0.6100 and
+        # was reproducible from nothing — the training run that produced it writes no
+        # artifact. Every number in this file must come from a script; a figure that
+        # can only be recovered by retraining is not a published metric, it is a
+        # memory. train_difficulty_nlp_v2.py should emit its own card the way
+        # train_sentiment.py now does; until it does, the honest set is the held-out
+        # test metrics below, which ml/evals/eval_difficulty.py regenerates on demand.
         "test_macro_f1": round(nlp_metrics["macro_f1"], 4),
         "test_accuracy": round(nlp_metrics["accuracy"], 4),
         "classes": diff_labels,
@@ -142,8 +150,8 @@ def main() -> None:
         "version": "v2",
         "path": "ml/models/difficulty_nlp_v2",
         "created_at": created_at,
+        "produced_by": "ml/evals/eval_difficulty.py",
         "key_metrics": {
-            "val_macro_f1": 0.6100,
             "test_macro_f1": round(nlp_metrics["macro_f1"], 4),
             "test_accuracy": round(nlp_metrics["accuracy"], 4),
         },
@@ -177,38 +185,26 @@ def main() -> None:
         print(f"    expected ≈ {expected:<20}  predicted: {pred_label:<15}  {conf}")
     print(f"  Smoke test: PASSED\n")
 
-    sent_card = {
-        "model_name": "sentiment_v1",
-        "architecture": "all-MiniLM-L6-v2 encoder (fine-tuned) + nn.Linear(384, 4)",
-        "professors_labeled": 1291,
-        "val_macro_f1": 0.8313,
-        "test_macro_f1": 0.8093,
-        "classes": sent_labels,
-        "weak_supervision_rules": {
-            "teaches_well": "overall >= 4.0 AND difficulty >= 3.0 AND would_take_again_pct >= 75",
-            "easy_grade":   "overall >= 3.8 AND difficulty <= 2.5 AND would_take_again_pct >= 70",
-            "harsh_grader": "difficulty >= 3.8 AND would_take_again_pct <= 50",
-            "avoid":        "overall <= 2.5 AND would_take_again_pct <= 40",
-            "priority":     "avoid > harsh_grader > teaches_well > easy_grade",
-        },
-        "input_format": "raw professor review text (concatenated reviews per professor)",
-        "output_format": "softmax probabilities over [teaches_well, easy_grade, harsh_grader, avoid]; argmax → label",
-        "created_at": created_at,
-    }
+    # sentiment_v1's model card is written by ml/models/train_sentiment.py — the run
+    # that actually produced the checkpoint — so read it rather than restating its
+    # metrics here.  (This file used to hardcode them, which meant re-running it
+    # silently reverted the card to a stale score.)
     card_path = os.path.join(SENTIMENT_MODEL_DIR, "model_card.json")
-    with open(card_path, "w") as f:
-        json.dump(sent_card, f, indent=2)
-    print(f"  Model card written → {card_path}")
+    with open(card_path) as f:
+        sent_card = json.load(f)
+    print(f"  Model card read ← {card_path}")
 
     registry.append({
         "model_id": "sentiment_v1",
         "version": "v1",
         "path": "ml/models/sentiment_v1",
-        "created_at": created_at,
+        "created_at": sent_card["created_at"],
+        "produced_by": "ml/models/train_sentiment.py",
         "key_metrics": {
-            "val_macro_f1": 0.8313,
-            "test_macro_f1": 0.8093,
-            "professors_labeled": 1291,
+            "val_macro_f1": sent_card["val_macro_f1"],
+            "test_macro_f1": sent_card["test_macro_f1"],
+            "test_records": sent_card["split"]["test"],
+            "rmp_records": sent_card["rmp_records"],
         },
     })
 
@@ -224,7 +220,7 @@ def main() -> None:
     print(f"  difficulty_nlp_v2  loaded  smoke test PASSED  "
           f"test macro F1: {nlp_metrics['macro_f1']:.4f}")
     print(f"  sentiment_v1       loaded  smoke test PASSED  "
-          f"test macro F1: 0.8093")
+          f"test macro F1: {sent_card['test_macro_f1']:.4f}")
     print(f"  Registry written → {registry_path}")
     print(f"  Models registered: {len(registry)}")
 

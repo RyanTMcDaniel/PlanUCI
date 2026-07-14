@@ -22,6 +22,7 @@ _ML_DIR = os.path.join(_APP_DIR, "..", "..", "ml")
 DIFFICULTY_MODEL_DIR = os.path.join(_ML_DIR, "models", "difficulty_nlp_v2")
 SENTIMENT_MODEL_DIR = os.path.join(_ML_DIR, "models", "sentiment_v1")
 PROF_FEATURES_CSV = os.path.join(_ML_DIR, "data", "prof_course_features.csv")
+COURSE_FEATURES_CSV = os.path.join(_ML_DIR, "data", "course_features.csv")
 EMBEDDING_DIM = 384
 
 
@@ -88,6 +89,18 @@ async def lifespan(app: FastAPI):
 
     prof_df = pd.read_csv(PROF_FEATURES_CSV)
     ml["prof_features"] = prof_df
+
+    # course_id → "high" | "medium" | "low": how much the served difficulty score is
+    # worth trusting, keyed on which signals backed it. ~a third of the catalogue is
+    # scored by the NLP classifier alone and must not look as authoritative as a
+    # course corroborated by grade history and professor ratings.
+    course_feat = pd.read_csv(COURSE_FEATURES_CSV)
+    ml["course_confidence"] = (
+        course_feat.dropna(subset=["confidence"])
+        .set_index("course_id")["confidence"]
+        .to_dict()
+        if "confidence" in course_feat.columns else {}
+    )
 
     reviews_raw = _fetch_all(client, "rmp_reviews", "ucinetid,review_text")
     ml["reviews"] = {

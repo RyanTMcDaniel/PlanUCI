@@ -1,4 +1,9 @@
+# Model weights go through Git LFS.
+#
+# These previously carried a second pair of rules — `*.safetensors !filter !merge
+# !diff` — which UNSET the filter attribute set here, so LFS never actually ran and
+# every checkpoint was committed as a raw ~87 MB blob. Four of them are already in
+# history and .git is ~483 MB as a result. Removing the unset lines makes LFS engage
+# for new commits; excising the existing blobs needs a separate history rewrite.
 *.safetensors filter=lfs diff=lfs merge=lfs -text
 *.bin filter=lfs diff=lfs merge=lfs -text
-*.safetensors !text !filter !merge !diff
-*.bin !text !filter !merge !diff

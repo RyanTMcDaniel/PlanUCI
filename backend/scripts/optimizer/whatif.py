@@ -31,6 +31,7 @@ from .hard_constraints import (
     _qkey,
     _course_units_by_norm,
     coreq_split_pairs,
+    ge_deadline_violations,
     quarter_units,
     unit_cap_tiers,
     units_valid,
@@ -312,21 +313,109 @@ def validate_locks(
 
 # ── What-if scheduling helpers ────────────────────────────────────────────────
 
+def _pull_late_ges_forward(
+    plan:            CoursePlan,
+    trees:           dict[str, dict],
+    meta:            dict[str, dict],
+    completed_norm:  set[str],
+    units_by_course: dict[str, int],
+    terms_by_course: dict[str, list[str]],
+    locked_norm:     set[str],
+    boundary:        tuple[int, int],
+) -> CoursePlan:
+    """Relocate every UNLOCKED, prereq-ready GE sitting at/after the Year-2
+    boundary into the earliest Year-1-2 quarter that respects prerequisites, term
+    availability and the unit cap.
+
+    This is the repair the whatif hill-climber can't perform on its own: its GE
+    guard only blocks *new* late placements, and pulling a GE earlier never
+    improves the soft score, so a seed that already places a GE in Year 3+ would
+    otherwise be returned unchanged.  GEs that genuinely can't fit earlier
+    (prereq-blocked, or no Y1-2 capacity) are left in place — the acceptable
+    exception.  Locked courses are never moved.
+    """
+    quarters       = sorted(plan.planned_courses.keys(), key=_qkey)
+    early_quarters = [q for q in quarters if _qkey(q) < boundary]
+    if not early_quarters:
+        return plan
+    cap = plan.units_per_quarter
+
+    def _units(c: str) -> int:
+        return units_by_course.get(c) or units_by_course.get(_norm(c)) or UNITS_PER_COURSE
+
+    # GE courses currently parked at/after the boundary (unlocked only).
+    late: list[tuple[str, str]] = []
+    for q in quarters:
+        if _qkey(q) < boundary:
+            continue
+        for c in plan.planned_courses[q]:
+            if _norm(c) in locked_norm:
+                continue
+            m = meta.get(_norm(c))
+            if m and m.get("ge_list"):
+                late.append((c, q))
+
+    for c, from_q in late:
+        tree = trees.get(_norm(c))
+        for to_q in early_quarters:
+            # Prereqs must be satisfied by STRICTLY earlier quarters.
+            avail = set(completed_norm)
+            for qq in quarters:
+                if _qkey(qq) < _qkey(to_q):
+                    avail.update(_norm(x) for x in plan.planned_courses.get(qq, []))
+            if tree and not _eval_tree(tree, avail):
+                continue
+            if not _offered_in(c, to_q, terms_by_course):
+                continue
+            used = sum(_units(x) for x in plan.planned_courses.get(to_q, []))
+            if used + _units(c) > cap:
+                continue
+            plan.planned_courses[from_q].remove(c)
+            plan.planned_courses.setdefault(to_q, []).append(c)
+            break
+
+    return plan
+
+
 def _perturb_unlocked(
     plan:        CoursePlan,
     locked_norm: set[str],
     rng:         random.Random,
     n_swaps:     int,
     trees:       dict[str, dict] | None = None,
+    ge_norms:    set[str] | None = None,
+    boundary:    tuple[int, int] | None = None,
 ) -> CoursePlan:
     """Swap n_swaps random pairs of UNLOCKED courses between quarters.
 
     When `trees` is provided, a swap that introduces a NEW prereq violation or
     splits a corequisite pair (relative to the pre-swap state) is undone, so the
     optimizer never starts from a plan whose prereq ordering it has scrambled.
+
+    Hard GE earliness: a swap that moves a GE course (not already past the Year-2
+    boundary in the input plan) into Year 3+ is also undone, so the perturbed
+    starting plan never re-scatters the GEs that _pull_late_ges_forward pulled in.
     """
     p = deepcopy(plan)
     quarters = list(p.planned_courses.keys())
+
+    ge_norms = ge_norms or set()
+    base_late_ge: set[str] = set()
+    if ge_norms and boundary is not None:
+        for q, cs in plan.planned_courses.items():
+            if _qkey(q) >= boundary:
+                for c in cs:
+                    if _norm(c) in ge_norms:
+                        base_late_ge.add(_norm(c))
+
+    def _ge_deadline_bad(course: str, dest_q: str) -> bool:
+        return (
+            boundary is not None
+            and _norm(course) in ge_norms
+            and _norm(course) not in base_late_ge
+            and _qkey(dest_q) >= boundary
+        )
+
     for _ in range(n_swaps):
         unlocked_quarters = [
             q for q in quarters
@@ -346,9 +435,14 @@ def _perturb_unlocked(
         p.planned_courses[q2].remove(c2)
         p.planned_courses[q1].append(c2)
         p.planned_courses[q2].append(c1)
-        if trees and (
-            (set(_check_prereqs(p, trees)) - before_viols)
-            or (coreq_split_pairs(p, trees) - before_split)
+        if (
+            (trees and (
+                (set(_check_prereqs(p, trees)) - before_viols)
+                or (coreq_split_pairs(p, trees) - before_split)
+            ))
+            # c1 now in q2, c2 now in q1 — reject if either lands a GE in Year 3+.
+            or _ge_deadline_bad(c1, q2)
+            or _ge_deadline_bad(c2, q1)
         ):
             p.planned_courses[q1].remove(c2)
             p.planned_courses[q2].remove(c1)
@@ -375,7 +469,7 @@ def _whatif_optimize(
     """
     rng       = random.Random(seed)
     best      = deepcopy(plan)
-    best_score, best_bd = _soft_score(plan, diff_scores, meta)
+    best_score, best_bd = _soft_score(plan, diff_scores, meta, frozenset(locked_norm))
     quarters  = sorted(plan.planned_courses.keys(), key=_qkey)
     cap       = plan.units_per_quarter
 
@@ -418,7 +512,15 @@ def _whatif_optimize(
         if coreq_split_pairs(candidate, trees) - base_coreq_split:
             continue
 
-        cand_score, cand_bd = _soft_score(candidate, diff_scores, meta)
+        # GE deadline — all GEs must finish by the end of Year 2. Absolute check
+        # (not a base diff): an unlocked GE may never sit in Year 3+, regardless
+        # of where the seed placed it. Locked late GEs are grandfathered so a
+        # user's manual placement is respected.
+        ge_viols = ge_deadline_violations(candidate, meta, plan.graduation_year)
+        if any(v["course"] not in locked_norm for v in ge_viols):
+            continue
+
+        cand_score, cand_bd = _soft_score(candidate, diff_scores, meta, frozenset(locked_norm))
         if cand_score < best_score:
             best, best_score, best_bd = candidate, cand_score, cand_bd
 
@@ -485,6 +587,13 @@ def optimize_around_locks(
     trees       = _prereq_trees(client, all_ids)
     meta        = _load_course_meta(client, all_ids)
     units_by_course = _course_units_by_norm(client, all_ids)
+    terms_by_course = _fetch_course_terms(client, all_ids)
+
+    # Hard GE earliness: norms of GE-satisfying courses + the Year-2 deadline
+    # boundary (Year-3 Fall).  Used to repair a seed that places GEs in Year 3+
+    # and to keep the perturbation from re-scattering them.
+    ge_norms = {n for n, m in meta.items() if m.get("ge_list")}
+    ge_boundary = _qkey(f"{plan.graduation_year - 2}_fall")
 
     # Resolve AP / completed credit into a normalized baseline of satisfied
     # tokens (course norms + "EXAMOK:" exam tokens).  These count as satisfied
@@ -524,10 +633,20 @@ def optimize_around_locks(
     for cap in unit_cap_tiers(plan.units_per_quarter):
         base = deepcopy(plan)
         base.units_per_quarter = cap
+        # Repair the seed: pull any unlocked, prereq-ready GE out of Year 3+ into
+        # the earliest valid Y1-2 slot before optimizing (the hill-climber can't).
+        base = _pull_late_ges_forward(
+            base, trees, meta, completed_norm, units_by_course,
+            terms_by_course, locked_norm, ge_boundary,
+        )
 
         for s, n_swaps in configs:
             rng   = random.Random(s)
-            start = _perturb_unlocked(base, locked_norm, rng, n_swaps, trees) if n_swaps else base
+            start = (
+                _perturb_unlocked(base, locked_norm, rng, n_swaps, trees,
+                                  ge_norms=ge_norms, boundary=ge_boundary)
+                if n_swaps else base
+            )
             opt, score, bd = _whatif_optimize(
                 start, locked_norm, trees, diff_scores, meta, seed=s,
                 extra_available=completed_norm, units_by_course=units_by_course,

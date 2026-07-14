@@ -26,13 +26,17 @@ UNIT_CAP_LADDER = (20, 24)
 
 
 def unit_cap_tiers(base_cap: int) -> list[int]:
-    """Caps to try, ascending: the requested cap first, then 20 then 24.
+    """Caps to try, ascending: the requested cap first, then ladder tiers up to
+    base_cap + 4 (the absolute ceiling).
 
-    Tiers below the requested cap are dropped (never schedule looser than asked
-    for at the first attempt), and 24 is the ceiling.
+    The requested cap is the intended hard limit; escalation is bounded to +4 so
+    the optimizer can't quietly schedule far over the requested load (which let
+    over-cap quarters pass as hard-valid instead of spreading courses out). Tiers
+    below the requested cap are dropped (never looser than asked at first try).
     """
+    ceiling = base_cap + 4
     tiers = sorted({base_cap, *UNIT_CAP_LADDER})
-    return [t for t in tiers if base_cap <= t <= max(base_cap, 24)] or [base_cap]
+    return [t for t in tiers if base_cap <= t <= ceiling] or [base_cap]
 
 
 def _qkey(qstr: str) -> tuple[int, int]:
@@ -71,9 +75,10 @@ CODE_PREREQ_ORDER  = "PREREQ_ORDER"
 CODE_UNIT_CAP      = "UNIT_CAP"
 CODE_DUPLICATE     = "DUPLICATE"
 CODE_REQ_UNCOVERED = "REQ_UNCOVERED"
+CODE_GE_DEADLINE   = "GE_DEADLINE"
 
 
-# ── CSE ↔ ICS alias map (FIX 6) ─────────────────────────────────────────────
+# ── CSE ↔ ICS alias map ─────────────────────────────────────────────
 # CSE was the old department prefix; current catalog uses I&CSCI / ICS after norm.
 # Hardcoded known aliases; _load_aliases() extends this from the DB at runtime.
 _ALIASES: dict[str, str] = {
@@ -86,7 +91,7 @@ _ALIASES_INITIALIZED = False
 
 
 def _load_aliases(client) -> None:
-    """FIX 6: query major_requirements to discover additional CSE↔ICS aliases."""
+    """query major_requirements to discover additional CSE↔ICS aliases."""
     global _ALIASES, _ALIASES_INITIALIZED
     if _ALIASES_INITIALIZED:
         return
@@ -110,7 +115,7 @@ def _load_aliases(client) -> None:
             _ALIASES.setdefault("CSE" + num, "ICS" + num)
 
     _ALIASES_INITIALIZED = True
-    print(f"[FIX 6] Alias map ({len(_ALIASES)} entries): {dict(sorted(_ALIASES.items()))}")
+    print(f"Alias map ({len(_ALIASES)} entries): {dict(sorted(_ALIASES.items()))}")
 
 
 def _norm(course_id: str) -> str:
@@ -118,7 +123,7 @@ def _norm(course_id: str) -> str:
     s = course_id.replace(" ", "").upper()
     # prereq_edges stores raw catalog text like "I&C SCI 46"; courses table uses "ICS46"
     s = s.replace("I&CSCI", "ICS")
-    # FIX 6: resolve CSE→ICS aliases so CSE46 == ICS46 in all comparisons
+    # resolve CSE→ICS aliases so CSE46 == ICS46 in all comparisons
     return _ALIASES.get(s, s)
 
 
@@ -235,6 +240,48 @@ def coreq_split_pairs(
     return split
 
 
+def ge_deadline_violations(
+    plan: CoursePlan,
+    course_meta: dict[str, dict],
+    graduation_year: int,
+) -> list[dict]:
+    """GE courses must be finished by the end of Year 2 — before Year 3 Fall.
+
+    Year 3 Fall is calendar year (graduation_year - 2), season fall: e.g. for a
+    2030 graduation the boundary is 2028_fall.  Any quarter at or after that
+    boundary is off-limits for GE-satisfying courses (non-empty ge_list).  Note
+    QUARTER_ORDER puts fall last within a calendar year, so Year 2's winter /
+    spring / summer (which carry the same calendar year as Year 3 Fall only when
+    they don't) stay strictly below the boundary tuple.
+
+    Returns one dict per offending placement: {course, quarter, reason, code}.
+    This flags ALL GE courses past the boundary, including locked ones.  Callers
+    that only want to block *new* late placements (the whatif hill-climber) diff
+    candidate violations against the pre-move set, so a course the user manually
+    locked into Year 3+ is present in both and never newly rejected.
+    """
+    boundary = (graduation_year - 2, QUARTER_ORDER["fall"])
+    deadline_q = _pretty_quarter(f"{graduation_year - 2}_fall")
+    violations: list[dict] = []
+    for q, courses in plan.planned_courses.items():
+        if _qkey(q) < boundary:
+            continue
+        for c in courses:
+            meta = course_meta.get(_norm(c))
+            if meta and meta.get("ge_list"):
+                violations.append({
+                    "course": _norm(c),
+                    "quarter": q,
+                    "reason": (
+                        f"{c} satisfies a GE but is placed in {_pretty_quarter(q)}; "
+                        f"all GE courses must be completed by the end of Year 2 "
+                        f"(before {deadline_q})."
+                    ),
+                    "code": CODE_GE_DEADLINE,
+                })
+    return violations
+
+
 def _representative_unmet(
     node: dict,
     available: set[str],
@@ -302,7 +349,7 @@ def _probe_group_column(client) -> str | None:
 # ── Validators ───────────────────────────────────────────────────────────────
 
 def prereqs_satisfied(plan: CoursePlan, client) -> tuple[bool, list[CheckResult]]:
-    # FIX 6 — ensure alias map is populated before any _norm() comparisons
+    # ensure alias map is populated before any _norm() comparisons
     _load_aliases(client)
     """Every planned course must have its prerequisites completed or planned earlier.
 
@@ -411,7 +458,7 @@ def major_requirements_met(plan: CoursePlan, client) -> tuple[bool, list[CheckRe
     Returns (all_passed, violations) where each violation is a CheckResult with
     code REQ_UNCOVERED.
     """
-    _load_aliases(client)  # FIX 6
+    _load_aliases(client)
     violations: list[CheckResult] = []
 
     all_courses = {_norm(c) for c in plan.completed_courses}
@@ -472,7 +519,7 @@ def major_requirements_met(plan: CoursePlan, client) -> tuple[bool, list[CheckRe
                 code=CODE_REQ_UNCOVERED,
             ))
 
-    # FIX 3: Also validate university-wide GE requirements (major_id = "ALL_MAJORS").
+    # Also validate university-wide GE requirements (major_id = "ALL_MAJORS").
     # A plan fails if any GE group has fewer courses than courses_needed.
     ge_rows = (
         client.table("major_requirements")
@@ -610,8 +657,7 @@ def validate(plan: CoursePlan) -> tuple[bool, list[CheckResult]]:
     when the plan is fully valid.
     """
     client = create_client(os.getenv("SUPABASE_URL"), os.getenv("SUPABASE_SERVICE_KEY"))
-    _load_aliases(client)  # FIX 6
-
+    _load_aliases(client)
     checks = [
         ("prereqs_satisfied",      prereqs_satisfied(plan, client)),
         ("major_requirements_met", major_requirements_met(plan, client)),

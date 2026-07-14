@@ -1,6 +1,7 @@
 "use client";
 
 import { useState, useEffect, useMemo, useCallback, useRef } from "react";
+import { createPortal } from "react-dom";
 import {
   DndContext,
   DragEndEvent,
@@ -21,6 +22,8 @@ import {
   type ApCreditResult,
   fetchMajorRequirements,
   fetchCourseDetails,
+  fetchPrereqTrees,
+  fetchCorequisites,
   fetchGERequirements,
   fetchApExamNames,
   resolveApCredits,
@@ -40,6 +43,180 @@ interface DragData {
   type: "sidebar" | "placed";
   courseId: string;
   quarterKey?: string;
+}
+
+// Coverage pills shown on autofilled cards that cross-cover requirements.
+// Major/Minor courses placed with no cross-cover carry no tag (clean card).
+type CoverageTag =
+  | { kind: "major" }
+  | { kind: "ge"; code: string }
+  | { kind: "minor" };
+
+// Clean UCI GE codes keyed by the DB's requirement_group, so pills read "Ia"
+// instead of "I_WRITING_LD" / "V_THIRD".
+const GE_CODE_LABELS: Record<string, string> = {
+  GE_I_WRITING_LD: "Ia",
+  GE_I_WRITING_UD: "Ib",
+  GE_II: "II",
+  GE_III: "III",
+  GE_IV: "IV",
+  GE_Va: "Va",
+  GE_Vb: "Vb",
+  GE_V_THIRD: "V",
+  GE_VI: "VI",
+  GE_VII: "VII",
+  GE_VIII: "VIII",
+};
+
+// ge_list token (e.g. "III", "Va") → requirement_group. The authoritative GE
+// taxonomy: a course satisfies a category iff its ge_list says so.
+const GE_TOKEN_TO_GROUP: Record<string, string> = {
+  Ia: "GE_I_WRITING_LD",
+  Ib: "GE_I_WRITING_UD",
+  II: "GE_II",
+  III: "GE_III",
+  IV: "GE_IV",
+  Va: "GE_Va",
+  Vb: "GE_Vb",
+  VI: "GE_VI",
+  VII: "GE_VII",
+  VIII: "GE_VIII",
+};
+// Canonical category order for tie-breaks.
+const GE_ORDER: Record<string, number> = {
+  GE_I_WRITING_LD: 0, GE_I_WRITING_UD: 1, GE_II: 2, GE_III: 3, GE_IV: 4,
+  GE_Va: 5, GE_Vb: 6, GE_V_THIRD: 7, GE_VI: 8, GE_VII: 9, GE_VIII: 10,
+};
+// clean code ("III", "V", "Ia") → requirement_group (inverse of GE_CODE_LABELS).
+const GE_LABEL_TO_GROUP: Record<string, string> = Object.fromEntries(
+  Object.entries(GE_CODE_LABELS).map(([g, label]) => [label, g]),
+);
+
+// UCI GE category VI = "Language Other Than English" — the only GE satisfiable
+// outside a placed course (heritage language, placement test, or HS equivalent).
+const LANGUAGE_GE_GROUP = "GE_VI";
+
+// Authoritative GE coverage for a course, derived ONLY from its ge_list (never
+// array membership). Returns requirement_group codes that also appear in the
+// passed geRequirements (so already-filled / not-needed categories are skipped
+// when the caller passes the unfilled subset). GE_V_THIRD is satisfied by any
+// "GE Va:" / "GE Vb:" course since it has no token of its own.
+function getCourseGECategories(course: CourseDetail | undefined, geRequirements: ReqGroup[]): string[] {
+  if (!course?.ge_list?.length) return [];
+  const present = new Set(geRequirements.map((r) => r.requirement_group ?? "").filter(Boolean));
+  const tokens = new Set<string>();
+  for (const s of course.ge_list) {
+    const m = /^GE\s+([A-Za-z]+)\s*:/.exec(s);
+    if (m) tokens.add(m[1]);
+  }
+  const out = new Set<string>();
+  for (const tok of tokens) {
+    const g = GE_TOKEN_TO_GROUP[tok];
+    if (g && present.has(g)) out.add(g);
+  }
+  if ((tokens.has("Va") || tokens.has("Vb")) && present.has("GE_V_THIRD")) out.add("GE_V_THIRD");
+  return [...out].sort((a, b) => (GE_ORDER[a] ?? 99) - (GE_ORDER[b] ?? 99));
+}
+
+// Prerequisite-tree node/leaf shape: { AND|OR|NOT: item[] }, where a leaf has a
+// prereqType ("course" | "exam"); course leaves carry a courseId / coreq flag,
+// exam leaves carry an examName + minGrade (string threshold, e.g. "4").
+type PrereqItem = {
+  prereqType?: string;
+  courseId?: string;
+  coreq?: boolean;
+  examName?: string;
+  minGrade?: string;
+} & Record<string, unknown>;
+
+// An exam prereq leaf is satisfied only if the student actually earned a
+// qualifying score. examScores is keyed by UPPERCASED exam name (prereq leaves
+// store "AP CALCULUS BC"; apScores keys are "AP Calculus BC"). If the leaf is
+// missing an exam name or a numeric threshold we can't evaluate, treat it as
+// NOT satisfied (conservative — let the backend decide).
+function examSatisfied(i: PrereqItem, examScores: Map<string, number>): boolean {
+  const name = String(i.examName ?? "").trim().toUpperCase();
+  const min = parseInt(String(i.minGrade ?? ""), 10);
+  if (!name || Number.isNaN(min)) return false;
+  const score = examScores.get(name);
+  return score != null && score >= min;
+}
+
+// ── Prereq closure ─────────────────────────────────────────────────────────
+// Course-leaf ids that must be ADDED so a prereq tree is satisfiable given what
+// is already available. AND → every child; OR → nothing if any option already
+// satisfied, else pull the first course option; NOT → ignored; exam → satisfied
+// only if the qualifying AP score is present in examScores.
+function itemSatisfied(i: PrereqItem, have: Set<string>, examScores: Map<string, number>): boolean {
+  if (i?.prereqType === "course") return have.has(normId(String(i.courseId ?? "")));
+  if (i?.prereqType === "exam") return examSatisfied(i, examScores);
+  return requiredMissingCourses(i, have, examScores).length === 0;
+}
+function missingFromItem(i: PrereqItem, have: Set<string>, examScores: Map<string, number>): string[] {
+  if (i?.prereqType === "course") {
+    const cid = String(i.courseId ?? "");
+    return cid && !have.has(normId(cid)) ? [cid] : [];
+  }
+  if (i?.prereqType === "exam") return []; // an exam can't be satisfied by adding a course
+  return requiredMissingCourses(i, have, examScores);
+}
+function requiredMissingCourses(node: unknown, have: Set<string>, examScores: Map<string, number>): string[] {
+  if (!node || typeof node !== "object") return [];
+  const n = node as Record<string, unknown>;
+  if (Array.isArray(n.AND)) return (n.AND as PrereqItem[]).flatMap((i) => missingFromItem(i, have, examScores));
+  if (Array.isArray(n.OR)) {
+    const items = n.OR as PrereqItem[];
+    if (items.some((i) => itemSatisfied(i, have, examScores))) return [];
+    const firstCourse = items.find((i) => i?.prereqType === "course" && i.courseId);
+    return firstCourse?.courseId ? [String(firstCourse.courseId)] : [];
+  }
+  return []; // NOT / unknown → nothing to add
+}
+
+// HARD prereq course-leaf ids that must come strictly before a course — only
+// AND-required leaves (coreq:true skipped — same-quarter partners; NOT skipped —
+// anti-requisite). OR branches contribute NOTHING: a choice between options is
+// not a hard floor (any single option may satisfy it), so we leave the ordering
+// of OR alternatives to whatif rather than pinning a floor. Used to derive
+// topological seed ordering and prereq floors.
+function collectPrereqCourseLeaves(node: unknown): string[] {
+  if (!node || typeof node !== "object") return [];
+  const n = node as Record<string, unknown>;
+  const out: string[] = [];
+  // AND only: every child is required. OR (and any other key) contributes no floor.
+  const arr = n.AND;
+  if (Array.isArray(arr)) {
+    for (const item of arr as PrereqItem[]) {
+      if (item?.prereqType === "course" && item.courseId && item.coreq !== true) {
+        out.push(String(item.courseId));
+      } else if (item?.prereqType !== "exam" && item && typeof item === "object") {
+        out.push(...collectPrereqCourseLeaves(item));
+      }
+    }
+  }
+  return out;
+}
+
+// Corequisite course-leaf ids (coreq:true) referenced in a prereq tree. A coreq
+// means "same quarter", not "before" — these drive the coreq alignment pass in
+// the seed, NOT the prereq floor. Coreq edges are stored one-directionally
+// (e.g. MATH105A's tree points at MATH105LA; the lab's tree is empty).
+function collectCoreqCourseLeaves(node: unknown): string[] {
+  if (!node || typeof node !== "object") return [];
+  const n = node as Record<string, unknown>;
+  const out: string[] = [];
+  for (const key of ["AND", "OR"] as const) {
+    const arr = n[key];
+    if (!Array.isArray(arr)) continue;
+    for (const item of arr as PrereqItem[]) {
+      if (item?.prereqType === "course" && item.courseId && item.coreq === true) {
+        out.push(String(item.courseId));
+      } else if (item?.prereqType !== "exam" && item && typeof item === "object") {
+        out.push(...collectCoreqCourseLeaves(item));
+      }
+    }
+  }
+  return out;
 }
 
 interface CourseStats {
@@ -134,6 +311,43 @@ function diffScoreColor(score: number): string {
   if (score < 6) return "#eab308";
   if (score < 8) return "#f97316";
   return "#ef4444";
+}
+
+// How far to trust a difficulty score, keyed on which signals actually backed it.
+// Roughly a third of the catalogue is scored from the course description alone, and
+// that must not look as authoritative as a course corroborated by real grade history
+// and professor ratings. The score is always shown — only the caveat changes.
+const CONFIDENCE_META: Record<string, { color: string; label: string; tip: string }> = {
+  high: {
+    color: "#9a9a9a",
+    label: "FULL DATA",
+    tip: "High confidence — difficulty is backed by the course description, historical grade distributions, and professor ratings.",
+  },
+  medium: {
+    color: "#b08947",
+    label: "PARTIAL DATA",
+    tip: "Medium confidence — difficulty is backed by two of the three signals (course description, historical grades, professor ratings).",
+  },
+  low: {
+    color: "#b06060",
+    label: "LOW DATA",
+    tip: "Low confidence — no grade or professor data for this course. Difficulty is estimated from the course description alone.",
+  },
+};
+
+function ConfidenceBadge({ confidence }: { confidence?: string | null }) {
+  const meta = confidence ? CONFIDENCE_META[confidence] : undefined;
+  if (!meta) return null;
+  return (
+    <span
+      title={meta.tip}
+      className="flex items-center gap-0.5 text-[9px] font-mono whitespace-nowrap cursor-help"
+      style={{ color: meta.color }}
+    >
+      <span className="text-[7px] leading-none">●</span>
+      {meta.label}
+    </span>
+  );
 }
 
 // ── Bucket classification ──────────────────────────────────────────────────────
@@ -281,7 +495,7 @@ function parseLockConflict(conflict: string): string {
 function LockIcon({ locked }: { locked: boolean }) {
   return (
     <svg viewBox="0 0 14 14" fill="none"
-      className={`w-3 h-3 transition-colors ${locked ? "text-amber-400" : "text-[#555] group-hover/card:text-[#e8e8e8]"}`}>
+      className={`w-4 h-4 transition-colors ${locked ? "text-amber-400" : "text-[#555] group-hover/card:text-[#e8e8e8]"}`}>
       <rect x="3" y="6" width="8" height="6" rx="1.2" stroke="currentColor" strokeWidth="1.3"/>
       <path d="M5 6V4.5a2 2 0 014 0V6" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round"/>
     </svg>
@@ -490,6 +704,101 @@ function MinorCombobox({
   );
 }
 
+// ── Specialization combobox ─────────────────────────────────────────────────
+// Mirrors MajorCombobox/MinorCombobox; specializations select by major_id.
+
+function SpecializationCombobox({
+  options, selectedMajorId, onSelect, loading,
+}: {
+  options: MajorOption[];
+  selectedMajorId: string;
+  onSelect: (majorId: string) => void;
+  loading: boolean;
+}) {
+  const [query, setQuery] = useState("");
+  const [open, setOpen] = useState(false);
+  const containerRef = useRef<HTMLDivElement>(null);
+  const inputRef = useRef<HTMLInputElement>(null);
+
+  const specLabel = (o: MajorOption) => o.specialization_name ?? o.major_id;
+
+  const selectedName = useMemo(() => {
+    const o = options.find((o) => o.major_id === selectedMajorId);
+    return o ? specLabel(o) : "";
+  }, [options, selectedMajorId]);
+
+  useEffect(() => {
+    if (!open) setQuery(selectedName);
+  }, [selectedName, open]);
+
+  useEffect(() => {
+    function onMouseDown(e: MouseEvent) {
+      if (containerRef.current && !containerRef.current.contains(e.target as Node)) {
+        setOpen(false);
+        setQuery(selectedName);
+      }
+    }
+    document.addEventListener("mousedown", onMouseDown);
+    return () => document.removeEventListener("mousedown", onMouseDown);
+  }, [selectedName]);
+
+  const filtered = useMemo(() => {
+    const q = query.trim().toLowerCase();
+    return options
+      .filter((o) => !q || specLabel(o).toLowerCase().includes(q))
+      .slice(0, 40);
+  }, [options, query]);
+
+  function handleSelect(opt: MajorOption) {
+    onSelect(opt.major_id);
+    setQuery(specLabel(opt));
+    setOpen(false);
+  }
+
+  function handleKeyDown(e: React.KeyboardEvent) {
+    if (e.key === "Escape") {
+      setOpen(false);
+      setQuery(selectedName);
+      inputRef.current?.blur();
+    }
+    if (e.key === "Enter" && filtered.length > 0) handleSelect(filtered[0]);
+  }
+
+  return (
+    <div ref={containerRef} className="relative">
+      <div className="relative">
+        <input
+          ref={inputRef}
+          type="text"
+          value={query}
+          onChange={(e) => { setQuery(e.target.value); setOpen(true); }}
+          onFocus={() => setOpen(true)}
+          onKeyDown={handleKeyDown}
+          placeholder={loading ? "Loading specializations…" : "Search for a specialization..."}
+          disabled={loading && options.length === 0}
+          className="w-full bg-[#111] border border-[#2a2a2a] rounded px-2.5 py-1.5 text-[11px] text-[#f0f0f0] placeholder-[#444] focus:outline-none focus:border-[#3b82f6]/60 disabled:opacity-50 pr-6"
+        />
+        <svg className="absolute right-2 top-1/2 -translate-y-1/2 w-3 h-3 text-[#444] pointer-events-none" viewBox="0 0 12 12" fill="none">
+          <path d="M2 4l4 4 4-4" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round"/>
+        </svg>
+      </div>
+      {open && filtered.length > 0 && (
+        <div className="absolute z-50 top-full left-0 right-0 mt-px bg-[#1a1a1a] border border-[#2a2a2a] rounded max-h-52 overflow-y-auto shadow-xl">
+          {filtered.map((opt) => (
+            <button
+              key={opt.major_id}
+              onMouseDown={() => handleSelect(opt)}
+              className="w-full text-left px-2.5 py-[7px] text-[11px] text-[#bbb] hover:bg-[#252525] hover:text-[#f0f0f0] transition-colors"
+            >
+              {specLabel(opt)}
+            </button>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
 // ── Course tooltip ─────────────────────────────────────────────────────────────
 
 function CourseTooltip({
@@ -624,10 +933,36 @@ function CourseTooltip({
   );
 }
 
+// ── Coverage pills ───────────────────────────────────────────────────────────
+// Small colored tags on a placed card showing what an autofilled course covers:
+// blue = major requirement, green = GE category (with code), purple = minor.
+
+function CoverageTags({ tags }: { tags: CoverageTag[] }) {
+  // Only GE coverage gets a pill — major/minor cards stay clean. Rendered as a
+  // fragment of spans (no wrapper) so the caller can flow them inline, right of
+  // the course code, with the first pill kept on the code's line.
+  const geTags = tags.filter(
+    (t): t is Extract<CoverageTag, { kind: "ge" }> => t.kind === "ge",
+  );
+  if (geTags.length === 0) return null;
+  return (
+    <>
+      {geTags.map((t, i) => (
+        <span
+          key={i}
+          className="rounded-full border px-1.5 py-[1px] text-[8.5px] font-bold leading-none tracking-wide bg-emerald-500/20 border-emerald-500/40 text-emerald-300"
+        >
+          {t.code}
+        </span>
+      ))}
+    </>
+  );
+}
+
 // ── Placed card ────────────────────────────────────────────────────────────────
 
 function PlacedCard({
-  courseId, quarterKey, title, units, level, diffScore, gpa, isLocked, onToggleLock, onRemove,
+  courseId, quarterKey, title, units, level, diffScore, diffConfidence, gpa, isLocked, onToggleLock, onRemove, tags,
 }: {
   courseId: string;
   quarterKey: string;
@@ -635,10 +970,12 @@ function PlacedCard({
   units?: number | null;
   level?: string | null;
   diffScore?: number | null;
+  diffConfidence?: string | null;
   gpa?: number | null;
   isLocked: boolean;
   onToggleLock: (id: string) => void;
   onRemove: (id: string, qKey: string) => void;
+  tags?: CoverageTag[];
 }) {
   const { attributes, listeners, setNodeRef, transform, isDragging } = useDraggable({
     id: `placed|${quarterKey}|${courseId}`,
@@ -660,52 +997,59 @@ function PlacedCard({
     <div
       ref={setNodeRef}
       style={style}
-      className={`group/card flex items-center gap-1.5 rounded-r-md pl-2 pr-1 py-1 select-none
-        bg-[#1e1e1e] border border-l-0 border-[#2a2a2a] shadow-sm transition-colors min-h-[44px]
+      className={`group/card flex items-stretch gap-1.5 rounded-r-md pl-1 pr-0 select-none
+        bg-[#1e1e1e] border border-l-0 border-[#2a2a2a] shadow-sm transition-colors min-h-[32px]
         ${isDragging ? "opacity-20" : "hover:bg-[#252525] hover:border-[#333]"}`}
     >
-      {/* drag handle */}
+      {/* drag handle — left, vertically centered */}
       <span
         {...listeners}
         {...attributes}
-        className="text-[10px] text-[#2a2a2a] group-hover/card:text-[#444] cursor-grab active:cursor-grabbing shrink-0 leading-none self-start mt-1"
+        className="flex items-center text-[26px] text-[#2a2a2a] group-hover/card:text-[#444] cursor-grab active:cursor-grabbing shrink-0 leading-none self-center"
       >
         ⠿
       </span>
 
-      {/* course info */}
-      <div className="flex-1 min-w-0">
-        <p className="text-[15px] font-bold text-[#e8e8e8] leading-tight truncate">{courseId}</p>
+      {/* content — course code + GE pills (inline, right of the code) over name */}
+      <div className="flex-1 min-w-0 flex flex-col justify-center gap-0 py-0.5">
+        <div className="flex flex-wrap items-center gap-1.5">
+          <p className="text-[19px] font-bold text-[#e8e8e8] leading-none truncate">{courseId}</p>
+          {tags && <CoverageTags tags={tags} />}
+        </div>
         {title && (
-          <p className="text-[10px] text-[#999] leading-snug truncate">{title}</p>
+          <p title={title} className="text-[10px] text-[#999] leading-tight overflow-hidden text-ellipsis whitespace-nowrap">{title}</p>
         )}
       </div>
 
-      {/* right side */}
-      <div className="flex flex-col items-end gap-0.5 shrink-0">
+      {/* avg gpa (left) + units (right) — single line, right of action strip */}
+      <div className="flex flex-row items-center justify-end gap-2 shrink-0 py-0.5 pr-1 text-right">
+        <ConfidenceBadge confidence={diffConfidence} />
         {gpa != null && isFinite(gpa) ? (
-          <span className="text-[10px] font-mono font-medium" style={{ color: "#9a9a9a" }}>{gpa.toFixed(2)} GPA</span>
+          <span className="text-[10px] font-mono font-medium" style={{ color: "#9a9a9a" }}>{gpa.toFixed(2)} AVG GPA</span>
         ) : (
           <span className="text-[9px] font-mono text-[#5a5a5a] whitespace-nowrap">No GPA Data</span>
         )}
         <span className="text-[11px] font-medium text-[#888] tabular-nums">{units ?? "?"} <span className="font-normal text-[#5a5a5a]">UNITS</span></span>
-        <div className="flex gap-1 opacity-0 group-hover/card:opacity-100 transition-opacity">
-          <button
-            onPointerDown={(e) => e.stopPropagation()}
-            onClick={() => onToggleLock(courseId)}
-            title={isLocked ? "Unlock" : "Lock to quarter"}
-          >
-            <LockIcon locked={isLocked} />
-          </button>
-          <button
-            onPointerDown={(e) => e.stopPropagation()}
-            onClick={() => onRemove(courseId, quarterKey)}
-            title="Remove"
-            className="text-[#555] hover:text-[#e8e8e8] text-[12px] leading-none w-3 text-center transition-colors"
-          >
-            ×
-          </button>
-        </div>
+      </div>
+
+      {/* right-edge action strip — full card height: remove (top) / lock (bottom) */}
+      <div className="flex flex-col shrink-0 w-7 self-stretch border-l border-[#2a2a2a]">
+        <button
+          onPointerDown={(e) => e.stopPropagation()}
+          onClick={() => onRemove(courseId, quarterKey)}
+          title="Remove"
+          className="flex-1 flex items-center justify-center rounded-tr-md text-[#555] hover:text-[#e8e8e8] hover:bg-[#333] text-[18px] leading-none transition-colors border-b border-[#2a2a2a]"
+        >
+          ×
+        </button>
+        <button
+          onPointerDown={(e) => e.stopPropagation()}
+          onClick={() => onToggleLock(courseId)}
+          title={isLocked ? "Unlock" : "Lock to quarter"}
+          className="flex-1 flex items-center justify-center rounded-br-md hover:bg-[#333] transition-colors"
+        >
+          <LockIcon locked={isLocked} />
+        </button>
       </div>
     </div>
   );
@@ -778,7 +1122,7 @@ function PlacedCardRow({
       {tipVisible && (
         <CourseTooltip
           courseId={courseId}
-          info={courseInfoMap[courseId]}
+          info={courseInfoMap[normId(courseId)]}
           style={{
             position: "fixed",
             top: tipPos.top,
@@ -797,10 +1141,10 @@ function PlacedCardRow({
 
 function QuarterCell({
   qKey, label, dim,
-  courseIds, courseInfoMap, difficultyMap, lockedCourses, onToggleLock, onRemove,
+  courseIds, courseInfoMap, difficultyMap, confidenceMap, lockedCourses, onToggleLock, onRemove,
   prereqWarnings, onDismissWarning,
   removable, onRemoveQuarter,
-  maxUnitsPerQuarter,
+  maxUnitsPerQuarter, coverageTags,
 }: {
   qKey: string;
   label: string;
@@ -808,6 +1152,7 @@ function QuarterCell({
   courseIds: string[];
   courseInfoMap: Record<string, CourseDetail>;
   difficultyMap: Record<string, number>;
+  confidenceMap: Record<string, string>;
   lockedCourses: Set<string>;
   onToggleLock: (id: string) => void;
   onRemove: (id: string, qKey: string) => void;
@@ -816,6 +1161,7 @@ function QuarterCell({
   removable?: boolean;
   onRemoveQuarter?: () => void;
   maxUnitsPerQuarter?: number;
+  coverageTags: Record<string, CoverageTag[]>;
 }) {
   const { setNodeRef, isOver } = useDroppable({
     id: `zone|${qKey}`,
@@ -825,20 +1171,20 @@ function QuarterCell({
   const quarterDiff = calculateQuarterDifficulty(
     courseIds.map((id) => ({
       difficulty_score: difficultyMap[id] ?? null,
-      units: courseInfoMap[id]?.min_units ?? null,
+      units: courseInfoMap[normId(id)]?.min_units ?? null,
     })),
   );
 
   const units = courseIds.reduce(
-    (sum, id) => sum + (courseInfoMap[id]?.min_units ?? 4),
+    (sum, id) => sum + (courseInfoMap[normId(id)]?.min_units ?? 4),
     0,
   );
 
   return (
     <div className={`flex flex-col border-r border-[#2a2a2a] last:border-r-0 ${dim ? "opacity-55" : ""}`}>
       {/* header */}
-      <div className={`flex items-center px-2 h-7 border-b border-[#2a2a2a] shrink-0 bg-[#242424] border-l-2 ${dim ? "border-l-[#FFC72C]/30" : "border-l-[#3b82f6]/40"}`}>
-        <span className={`text-[11px] font-bold tracking-wide ${dim ? "text-[#5a5648]" : "text-[#888]"}`}>
+      <div className={`flex items-center px-2 h-7 border-b border-[#2a2a2a] shrink-0 bg-[#242424] border-l-[3px] ${dim ? "border-l-[#FFC72C]/40" : "border-l-[#3b82f6]/70"}`}>
+        <span className={`text-[12px] font-bold tracking-wide ${dim ? "text-[#6a655a]" : "text-[#a5a5a5]"}`}>
           {label}
         </span>
         {quarterDiff != null && (
@@ -885,8 +1231,10 @@ function QuarterCell({
           ${isOver ? "bg-[#0d1a2d]" : "bg-[#1e1e1e]"}`}
       >
         {courseIds.length === 0 && !isOver && (
-          <div className="m-0.5 flex-1 flex items-center justify-center border border-dashed border-[#2c2c2c] rounded-md">
-            <span className="text-[9px] text-[#3a3a3a] font-medium select-none">Drop courses here</span>
+          <div className="m-0.5 flex-1 flex items-center justify-center border border-dotted border-[#262626] rounded-md">
+            <span className="inline-flex items-center gap-1 rounded-md px-2.5 py-1 text-[10px] font-medium text-[#4a4a4a] hover:text-[#7a7a7a] hover:bg-white/[0.02] cursor-pointer transition-colors select-none">
+              <span className="text-[12px] leading-none">+</span> Add Course
+            </span>
           </div>
         )}
         {courseIds.map((cid) => (
@@ -894,17 +1242,19 @@ function QuarterCell({
             key={cid}
             courseId={cid}
             quarterKey={qKey}
-            title={courseInfoMap[cid]?.title}
-            units={courseInfoMap[cid]?.min_units}
-            level={courseInfoMap[cid]?.course_level}
+            title={courseInfoMap[normId(cid)]?.title}
+            units={courseInfoMap[normId(cid)]?.min_units}
+            level={courseInfoMap[normId(cid)]?.course_level}
             diffScore={difficultyMap[cid] ?? null}
-            gpa={courseInfoMap[cid]?.avg_gpa ?? null}
+            diffConfidence={confidenceMap[cid] ?? null}
+            gpa={courseInfoMap[normId(cid)]?.avg_gpa ?? null}
             isLocked={lockedCourses.has(cid)}
             onToggleLock={onToggleLock}
             onRemove={onRemove}
             courseInfoMap={courseInfoMap}
             prereqWarning={prereqWarnings[cid]}
             onDismissWarning={() => onDismissWarning(cid)}
+            tags={coverageTags[cid]}
           />
         ))}
       </div>
@@ -928,7 +1278,7 @@ function CoursePill({
 }) {
   // Pick-N pools list many courses; keep their codes compact. Everywhere else
   // uses the larger, easier-to-read size.
-  const codeSize = compact ? "text-[9px]" : "text-[11px]";
+  const codeSize = compact ? "text-[10px]" : "text-[16px]";
 
   const { attributes, listeners, setNodeRef, transform, isDragging } = useDraggable({
     id: `sidebar|${courseId}`,
@@ -950,7 +1300,7 @@ function CoursePill({
     return (
       <div
         title={`${tooltip} — satisfied by AP credit`}
-        className="flex items-center gap-1 rounded-full px-2.5 py-1 bg-emerald-950/40 border border-emerald-700/40 min-w-0 overflow-hidden"
+        className="flex items-center gap-1 rounded-full px-3 py-1.5 bg-emerald-950/40 border border-emerald-700/40 min-w-0 overflow-hidden"
       >
         {dot}
         <span className={`${codeSize} font-medium leading-none truncate text-emerald-400`}>{courseId}</span>
@@ -963,7 +1313,7 @@ function CoursePill({
     return (
       <div
         title={tooltip}
-        className="flex items-center justify-center rounded-full px-2.5 py-1 bg-[#3b82f6]/20 border border-[#3b82f6]/35 min-w-0 overflow-hidden"
+        className="flex items-center justify-center rounded-full px-3 py-1.5 bg-[#3b82f6]/20 border border-[#3b82f6]/35 min-w-0 overflow-hidden"
       >
         {dot}
         <span className={`${codeSize} font-medium leading-none truncate text-[#93c5fd]`}>
@@ -980,7 +1330,7 @@ function CoursePill({
       {...listeners}
       {...attributes}
       title={tooltip}
-      className={`flex items-center justify-center rounded-full px-2.5 py-1 border cursor-grab active:cursor-grabbing select-none transition-colors min-w-0 overflow-hidden
+      className={`flex items-center justify-center rounded-full px-3 py-1.5 border cursor-grab active:cursor-grabbing select-none transition-colors min-w-0 overflow-hidden
         ${unavailable
           ? "border-dashed border-[#252525] bg-transparent"
           : isDragging
@@ -1018,7 +1368,7 @@ function RequirementGroup({
     return req.courses.filter(
       (cid) =>
         cid.toLowerCase().includes(q) ||
-        (courseInfoMap[cid]?.title ?? "").toLowerCase().includes(q),
+        (courseInfoMap[normId(cid)]?.title ?? "").toLowerCase().includes(q),
     );
   }, [req.courses, searchQuery, courseInfoMap]);
 
@@ -1035,10 +1385,10 @@ function RequirementGroup({
     >
       <button
         onClick={() => setOpen((o) => !o)}
-        className="w-full flex items-center px-2.5 py-2 hover:bg-[#1c1c1c] transition-colors text-left gap-2 bg-[#141414]"
+        className="w-full flex items-center px-2.5 py-3 hover:bg-[#1c1c1c] transition-colors text-left gap-2 bg-[#141414]"
       >
         <div className="flex-1 min-w-0">
-          <span className="text-[12px] font-normal text-[#ccc] block truncate">
+          <span className="text-[13px] font-normal text-[#ccc] block truncate">
             {req.group_name}
           </span>
           {req.courses_needed < req.courses.length && (
@@ -1055,16 +1405,16 @@ function RequirementGroup({
         </div>
       </button>
       {open && (
-        <div className="grid grid-cols-3 gap-1.5 p-2 bg-[#0f0f0f]">
+        <div className="grid [grid-template-columns:repeat(auto-fill,minmax(80px,1fr))] gap-1.5 p-2 bg-[#0f0f0f]">
           {filtered.map((cid) => (
             <CoursePill
               key={cid}
               courseId={cid}
-              title={courseInfoMap[cid]?.title}
-              units={courseInfoMap[cid]?.min_units}
+              title={courseInfoMap[normId(cid)]?.title}
+              units={courseInfoMap[normId(cid)]?.min_units}
               isPlaced={placedSet.has(normId(cid))}
               isApCredit={apCreditedSet.has(cid)}
-              unavailable={!courseInfoMap[cid]}
+              unavailable={!courseInfoMap[normId(cid)]}
               diffScore={difficultyMap[cid] ?? null}
               compact={req.courses_needed < req.courses.length}
             />
@@ -1092,7 +1442,7 @@ function FlatGroup({
     if (!searchQuery) return req.courses;
     const q = searchQuery.toLowerCase();
     return req.courses.filter(
-      (cid) => cid.toLowerCase().includes(q) || (courseInfoMap[cid]?.title ?? "").toLowerCase().includes(q),
+      (cid) => cid.toLowerCase().includes(q) || (courseInfoMap[normId(cid)]?.title ?? "").toLowerCase().includes(q),
     );
   }, [req.courses, searchQuery, courseInfoMap]);
 
@@ -1119,11 +1469,11 @@ function FlatGroup({
           <CoursePill
             key={cid}
             courseId={cid}
-            title={courseInfoMap[cid]?.title}
-            units={courseInfoMap[cid]?.min_units}
+            title={courseInfoMap[normId(cid)]?.title}
+            units={courseInfoMap[normId(cid)]?.min_units}
             isPlaced={placedSet.has(normId(cid))}
             isApCredit={apCreditedSet.has(cid)}
-            unavailable={!courseInfoMap[cid]}
+            unavailable={!courseInfoMap[normId(cid)]}
             diffScore={difficultyMap[cid] ?? null}
           />
         ))}
@@ -1213,12 +1563,16 @@ function BucketSection({
 // ── GE section ─────────────────────────────────────────────────────────────────
 
 function GESection({
-  req, placedSet, apCreditedSet, apSatisfiedGEs, courseInfoMap, difficultyMap, searchQuery, initialOpen, getCoverage,
+  req, placedSet, apCreditedSet, apSatisfiedGEs, extraSatisfied, courseInfoMap, difficultyMap, searchQuery, initialOpen, getCoverage,
 }: {
   req: ReqGroup;
   placedSet: Set<string>;
   apCreditedSet: Set<string>;
   apSatisfiedGEs: Set<string>;
+  // Satisfied outside a placed course by a non-AP source (e.g. the language
+  // requirement checkbox). Marks the category complete but shows no AP badge —
+  // identical to having a course placed for it.
+  extraSatisfied?: boolean;
   courseInfoMap: Record<string, CourseDetail>;
   difficultyMap: Record<string, number>;
   searchQuery: string;
@@ -1233,7 +1587,7 @@ function GESection({
     return req.courses.filter(
       (cid) =>
         cid.toLowerCase().includes(q) ||
-        (courseInfoMap[cid]?.title ?? "").toLowerCase().includes(q),
+        (courseInfoMap[normId(cid)]?.title ?? "").toLowerCase().includes(q),
     );
   }, [req.courses, searchQuery, courseInfoMap]);
 
@@ -1241,10 +1595,12 @@ function GESection({
 
   // AP exam directly satisfies this GE category (e.g. AP World History → GE-VIII)
   const apDirect = apSatisfiedGEs.has(req.requirement_group ?? "");
+  // Satisfied without a course (AP badge only for the AP source).
+  const directDone = apDirect || !!extraSatisfied;
 
   const cov = getCoverage(req);
-  const satisfied = apDirect ? cov.needed : Math.min(cov.placed, cov.needed);
-  const done = apDirect ? true : cov.done;
+  const satisfied = directDone ? cov.needed : Math.min(cov.placed, cov.needed);
+  const done = directDone ? true : cov.done;
   const partial = !done && satisfied > 0;
   const accentColor = done ? "#22c55e" : partial ? "#3b82f6" : "transparent";
 
@@ -1278,16 +1634,16 @@ function GESection({
         </div>
       </button>
       {open && (
-        <div className="grid grid-cols-3 gap-1 p-1.5 bg-[#0f0f0f] max-h-[300px] overflow-y-auto">
+        <div className="grid [grid-template-columns:repeat(auto-fill,minmax(80px,1fr))] gap-1 p-1.5 bg-[#0f0f0f] max-h-[300px] overflow-y-auto">
           {filtered.map((cid) => (
             <CoursePill
               key={cid}
               courseId={cid}
-              title={courseInfoMap[cid]?.title}
-              units={courseInfoMap[cid]?.min_units}
+              title={courseInfoMap[normId(cid)]?.title}
+              units={courseInfoMap[normId(cid)]?.min_units}
               isPlaced={placedSet.has(normId(cid))}
               isApCredit={apCreditedSet.has(cid)}
-              unavailable={!courseInfoMap[cid]}
+              unavailable={!courseInfoMap[normId(cid)]}
               diffScore={difficultyMap[cid] ?? null}
             />
           ))}
@@ -1301,10 +1657,13 @@ function GESection({
 
 function APCreditsMenu({
   apScores, setApScores, apExamNames,
+  languageReqSatisfied, setLanguageReqSatisfied,
 }: {
   apScores: Record<string, number>;
   setApScores: React.Dispatch<React.SetStateAction<Record<string, number>>>;
   apExamNames: string[];
+  languageReqSatisfied: boolean;
+  setLanguageReqSatisfied: React.Dispatch<React.SetStateAction<boolean>>;
 }) {
   const [open, setOpen] = useState(false);
   const [query, setQuery] = useState("");
@@ -1355,6 +1714,31 @@ function APCreditsMenu({
             <p className="text-[9.5px] text-[#666] mt-0.5 leading-snug">
               Add your scores so satisfied courses are pre-filled.
             </p>
+          </div>
+          <div className="px-2.5 pt-2.5">
+            <button
+              onClick={() => setLanguageReqSatisfied((v) => !v)}
+              className="w-full flex items-start gap-2 rounded border border-[#2a2a2a] bg-[#141414] px-2 py-1.5 text-left hover:border-[#3a3a3a] transition-colors"
+            >
+              <span
+                className={`mt-[1px] w-3.5 h-3.5 shrink-0 rounded-[3px] border flex items-center justify-center transition-colors
+                  ${languageReqSatisfied
+                    ? "bg-[#3b82f6] border-[#3b82f6]"
+                    : "border-[#3a3a3a] bg-[#1a1a1a]"}`}
+              >
+                {languageReqSatisfied && (
+                  <svg viewBox="0 0 12 12" className="w-2.5 h-2.5" fill="none">
+                    <path d="M2.5 6l2.5 2.5 4.5-5" stroke="white" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round"/>
+                  </svg>
+                )}
+              </span>
+              <span className="min-w-0">
+                <span className="text-[10px] text-[#ccc] leading-tight block">Language requirement satisfied</span>
+                <span className="text-[9px] text-[#666] leading-snug block mt-0.5">
+                  e.g. via heritage language, placement test, or high school equivalent
+                </span>
+              </span>
+            </button>
           </div>
           <div className="px-2.5 pt-2">
             <input
@@ -1597,7 +1981,30 @@ export default function PlannerClient() {
   const [loadingMinorReqs, setLoadingMinorReqs] = useState(false);
 
   // ── UI state ───────────────────────────────────────────────────────────────
-  const [sidebarTab, setSidebarTab] = useState<"major" | "ge" | "minor">("major");
+  const [sidebarTab, setSidebarTab] = useState<"major" | "ge" | "minor" | "help">("major");
+  // Resizable sidebar width (px). Persists for the session; clamped on drag.
+  const SIDEBAR_MIN = 220;
+  const SIDEBAR_MAX = 480;
+  const [sidebarWidth, setSidebarWidth] = useState(280);
+  const startSidebarResize = useCallback((e: React.PointerEvent) => {
+    e.preventDefault();
+    const startX = e.clientX;
+    const startW = sidebarWidth;
+    const onMove = (ev: PointerEvent) => {
+      const next = Math.min(SIDEBAR_MAX, Math.max(SIDEBAR_MIN, startW + ev.clientX - startX));
+      setSidebarWidth(next);
+    };
+    const onUp = () => {
+      window.removeEventListener("pointermove", onMove);
+      window.removeEventListener("pointerup", onUp);
+      document.body.style.cursor = "";
+      document.body.style.userSelect = "";
+    };
+    document.body.style.cursor = "col-resize";
+    document.body.style.userSelect = "none";
+    window.addEventListener("pointermove", onMove);
+    window.addEventListener("pointerup", onUp);
+  }, [sidebarWidth]);
   const [selectedDisplayName, setSelectedDisplayName] = useState("");
   const [selectedMajorId, setSelectedMajorId] = useState("");
   const [selectedMinorId, setSelectedMinorId] = useState("");
@@ -1607,18 +2014,37 @@ export default function PlannerClient() {
   const [activeData, setActiveData] = useState<DragData | null>(null);
   const [loadingReqs, setLoadingReqs] = useState(false);
   const [summerYears, setSummerYears] = useState<Set<number>>(new Set());
+  const [collapsedYears, setCollapsedYears] = useState<Set<number>>(new Set());
+  const toggleYearCollapse = useCallback((year: number) => {
+    setCollapsedYears((prev) => {
+      const next = new Set(prev);
+      if (next.has(year)) next.delete(year);
+      else next.add(year);
+      return next;
+    });
+  }, []);
+  // Portal target inside the global Navbar; page-level actions render here.
+  const [navActionsSlot, setNavActionsSlot] = useState<HTMLElement | null>(null);
+  useEffect(() => { setNavActionsSlot(document.getElementById("navbar-actions")); }, []);
   const [lockedCourses, setLockedCourses] = useState<Set<string>>(new Set());
   const [searchQuery, setSearchQuery] = useState("");
   const [autoFillLoading, setAutoFillLoading] = useState(false);
   const [optimizeLoading, setOptimizeLoading] = useState(false);
   const [toast, setToast] = useState<string | null>(null);
   const [prereqWarnings, setPrereqWarnings] = useState<Record<string, string>>({});
+  // Coverage pills for cross-covering autofilled courses (ephemeral — recomputed
+  // on each autofill, auto-pruned when a course leaves the plan; not persisted).
+  const [coverageTags, setCoverageTags] = useState<Record<string, CoverageTag[]>>({});
   const [difficultyMap, setDifficultyMap] = useState<Record<string, number>>({});
+  // course_id -> "high" | "medium" | "low": which signals backed the difficulty score.
+  const [confidenceMap, setConfidenceMap] = useState<Record<string, string>>({});
   const [optimizerOnline, setOptimizerOnline] = useState<boolean | null>(null);
   const [apScores, setApScores] = useState<Record<string, number>>({});
   const [apExamNames, setApExamNames] = useState<string[]>([]);
   const [apCreditedSet, setApCreditedSet] = useState<Set<string>>(new Set());
   const [apSatisfiedGEs, setApSatisfiedGEs] = useState<Set<string>>(new Set());
+  // Language Other Than English (GE VI) satisfied outside a placed course.
+  const [languageReqSatisfied, setLanguageReqSatisfied] = useState(false);
   const [showClearConfirm, setShowClearConfirm] = useState(false);
   const [lockConflictErrors, setLockConflictErrors] = useState<string[] | null>(null);
   const [pendingLock, setPendingLock] = useState<{ courseId: string; warnings: string[] } | null>(null);
@@ -1664,7 +2090,7 @@ export default function PlannerClient() {
   const totalUnits = useMemo(
     () =>
       Object.values(plannedCourses).reduce(
-        (sum, ids) => sum + ids.reduce((s, id) => s + (courseInfoMap[id]?.min_units ?? 4), 0),
+        (sum, ids) => sum + ids.reduce((s, id) => s + (courseInfoMap[normId(id)]?.min_units ?? 4), 0),
         0,
       ),
     [plannedCourses, courseInfoMap],
@@ -1825,6 +2251,7 @@ export default function PlannerClient() {
       if (!res.ok) return;
       const d = await res.json();
       if (d?.scores) setDifficultyMap((prev) => ({ ...prev, ...d.scores }));
+      if (d?.confidence) setConfidenceMap((prev) => ({ ...prev, ...d.confidence }));
     } catch {}
   }, []);
 
@@ -1839,6 +2266,7 @@ export default function PlannerClient() {
     setMaxUnits(plan.maxUnits);
     setLockedCourses(new Set(plan.lockedCourses));
     setApScores(plan.apScores);
+    setLanguageReqSatisfied(plan.languageReqSatisfied ?? false);
     setSummerYears(new Set(plan.summerYears));
   }, []);
 
@@ -1874,27 +2302,47 @@ export default function PlannerClient() {
         maxUnits,
         lockedCourses: [...lockedCourses],
         apScores,
+        languageReqSatisfied,
         summerYears: [...summerYears],
       }).catch(() => {});
     }, 500);
     return () => { if (saveTimerRef.current) clearTimeout(saveTimerRef.current); };
-  }, [plannedCourses, selectedMajorId, selectedDisplayName, selectedMinorId, numYears, gradQuarter, maxUnits, lockedCourses, apScores, summerYears]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [plannedCourses, selectedMajorId, selectedDisplayName, selectedMinorId, numYears, gradQuarter, maxUnits, lockedCourses, apScores, languageReqSatisfied, summerYears]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // ── Auto-fetch details for placed courses not in courseInfoMap ────────────
   useEffect(() => {
-    const placed = [...new Set(Object.values(plannedCourses).flat())];
+    // Normalize planned IDs to canonical form so non-canonical entries (spaced
+    // "MATH 1B", aliases like "CSE31") both hit the courseInfoMap key space AND
+    // fetch against the canonical courses.id in the DB.
+    const placed = [...new Set(Object.values(plannedCourses).flat().map(normId))];
     const missing = placed.filter((id) => !courseInfoMapRef.current[id]);
     if (missing.length === 0) return;
     fetchCourseDetails(missing).then((details) => {
       if (!details.length) return;
       setCourseInfoMap((prev) => {
         const next = { ...prev };
-        for (const c of details) next[c.id] = c;
+        for (const c of details) next[normId(c.id)] = c;
         return next;
       });
       fetchDifficulties(missing);
     }).catch(() => {});
   }, [plannedCourses, fetchDifficulties]);
+
+  // ── Prune coverage pills for courses no longer in the plan ────────────────
+  // Keeps tags in sync when a course is moved out / removed manually. Tags set
+  // immediately after an autofill survive because the new plan still holds them.
+  useEffect(() => {
+    const placedNow = new Set(Object.values(plannedCourses).flat());
+    setCoverageTags((prev) => {
+      let changed = false;
+      const next: Record<string, CoverageTag[]> = {};
+      for (const [id, t] of Object.entries(prev)) {
+        if (placedNow.has(id)) next[id] = t;
+        else changed = true;
+      }
+      return changed ? next : prev;
+    });
+  }, [plannedCourses]);
 
   // ── Global course search (any course, not just requirements) ──────────────
   useEffect(() => {
@@ -1905,7 +2353,7 @@ export default function PlannerClient() {
         const qNorm = q.replace(/\s+/g, "").toUpperCase();
         const { data } = await supabase
           .from("courses")
-          .select("id, title, min_units, description, course_level, terms, avg_gpa")
+          .select("id, title, min_units, description, course_level, terms, avg_gpa, ge_list")
           .or(`id.ilike.${qNorm}%,title.ilike.%${q}%`)
           .limit(20);
         const results = (data ?? []) as CourseDetail[];
@@ -1913,7 +2361,7 @@ export default function PlannerClient() {
         if (results.length > 0) {
           setCourseInfoMap((prev) => {
             const next = { ...prev };
-            for (const c of results) next[c.id] = c;
+            for (const c of results) next[normId(c.id)] = c;
             return next;
           });
           fetchDifficulties(results.map((c) => c.id));
@@ -1967,7 +2415,7 @@ export default function PlannerClient() {
         const details = await fetchCourseDetails(allIds);
         setCourseInfoMap((prev) => {
           const next = { ...prev };
-          for (const c of details) next[c.id] = c;
+          for (const c of details) next[normId(c.id)] = c;
           return next;
         });
         fetchDifficulties(allIds);
@@ -1994,7 +2442,7 @@ export default function PlannerClient() {
         const details = await fetchCourseDetails(allIds);
         setCourseInfoMap((prev) => {
           const next = { ...prev };
-          for (const c of details) next[c.id] = c;
+          for (const c of details) next[normId(c.id)] = c;
           return next;
         });
         fetchDifficulties(allIds);
@@ -2018,7 +2466,7 @@ export default function PlannerClient() {
         const details = await fetchCourseDetails(allIds);
         setCourseInfoMap((prev) => {
           const next = { ...prev };
-          for (const c of details) next[c.id] = c;
+          for (const c of details) next[normId(c.id)] = c;
           return next;
         });
         fetchDifficulties(allIds);
@@ -2083,11 +2531,11 @@ export default function PlannerClient() {
     const res = await saveNamedPlan(name, {
       plannedCourses, selectedMajorId, selectedDisplayName, selectedMinorId,
       numYears, gradQuarter, maxUnits,
-      lockedCourses: [...lockedCourses], apScores, summerYears: [...summerYears],
+      lockedCourses: [...lockedCourses], apScores, languageReqSatisfied, summerYears: [...summerYears],
     });
     if (res.ok) listNamedPlans().then(setSavedPlans).catch(() => {});
     return res.ok ? { ok: true } : { ok: false, reason: res.reason };
-  }, [plannedCourses, selectedMajorId, selectedDisplayName, selectedMinorId, numYears, gradQuarter, maxUnits, lockedCourses, apScores, summerYears]);
+  }, [plannedCourses, selectedMajorId, selectedDisplayName, selectedMinorId, numYears, gradQuarter, maxUnits, lockedCourses, apScores, languageReqSatisfied, summerYears]);
 
   const handleLoadNamed = useCallback(async (id: number) => {
     const plan = await loadPlanById(id);
@@ -2122,11 +2570,11 @@ export default function PlannerClient() {
           const ids = plannedCourses[qkey(y, s.key)] ?? [];
           return {
             label: s.label,
-            units: ids.reduce((sum, id) => sum + (courseInfoMap[id]?.min_units ?? 4), 0),
+            units: ids.reduce((sum, id) => sum + (courseInfoMap[normId(id)]?.min_units ?? 4), 0),
             courses: ids.map((id) => ({
               code: id,
-              title: courseInfoMap[id]?.title ?? null,
-              units: courseInfoMap[id]?.min_units ?? null,
+              title: courseInfoMap[normId(id)]?.title ?? null,
+              units: courseInfoMap[normId(id)]?.min_units ?? null,
               difficulty: difficultyMap[id] ?? null,
             })),
           };
@@ -2351,6 +2799,793 @@ export default function PlannerClient() {
     });
   }, []);
 
+  // GE categories an ALREADY-PLACED course counts toward. Autofilled cards keep
+  // their (capped) GE pills as the source of truth; everything else falls back
+  // to authoritative ge_list. Keeps the "filled" tally consistent with pills.
+  const placedGECats = useCallback(
+    (id: string, groups: ReqGroup[]): string[] => {
+      const t = coverageTags[id];
+      if (t && t.some((x) => x.kind === "ge")) {
+        return t
+          .filter((x): x is Extract<CoverageTag, { kind: "ge" }> => x.kind === "ge")
+          .map((x) => GE_LABEL_TO_GROUP[x.code] ?? "")
+          .filter((g) => g && groups.some((r) => (r.requirement_group ?? "") === g));
+      }
+      return getCourseGECategories(courseInfoMapRef.current[normId(id)], groups);
+    },
+    [coverageTags],
+  );
+
+  // ── Unified pool → /api/whatif optimizer ────────────────────────────────
+  // Shared by all three autofill tabs: pool = unlocked existing + the tab's new
+  // picks + auto-pulled missing prereqs; sent to /api/whatif so the real
+  // optimizer handles difficulty balancing, prereq ordering, and term
+  // availability. Locked courses never move. On infeasible/error the current
+  // schedule is left untouched.
+  const buildAndOptimizePool = useCallback(
+    async (
+      newPicks: string[],
+      newTags: Record<string, CoverageTag[]> = {},
+      // Picks the overflow trim (d.3) protects from being dropped — kept over
+      // pick-N / injected courses when the pool can't fit the grid. Minor
+      // autofill passes its REQUIRED (non-pick-N) courses here.
+      protectedPicks: string[] = [],
+    ) => {
+      // AP-credited courses are already satisfied (no quarter, never placeable);
+      // they must never enter the pool or lockedMap — they're passed to the
+      // optimizer as completed_courses instead.
+      const apNorm = new Set([...apCreditedSet].map(normId));
+      // Earned AP scores keyed by UPPERCASED exam name, so the prereq closure can
+      // tell whether an exam-gated OR branch is actually satisfied (vs. assuming
+      // every exam is earned, which diverged from the backend).
+      const examScores = new Map<string, number>();
+      for (const [name, score] of Object.entries(apScores)) examScores.set(name.trim().toUpperCase(), score);
+
+      // (a) unlocked existing + locked positions (AP-credited courses excluded).
+      const lockedMap: Record<string, string> = {};
+      const unlockedExisting: string[] = [];
+      for (const [q, ids] of Object.entries(plannedCourses))
+        for (const id of ids) {
+          if (apNorm.has(normId(id))) continue;
+          if (lockedCourses.has(id)) lockedMap[id] = q;
+          else unlockedExisting.push(id);
+        }
+
+      // (b) merge with new picks (dedupe by normalized id; AP-credited excluded).
+      const seenNorm = new Set<string>();
+      const pool: string[] = [];
+      for (const id of [...unlockedExisting, ...newPicks]) {
+        const nn = normId(id);
+        if (apNorm.has(nn)) continue;
+        if (seenNorm.has(nn)) continue;
+        seenNorm.add(nn);
+        pool.push(id);
+      }
+
+      // (c) inject missing prereqs (transitive). have = pool ∪ locked ∪ AP.
+      const have = new Set<string>([...pool.map(normId), ...Object.keys(lockedMap).map(normId), ...apNorm]);
+      let trees = await fetchPrereqTrees(pool); // ← prereq fetch #1
+      let frontier = [...pool];
+      let guard = 0;
+      while (frontier.length && guard++ < 20) {
+        const missing: string[] = [];
+        for (const cid of frontier) {
+          const tree = trees[cid] ?? trees[normId(cid)];
+          if (!tree) continue;
+          for (const m of requiredMissingCourses(tree, have, examScores)) {
+            const nn = normId(m);
+            if (!have.has(nn)) { have.add(nn); missing.push(m); pool.push(m); }
+          }
+        }
+        if (missing.length === 0) break;
+        trees = { ...trees, ...(await fetchPrereqTrees(missing)) }; // ← prereq fetch #2 (closure loop)
+        frontier = missing;
+      }
+
+      if (pool.length === 0) {
+        setToast("Nothing to schedule — everything is locked or already placed.");
+        return;
+      }
+
+      // (d) payload plan: ALL grid quarters as keys (whatif only redistributes
+      // among quarters present in the plan). Locked courses stay put; unlocked
+      // pool courses are distributed round-robin under the unit cap with a
+      // topological pass (a course never seeds before an in-pool prereq) — this
+      // gives the optimizer a feasible starting state instead of one stuffed
+      // quarter.
+      const quarters: string[] = [];
+      for (let y = 1; y <= numYears; y++) {
+        for (const s of ["fall", "winter", "spring"]) quarters.push(qkey(y, s));
+        if (summerYears.has(y)) quarters.push(qkey(y, "summer"));
+      }
+      const planned_courses: Record<string, string[]> = {};
+      for (const q of quarters) planned_courses[q] = [];
+      const quarterUnits = new Array(quarters.length).fill(0);
+      const qIndex = new Map(quarters.map((q, i) => [q, i] as const));
+      const unitsOf = (id: string) => courseInfoMapRef.current[normId(id)]?.min_units ?? 4;
+
+      // Locked courses stay in their quarters; count their units against them.
+      for (const [cid, q] of Object.entries(lockedMap)) {
+        (planned_courses[q] ??= []).push(cid);
+        const i = qIndex.get(q);
+        if (i != null) quarterUnits[i] += unitsOf(cid);
+      }
+
+      // In-pool prereqs of a course (course-leaves of its tree that are in the pool).
+      const poolNorm = new Set(pool.map(normId));
+      const prereqsInPool = (id: string): string[] =>
+        collectPrereqCourseLeaves(trees[id] ?? trees[normId(id)]).filter(
+          (p) => poolNorm.has(normId(p)) && normId(p) !== normId(id),
+        );
+      // In-pool coreq:true partners of a course (its tree's coreq leaves).
+      const coreqPartnersInPool = (id: string): string[] =>
+        collectCoreqCourseLeaves(trees[id] ?? trees[normId(id)]).filter(
+          (p) => poolNorm.has(normId(p)) && normId(p) !== normId(id),
+        );
+
+      // FIX B — genuine bidirectional coreq pairs. The prerequisite_tree stores
+      // coreq edges one-directionally (and not at all for lab rows), so a tree
+      // coreq:true edge alone can't tell a true lecture↔lab coreq (MATH105A ↔
+      // MATH105LA) from a "prerequisite or concurrent" edge (CHEM1A → MATH2A).
+      // The authoritative signal is the `corequisites` field being MUTUAL: A
+      // lists B and B lists A. Only those pairs get forced same-quarter; the
+      // unidirectional edges merely contribute a same-quarter floor (below).
+      const coreqText = await fetchCorequisites(pool);
+      const COURSE_TOKEN_RE = /[A-Z][A-Z&]*(?:\s+[A-Z][A-Z&]*)*\s+\d+[A-Z]*/g;
+      const fieldRefs = (id: string): Set<string> => {
+        const text = coreqText[id] ?? coreqText[normId(id)] ?? "";
+        const out = new Set<string>();
+        for (const m of text.toUpperCase().matchAll(COURSE_TOKEN_RE)) {
+          const nn = normId(m[0]);
+          if (poolNorm.has(nn) && nn !== normId(id)) out.add(nn);
+        }
+        return out;
+      };
+      const refsByNorm = new Map<string, Set<string>>();
+      for (const c of pool) refsByNorm.set(normId(c), fieldRefs(c));
+      const bidirKey = (a: string, b: string) => [a, b].sort().join("|");
+      const bidirSet = new Set<string>();
+      for (const a of pool) {
+        const an = normId(a);
+        for (const bn of refsByNorm.get(an) ?? [])
+          if (refsByNorm.get(bn)?.has(an)) bidirSet.add(bidirKey(an, bn));
+      }
+      const isBidirCoreq = (a: string, b: string) => bidirSet.has(bidirKey(normId(a), normId(b)));
+
+      // Topological order: prereqs before dependents.
+      const ordered: string[] = [];
+      const seenTopo = new Set<string>();
+      const visit = (id: string, stack: Set<string>) => {
+        const nn = normId(id);
+        if (seenTopo.has(nn) || stack.has(nn)) return;
+        stack.add(nn);
+        for (const p of prereqsInPool(id)) {
+          const dep = pool.find((x) => normId(x) === normId(p));
+          if (dep) visit(dep, stack);
+        }
+        stack.delete(nn);
+        if (!seenTopo.has(nn)) { seenTopo.add(nn); ordered.push(id); }
+      };
+      for (const c of pool) visit(c, new Set());
+
+      // Prereq floor: latest quarter that gates this course.
+      //  • strict prereq → must come strictly AFTER  ⇒ floor ≥ prereqIdx + 1
+      //  • coreq:true    → may share the SAME quarter ⇒ floor ≥ prereqIdx (FIX A)
+      // The coreq term only raises the dependent's floor; it never moves the
+      // partner. So "prereq-or-concurrent" edges just push the dependent to its
+      // partner's quarter or later — the partner is never dragged forward.
+      const assignedIdx = new Map<string, number>();
+      // OR-aware in-pool prereqs of a course: the representative course set
+      // requiredMissingCourses would inject against AP-only (every AND course
+      // leaf plus the first option of each unsatisfied OR), restricted to the
+      // pool, with same-quarter coreq partners removed (those are a same-quarter
+      // floor, not a strict-before one). Hoisted here so floorOf, the d.2
+      // re-placement, and earlyFloorPreferred all share one definition.
+      const orPrereqsInPool = (id: string): string[] => {
+        const tree = trees[id] ?? trees[normId(id)];
+        if (!tree) return [];
+        const coreqs = new Set(coreqPartnersInPool(id).map(normId));
+        return requiredMissingCourses(tree, new Set(apNorm), examScores).filter(
+          (p) => poolNorm.has(normId(p)) && normId(p) !== normId(id) && !coreqs.has(normId(p)),
+        );
+      };
+      // Earliness bias (seed preference, NOT a hard constraint): drop the
+      // same-quarter coreq floor term ONLY for a true ROOT course — one with no
+      // in-pool prerequisites at all: no OR-aware strict/representative prereq
+      // (orPrereqsInPool empty) AND no in-pool coreq partner. A course with ANY
+      // in-pool dependency (strict OR coreq) keeps the full prereq + coreq floor,
+      // so it can never seed ahead of a prereq it can only satisfy via a coreq
+      // edge (e.g. CHEM1A, whose only in-pool satisfier is the coreq PHYSICS 7C /
+      // MATH 2A). Note orPrereqsInPool excludes coreq partners, so the coreq
+      // check is required in addition for the predicate to mean "no deps at all".
+      const earlyFloorPreferred = (id: string): boolean =>
+        orPrereqsInPool(id).length === 0 && coreqPartnersInPool(id).length === 0;
+      const floorOf = (c: string): number => {
+        let floor = 0;
+        for (const p of prereqsInPool(c)) {
+          const pi = assignedIdx.get(normId(p));
+          if (pi != null) floor = Math.max(floor, pi + 1);
+        }
+        if (!earlyFloorPreferred(c)) {
+          for (const p of coreqPartnersInPool(c)) {
+            const pi = assignedIdx.get(normId(p));
+            if (pi != null) floor = Math.max(floor, pi);
+          }
+        }
+        return floor;
+      };
+      // Two-pass seed (spread across the full grid; never overload the front).
+      // Pass 1: in topological order, place each course in the EARLIEST quarter
+      // that is both at/after its prereq floor and under the unit cap. A course
+      // that finds no under-cap quarter at/after its floor is deferred — it is
+      // NOT overloaded onto an early quarter here.
+      const deferred: string[] = [];
+      for (const c of ordered) {
+        const u = unitsOf(c);
+        const floor = Math.min(floorOf(c), quarters.length - 1);
+        let chosen = -1;
+        for (let i = floor; i < quarters.length; i++) {
+          if (quarterUnits[i] + u <= maxUnits) { chosen = i; break; }
+        }
+        if (chosen === -1) { deferred.push(c); continue; }
+        planned_courses[quarters[chosen]].push(c);
+        quarterUnits[chosen] += u;
+        assignedIdx.set(normId(c), chosen);
+      }
+      // Pass 2: place each deferred (overloaded) course by scanning FORWARD from
+      // its floor toward the end of the grid for the first under-cap quarter, so
+      // overflow lands in later / still-empty quarters instead of overloading the
+      // front. If the whole tail is full, spread the overflow onto the LEAST-
+      // loaded quarter at/after the floor (FIX A) instead of dumping every
+      // deferred course onto the last quarter — that kept the front clean but
+      // stacked all overflow into one 32+ unit quarter that whatif rejects.
+      for (const c of deferred) {
+        const u = unitsOf(c);
+        const floor = Math.min(floorOf(c), quarters.length - 1);
+        let chosen = -1;
+        for (let i = floor; i < quarters.length; i++) {
+          if (quarterUnits[i] + u <= maxUnits) { chosen = i; break; }
+        }
+        if (chosen === -1) {
+          // No under-cap quarter at/after the floor → minimum-load quarter at/
+          // after the floor (spread overflow as evenly as possible). The floor
+          // is clamped to a valid index above, so this loop always finds one.
+          for (let i = floor; i < quarters.length; i++) {
+            if (chosen === -1 || quarterUnits[i] < quarterUnits[chosen]) chosen = i;
+          }
+          if (chosen === -1) chosen = quarters.length - 1; // no slot at/after floor at all
+        }
+        planned_courses[quarters[chosen]].push(c);
+        quarterUnits[chosen] += u;
+        assignedIdx.set(normId(c), chosen);
+      }
+
+      // Enforce "course strictly after every in-pool prereq", iterating until
+      // stable so a move cascades to that course's own dependents. (Whenever the
+      // grid has room this guarantees prereqQuarter + 1; a course can only stay
+      // put if its prereq is already in the last quarter — genuine window-too-
+      // short, surfaced later by validation.)
+      let changed = true;
+      let safety = 0;
+      const maxIter = (ordered.length + 1) * (quarters.length + 1);
+      while (changed && safety++ < maxIter) {
+        changed = false;
+        for (const c of ordered) {
+          const floor = floorOf(c);
+          if (floor > quarters.length - 1) continue; // can't fit after prereq in this grid
+          const cur = assignedIdx.get(normId(c));
+          if (cur == null || cur >= floor) continue;
+          const u = unitsOf(c);
+          let target = -1;
+          for (let i = floor; i < quarters.length; i++) {
+            if (quarterUnits[i] + u <= maxUnits) { target = i; break; }
+          }
+          if (target === -1) target = floor;
+          if (target === cur) continue;
+          planned_courses[quarters[cur]] = planned_courses[quarters[cur]].filter((x) => x !== c);
+          quarterUnits[cur] -= u;
+          planned_courses[quarters[target]].push(c);
+          quarterUnits[target] += u;
+          assignedIdx.set(normId(c), target);
+          changed = true;
+        }
+      }
+
+      // (d.1) Coreq alignment — FIX B: only GENUINE bidirectional coreq pairs
+      // (mutual in the corequisites field, e.g. MATH105A ↔ MATH105LA) are forced
+      // into a single quarter. Unidirectional "prereq-or-concurrent" edges are
+      // NOT aligned here — floorOf already lets the dependent sit in its
+      // partner's quarter or later, so the seed handles them without moving the
+      // partner. To co-locate a pair we move the EARLIER-placed partner UP to the
+      // later one's quarter (FIX A direction): moving a course later never breaks
+      // its own prereqs, and a genuine coreq lab has no dependents — so we never
+      // drag a foundational prereq forward.
+      let coreqChanged = true;
+      let coreqSafety = 0;
+      const coreqMaxIter = (ordered.length + 1) * (quarters.length + 1);
+      while (coreqChanged && coreqSafety++ < coreqMaxIter) {
+        coreqChanged = false;
+        for (const c of ordered) {
+          for (const p of coreqPartnersInPool(c)) {
+            const partner = pool.find((x) => normId(x) === normId(p));
+            if (!partner) continue;
+            if (!isBidirCoreq(c, partner)) continue; // FIX B: bidirectional pairs only
+            const ci = assignedIdx.get(normId(c));
+            const pi = assignedIdx.get(normId(partner));
+            if (ci == null || pi == null || ci === pi) continue;
+            const target = Math.max(ci, pi); // co-locate at the later slot (move earlier UP)
+            const mover = ci < pi ? c : partner;
+            const from = Math.min(ci, pi);
+            const u = unitsOf(mover);
+            planned_courses[quarters[from]] = planned_courses[quarters[from]].filter((x) => x !== mover);
+            quarterUnits[from] -= u;
+            planned_courses[quarters[target]].push(mover);
+            quarterUnits[target] += u;
+            assignedIdx.set(normId(mover), target);
+            coreqChanged = true;
+          }
+        }
+      }
+
+      // (d.2) OR-aware re-placement. Strict (AND) prereqs are floored by Pass 1/
+      // stabilization, but OR-gated representative prereqs (e.g. MATH 1B → MATH2A,
+      // BIO SCI 93 → BIOSCI94) carry no floor (FIX A), so a whole OR-gated chain
+      // can land stacked in one quarter or out of order, and an injected prereq
+      // can sit AFTER its dependent. The previous patch nudged dependents one
+      // inversion at a time, which cascaded a chain toward the empty tail (a
+      // 32-unit final quarter) and emptied the front. Instead we re-derive an
+      // OR-aware floor and re-place every UNLOCKED course topologically from the
+      // front: each course lands in the earliest under-cap quarter at/after all of
+      // its already-placed OR-aware prereqs, so chains spread in order without
+      // overloading the tail. Locked courses keep their quarter and only constrain
+      // capacity. This makes the seed feasible up front instead of patching it.
+      // (orPrereqsInPool is defined above, alongside floorOf/earlyFloorPreferred.)
+
+      // OR-aware floor: strictly after every placed OR-aware prereq; at/after every
+      // placed coreq partner (same quarter allowed). Lower-div / GE courses skip
+      // the coreq term (earliness bias — see earlyFloorPreferred above) so they are
+      // not held back past their strict prereqs; genuine bidirectional coreqs are
+      // still co-located by the group placement below.
+      const orFloorOf = (c: string): number => {
+        let floor = 0;
+        for (const p of orPrereqsInPool(c)) {
+          const pi = assignedIdx.get(normId(p));
+          if (pi != null) floor = Math.max(floor, pi + 1);
+        }
+        if (!earlyFloorPreferred(c)) {
+          for (const p of coreqPartnersInPool(c)) {
+            const pi = assignedIdx.get(normId(p));
+            if (pi != null) floor = Math.max(floor, pi);
+          }
+        }
+        return floor;
+      };
+
+      // Re-pack every unlocked pool course OR-aware-topologically into the grid.
+      // Re-runnable: the (d.3) overflow trim calls it again after dropping a
+      // course so the freed capacity is reused.
+      const repackD2 = () => {
+        // OR-aware topological order (prereqs before dependents); cycle-guarded the
+        // same way as the strict topo order so a representative-first-option loop
+        // (A's OR points at B, B's OR points at A) can't recurse forever. A course's
+        // coreq partners are visited first too: a "prereq-or-concurrent" coreq
+        // (e.g. PHYSICS7C → MATH 2B) carries no OR-aware prereq floor, so unless
+        // the partner is already placed when the dependent lands, orFloorOf's coreq
+        // term sees no index and the dependent can seed BEFORE its partner — a
+        // PREREQ_ORDER violation. Ordering the partner first makes the coreq floor
+        // always apply (genuine bidirectional pairs are still co-located by the
+        // group placement below, so their relative order here is harmless).
+        const orderedOR: string[] = [];
+        const seenOR = new Set<string>();
+        const visitOR = (id: string, stack: Set<string>) => {
+          const nn = normId(id);
+          if (seenOR.has(nn) || stack.has(nn)) return;
+          stack.add(nn);
+          for (const p of orPrereqsInPool(id)) {
+            const dep = pool.find((x) => normId(x) === normId(p));
+            if (dep) visitOR(dep, stack);
+          }
+          for (const p of coreqPartnersInPool(id)) {
+            const partner = pool.find((x) => normId(x) === normId(p));
+            if (partner) visitOR(partner, stack);
+          }
+          stack.delete(nn);
+          if (!seenOR.has(nn)) { seenOR.add(nn); orderedOR.push(id); }
+        };
+        for (const c of pool) visitOR(c, new Set());
+
+        // Clear every unlocked pool course; recompute per-quarter load from the
+        // locked courses that remain, then re-place from a clean slate.
+        for (const q of quarters)
+          planned_courses[q] = planned_courses[q].filter((id) => !poolNorm.has(normId(id)));
+        for (let i = 0; i < quarters.length; i++)
+          quarterUnits[i] = planned_courses[quarters[i]].reduce((s, id) => s + unitsOf(id), 0);
+        assignedIdx.clear();
+
+        // Place each course — or each genuine bidirectional coreq GROUP (a lecture
+        // plus its mutual-coreq partners, e.g. MATH105A + MATH105LA) — in the
+        // earliest quarter at/after the group's OR-aware floor with room for the
+        // WHOLE group under one cap check. Co-locating a pair as a unit avoids the
+        // old failure where the lab was placed separately and then moved up into an
+        // already-full lecture quarter, tipping it 1 unit over the cap. Ordinary
+        // courses are a group of one. Min-load fallback (Pass 2 FIX A) only when the
+        // pool genuinely can't fit the group under the cap at/after its floor.
+        const placedGroup = new Set<string>();
+        for (const c of orderedOR) {
+          if (placedGroup.has(normId(c))) continue;
+          const group = [
+            c,
+            ...pool.filter(
+              (x) => normId(x) !== normId(c) && isBidirCoreq(c, x) && !placedGroup.has(normId(x)),
+            ),
+          ];
+          const gu = group.reduce((s, g) => s + unitsOf(g), 0);
+          let floor = 0;
+          for (const g of group) floor = Math.max(floor, orFloorOf(g));
+          floor = Math.min(floor, quarters.length - 1);
+          let chosen = -1;
+          for (let i = floor; i < quarters.length; i++) {
+            if (quarterUnits[i] + gu <= maxUnits) { chosen = i; break; }
+          }
+          if (chosen === -1) {
+            for (let i = floor; i < quarters.length; i++) {
+              if (chosen === -1 || quarterUnits[i] < quarterUnits[chosen]) chosen = i;
+            }
+            if (chosen === -1) chosen = quarters.length - 1;
+          }
+          for (const g of group) {
+            planned_courses[quarters[chosen]].push(g);
+            quarterUnits[chosen] += unitsOf(g);
+            assignedIdx.set(normId(g), chosen);
+            placedGroup.add(normId(g));
+          }
+        }
+      };
+      repackD2();
+
+      // (d.3) Overflow trim. When the combined pool can't fit the 12-quarter grid
+      // under cap, the floor clamp (Math.min(floor, quarters.length-1)) can pin a
+      // course into the same quarter as — or before — a prerequisite it needs, a
+      // PREREQ_ORDER violation whatif rejects outright (e.g. minor autofill on a
+      // major-filled schedule stacking I&CSCI46 onto its prereqs in the last
+      // quarter). Rather than send an invalid plan, drop the offending courses and
+      // re-pack until the seed is prereq-valid: shed the lowest-priority TRIMMABLE
+      // course first (a freshly-added pick or injected prereq — never a locked or
+      // pre-existing course the user already placed), preferring non-protected
+      // (pick-N / injected) over protected (required) picks, and dropping the
+      // latest-placed candidate so deep-chained tail electives go before earlier
+      // required courses. Feasible seeds have no violation, so the loop is a no-op.
+      const preExistingNorm = new Set(
+        [...unlockedExisting, ...Object.keys(lockedMap)].map(normId),
+      );
+      const protectedNorm = new Set(protectedPicks.map(normId));
+      const isTrimmable = (id: string) => !preExistingNorm.has(normId(id));
+      // x in quarter qi is unsatisfied iff its tree isn't met by AP + everything
+      // strictly before qi + its same-quarter coreqs (mirrors whatif's check).
+      const courseUnsatisfied = (x: string, qi: number): boolean => {
+        const tree = trees[x] ?? trees[normId(x)];
+        if (!tree) return false;
+        const have = new Set<string>(apNorm);
+        for (let i = 0; i < qi; i++)
+          for (const id of planned_courses[quarters[i]]) have.add(normId(id));
+        const xCoreqs = new Set(coreqPartnersInPool(x).map(normId));
+        for (const id of planned_courses[quarters[qi]]) if (xCoreqs.has(normId(id))) have.add(normId(id));
+        return requiredMissingCourses(tree, have, examScores).length > 0;
+      };
+      const hasPrereqViolation = (): boolean => {
+        for (let qi = 0; qi < quarters.length; qi++)
+          for (const x of planned_courses[quarters[qi]]) if (courseUnsatisfied(x, qi)) return true;
+        return false;
+      };
+      // Latest-placed trimmable violator, non-protected first.
+      const pickTrimVictim = (): string | null => {
+        for (let qi = quarters.length - 1; qi >= 0; qi--)
+          for (const x of planned_courses[quarters[qi]])
+            if (isTrimmable(x) && !protectedNorm.has(normId(x)) && courseUnsatisfied(x, qi)) return x;
+        for (let qi = quarters.length - 1; qi >= 0; qi--)
+          for (const x of planned_courses[quarters[qi]])
+            if (isTrimmable(x) && courseUnsatisfied(x, qi)) return x;
+        return null;
+      };
+      let trimGuard = 0;
+      while (hasPrereqViolation() && trimGuard++ < pool.length + 1) {
+        const victim = pickTrimVictim();
+        if (victim == null) break; // only non-trimmable violators remain — can't fix here
+        const vi = pool.indexOf(victim);
+        if (vi >= 0) pool.splice(vi, 1);
+        poolNorm.delete(normId(victim));
+        for (const q of quarters)
+          planned_courses[q] = planned_courses[q].filter((c) => c !== victim);
+        repackD2();
+      }
+
+      // (e) send to /api/whatif — same shape as the Optimize Schedule button.
+      const res = await fetch("/api/whatif", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          plan: {
+            major_id: selectedMajorId,
+            completed_courses: [...apCreditedSet],
+            planned_courses,
+            graduation_year: parseInt(gradQuarter.split("_")[0]),
+            units_per_quarter: maxUnits,
+          },
+          locked_courses: lockedMap,
+          major_id: selectedMajorId,
+          graduation_quarter: gradQuarter,
+          units_per_quarter: maxUnits,
+          waived_ges: [],
+          ap_scores: apScores,
+        }),
+      });
+      const data = await res.json();
+
+      // (g) error / infeasible — surface UI, never wipe the schedule.
+      if (!res.ok) {
+        if (
+          data?.detail?.error === "lock_conflict" &&
+          Array.isArray(data.detail.conflicts) &&
+          data.detail.conflicts.length > 0
+        ) {
+          setLockConflictErrors(data.detail.conflicts as string[]);
+        } else {
+          const msg =
+            typeof data?.detail === "object"
+              ? (data.detail.message ?? JSON.stringify(data.detail))
+              : (data?.detail ?? data?.error ?? "Optimizer error");
+          setToast(String(msg));
+        }
+        return;
+      }
+      setLockConflictErrors(null);
+      if (data?.status === "infeasible") {
+        const reasons: string[] = Array.isArray(data.conflicts)
+          ? data.conflicts.map((c: { reason?: string }) => c?.reason ?? String(c))
+          : [];
+        setToast(
+          reasons.length
+            ? `Can't optimize with these locks — ${reasons.join(" · ")}`
+            : "Can't optimize around these locked courses.",
+        );
+        return;
+      }
+
+      const planResult = data?.plans?.[0]?.planned_courses as PlannedCourses | undefined;
+      if (!planResult) {
+        setToast("No plan returned from optimizer");
+        return;
+      }
+
+      // (f) apply; defensively re-pin locked courses to their locked quarters.
+      const finalPlan: PlannedCourses = {};
+      for (const [q, ids] of Object.entries(planResult)) finalPlan[q] = [...ids];
+      for (const [cid, q] of Object.entries(lockedMap)) {
+        for (const qq of Object.keys(finalPlan)) finalPlan[qq] = finalPlan[qq].filter((x) => x !== cid);
+        (finalPlan[q] ??= []).push(cid);
+      }
+      setPlannedCourses(finalPlan);
+      validatePlan(finalPlan);
+
+      const inPlan = new Set(Object.values(finalPlan).flat());
+      setCoverageTags((prev) => {
+        const next: Record<string, CoverageTag[]> = { ...prev, ...newTags };
+        for (const k of Object.keys(next)) if (!inPlan.has(k)) delete next[k];
+        return next;
+      });
+    },
+    [plannedCourses, lockedCourses, apCreditedSet, numYears, summerYears, selectedMajorId, gradQuarter, maxUnits, apScores, validatePlan],
+  );
+
+  // ── GE autofill (no optimizer) ─────────────────────────────────────────────
+  // Coverage is authoritative (ge_list via getCourseGECategories) — NEVER array
+  // membership. Array membership only supplies the candidate POOL per category.
+  const handleGEAutofill = useCallback(async () => {
+    const info = courseInfoMapRef.current;
+    const allGroups = geRequirements.filter((r) => !apSatisfiedGEs.has(r.requirement_group ?? "") && !(languageReqSatisfied && r.requirement_group === LANGUAGE_GE_GROUP));
+    const keyOf = (r: ReqGroup) => r.requirement_group ?? r.group_name;
+    const groupByKey = new Map(allGroups.map((g) => [keyOf(g), g] as const));
+
+    // need = remaining slots per group, decremented by what's authoritatively placed.
+    const need = new Map<string, number>();
+    for (const g of allGroups) need.set(keyOf(g), g.courses_needed ?? 1);
+    for (const ids of Object.values(plannedCourses))
+      for (const id of ids)
+        for (const cat of placedGECats(id, allGroups)) {
+          const n = need.get(cat);
+          if (n != null) need.set(cat, n - 1);
+        }
+    for (const [k, v] of [...need]) if (v <= 0) need.delete(k); // keep only unfilled
+
+    const unmetMajor = new Set<string>();
+    for (const r of requirements) if (getCoverage(r).remaining > 0) r.courses.forEach((c) => unmetMajor.add(normId(c)));
+
+    const placedIds = new Set(Object.values(plannedCourses).flat().map(normId));
+    const picks: string[] = [];
+    const tags: Record<string, CoverageTag[]> = {};
+    const chosen = new Set<string>();
+    const available = (cid: string) => !!info[normId(cid)] && !placedIds.has(normId(cid)) && !chosen.has(normId(cid));
+    // Exclude major-specific writing seminars that carry a GE writing tag but only
+    // satisfy the requirement for specific majors — the generic GE autofill must
+    // not place them (manual drag-and-drop is unaffected). Excluded when ANY holds:
+    //   1. an upper-division WRITING-department course (WRITING ≥ 100)
+    //   2. a GE-writing-tagged course whose `restriction` names a major
+    //   3. a title naming a major-specific seminar (e.g. "…Majors…")
+    const isMajorSpecificGE = (cid: string): boolean => {
+      const ci = info[normId(cid)];
+      if (!ci) return false;
+      const id = normId(cid);
+      const num = parseInt(id.match(/\d+/)?.[0] ?? "", 10);
+      if (id.startsWith("WRITING") && num >= 100) return true;
+      const isWritingGE = (ci.ge_list ?? []).some((g) => /\bGE\s+I[ab]\b/i.test(g));
+      if (isWritingGE && /\bmajors?\b/i.test(ci.restriction ?? "")) return true;
+      if (/\bmajors\b/i.test(ci.title ?? "")) return true;
+      return false;
+    };
+    // Data-quality term, folded directly into the candidate score (CHANGE 2):
+    // +1 when a course carries BOTH real GPA and unit data, -2 when it has
+    // NEITHER, 0 when it has just one. Courses with no data are actively
+    // deprioritized so the autofill prefers well-documented courses.
+    const dataQuality = (cid: string): number => {
+      const ci = info[normId(cid)];
+      const hasGpa = ci?.avg_gpa != null && ci.avg_gpa !== 0;
+      const hasUnits = ci?.min_units != null && ci.min_units !== 0;
+      if (!hasGpa && !hasUnits) return -2;
+      if (hasGpa && hasUnits) return 1;
+      return 0;
+    };
+
+    let guard = 0;
+    while (need.size > 0 && guard++ < 300) {
+      const unfilled = allGroups.filter((g) => (need.get(keyOf(g)) ?? 0) > 0);
+      const key = [...need.keys()].sort((a, b) => (GE_ORDER[a] ?? 99) - (GE_ORDER[b] ?? 99))[0];
+      const g = groupByKey.get(key);
+      if (!g) { need.delete(key); continue; }
+
+      // Pool from array membership; coverage filter is authoritative. Major-specific
+      // writing seminars masquerading as GEs are excluded from the candidate pool.
+      const candidates = g.courses.filter((c) => available(c) && !isMajorSpecificGE(c) && getCourseGECategories(info[normId(c)], unfilled).includes(key));
+      if (candidates.length === 0) { need.delete(key); continue; }
+
+      // Scarcity: how many other available courses authoritatively cover each unfilled cat.
+      const universe = [...new Set(unfilled.flatMap((x) => x.courses))].filter((c) => available(c) && !isMajorSpecificGE(c));
+      const catsOf = new Map<string, string[]>();
+      for (const c of universe) catsOf.set(c, getCourseGECategories(info[normId(c)], unfilled));
+      const eligibleCount = new Map<string, number>();
+      for (const c of universe) for (const cat of catsOf.get(c)!) eligibleCount.set(cat, (eligibleCount.get(cat) ?? 0) + 1);
+      const scarcity = (cat: string) => {
+        const others = (eligibleCount.get(cat) ?? 0) - 1; // exclude the course itself
+        return others <= 0 ? Infinity : 1 / others;
+      };
+      // Cap a course's covered-unfilled categories to 2 by scarcity (tie: order).
+      const capTo2 = (cats: string[]) =>
+        cats.length <= 2
+          ? cats
+          : [...cats].sort((a, b) => scarcity(b) - scarcity(a) || (GE_ORDER[a] ?? 99) - (GE_ORDER[b] ?? 99)).slice(0, 2);
+
+      // Score every candidate that covers `key` (CHANGE 2 cross-cover scheme):
+      //   +3 also satisfies a major requirement not yet placed on the schedule
+      //   +2 also covers another unfilled GE category (capped to 2 → length ≥ 2)
+      //   +1 / -2 / 0 data-quality term (both / neither / one of avg_gpa & units)
+      // The pool is authoritative: g.courses is the full set of courses that
+      // satisfy this category, including ones NOT yet on the schedule.
+      let bestScore = -Infinity;
+      let best: { c: string; capped: string[] }[] = [];
+      let fallback: string | null = null;
+      for (const c of candidates) {
+        if (!fallback) fallback = c;
+        const capped = capTo2(catsOf.get(c) ?? getCourseGECategories(info[normId(c)], unfilled));
+        if (!capped.includes(key)) continue; // this course is better spent on scarcer cats
+        let score = 0;
+        if (unmetMajor.has(normId(c))) score += 3;
+        if (capped.length >= 2) score += 2;
+        score += dataQuality(c);
+        if (score > bestScore) { bestScore = score; best = [{ c, capped }]; }
+        else if (score === bestScore) best.push({ c, capped });
+      }
+
+      let pick: string;
+      let capped: string[];
+      if (best.length) {
+        // Highest score wins; remaining exact ties broken randomly.
+        const ch = best[Math.floor(Math.random() * best.length)];
+        pick = ch.c;
+        capped = ch.capped;
+      } else {
+        pick = fallback!; // none kept `key` in its cap → credit this one to `key` only
+        capped = [key];
+      }
+
+      const t: CoverageTag[] = capped.map((cat) => ({ kind: "ge", code: GE_CODE_LABELS[cat] ?? cat }));
+      if (unmetMajor.has(normId(pick))) t.push({ kind: "major" });
+      picks.push(pick);
+      tags[pick] = t;
+      chosen.add(normId(pick));
+      for (const cat of capped) {
+        const n = need.get(cat);
+        if (n != null) {
+          if (n - 1 <= 0) need.delete(cat);
+          else need.set(cat, n - 1);
+        }
+      }
+    }
+    await buildAndOptimizePool(picks, tags);
+  }, [plannedCourses, geRequirements, apSatisfiedGEs, languageReqSatisfied, requirements, getCoverage, placedGECats, buildAndOptimizePool]);
+
+  // ── Minor autofill (no optimizer) ──────────────────────────────────────────
+  const handleMinorAutofill = useCallback(async () => {
+    const info = courseInfoMapRef.current;
+    const placedIds = new Set(Object.values(plannedCourses).flat().map(normId));
+    const geGroups = geRequirements.filter((r) => !apSatisfiedGEs.has(r.requirement_group ?? "") && !(languageReqSatisfied && r.requirement_group === LANGUAGE_GE_GROUP));
+    const keyOf = (r: ReqGroup) => r.requirement_group ?? r.group_name;
+
+    // Unfilled GE groups, authoritative (ge_list) — never array membership.
+    const geNeed = new Map<string, number>();
+    for (const g of geGroups) geNeed.set(keyOf(g), g.courses_needed ?? 1);
+    for (const ids of Object.values(plannedCourses))
+      for (const id of ids)
+        for (const cat of placedGECats(id, geGroups)) {
+          const n = geNeed.get(cat);
+          if (n != null) geNeed.set(cat, n - 1);
+        }
+    const geUnfilled = geGroups.filter((g) => (geNeed.get(keyOf(g)) ?? 0) > 0);
+
+    const unmetMajor = new Set<string>();
+    for (const r of requirements) if (getCoverage(r).remaining > 0) r.courses.forEach((c) => unmetMajor.add(normId(c)));
+
+    // GE categories this course authoritatively covers among still-unfilled
+    // groups, capped at 2 (canonical order) to match the GE-autofill cap.
+    const geCoveredUnfilled = (cid: string) => getCourseGECategories(info[normId(cid)], geUnfilled).slice(0, 2);
+
+    const picks: string[] = [];
+    const requiredPicks: string[] = []; // non-pick-N minor courses — protected from the overflow trim
+    const tags: Record<string, CoverageTag[]> = {};
+    const chosen = new Set<string>();
+
+    const avail = (cid: string) => !!info[normId(cid)] && !placedIds.has(normId(cid)) && !chosen.has(normId(cid));
+    const tagFor = (cid: string): CoverageTag[] => {
+      const t: CoverageTag[] = [{ kind: "minor" }];
+      for (const cat of geCoveredUnfilled(cid)) t.push({ kind: "ge", code: GE_CODE_LABELS[cat] ?? cat });
+      if (unmetMajor.has(normId(cid))) t.push({ kind: "major" });
+      return t;
+    };
+
+    for (const req of minorRequirements) {
+      const isPickN = req.courses_needed < req.courses.length;
+      if (!isPickN) {
+        // Required course(s): always place if not already on the schedule.
+        for (const c of req.courses) {
+          if (!avail(c)) continue;
+          picks.push(c);
+          requiredPicks.push(c);
+          tags[c] = tagFor(c);
+          chosen.add(normId(c));
+        }
+      } else {
+        // Pick-N: only place a candidate that cross-covers an unfilled GE / unmet major.
+        let bestScore = 0;
+        let best: string[] = [];
+        for (const c of req.courses.filter(avail)) {
+          let score = 0;
+          if (geCoveredUnfilled(c).length > 0) score += 2;
+          if (unmetMajor.has(normId(c))) score += 1;
+          if (score > bestScore) {
+            bestScore = score;
+            best = [c];
+          } else if (score === bestScore && score > 0) best.push(c);
+        }
+        if (bestScore > 0 && best.length) {
+          const pick = best[Math.floor(Math.random() * best.length)];
+          picks.push(pick);
+          tags[pick] = tagFor(pick);
+          chosen.add(normId(pick));
+        }
+        // else: no cross-cover → skip this group entirely.
+      }
+    }
+    await buildAndOptimizePool(picks, tags, requiredPicks);
+  }, [plannedCourses, geRequirements, apSatisfiedGEs, languageReqSatisfied, minorRequirements, requirements, getCoverage, placedGECats, buildAndOptimizePool]);
+
   const toggleSummer = useCallback((year: number) => {
     setSummerYears((prev) => {
       const next = new Set(prev);
@@ -2432,7 +3667,9 @@ export default function PlannerClient() {
     return order.find((k) => minorBucketed[k].some((r) => !clientCoverage(r).done)) ?? null;
   }, [minorBucketed, clientCoverage]);
 
-  const firstIncompleteGE = geRequirements.findIndex((r) => !getCoverage(r).done);
+  const firstIncompleteGE = geRequirements.findIndex(
+    (r) => !getCoverage(r).done && !(languageReqSatisfied && r.requirement_group === LANGUAGE_GE_GROUP),
+  );
 
   // ── Render ──────────────────────────────────────────────────────────────────
   return (
@@ -2440,11 +3677,14 @@ export default function PlannerClient() {
       <div className="flex overflow-hidden" style={{ height: "calc(100vh - 56px)" }}>
 
         {/* ── Sidebar ──────────────────────────────────────────────────────── */}
-        <aside className="w-[260px] shrink-0 flex flex-col bg-[#181818] border-r border-[#2a2a2a]">
+        <aside
+          style={{ width: sidebarWidth }}
+          className="shrink-0 flex flex-col bg-[#1a1a1a] border-r-2 border-[#303030] shadow-[1px_0_6px_rgba(0,0,0,0.35)]"
+        >
 
           {/* Tabs */}
           <div className="flex border-b border-[#2a2a2a] shrink-0">
-            {(["major", "ge", "minor"] as const).map((tab) => (
+            {(["major", "ge", "minor", "help"] as const).map((tab) => (
               <button
                 key={tab}
                 onClick={() => setSidebarTab(tab)}
@@ -2453,14 +3693,15 @@ export default function PlannerClient() {
                     ? "text-[#f0f0f0] border-b-2 border-[#3b82f6]"
                     : "text-[#444] hover:text-[#666]"}`}
               >
-                {tab === "major" ? "Major" : tab === "ge" ? "GE" : "Minor"}
+                {tab === "major" ? "Major" : tab === "ge" ? "GE" : tab === "minor" ? "Minor" : "Help"}
               </button>
             ))}
           </div>
 
           {/* Fixed top */}
+          {sidebarTab !== "help" && (
           <div className="px-2 pt-2 flex flex-col gap-1.5 shrink-0">
-            {sidebarTab !== "minor" && (
+            {sidebarTab === "major" && (
               majorListError ? (
                 <ErrorBanner
                   message="Failed to load majors"
@@ -2476,18 +3717,13 @@ export default function PlannerClient() {
               )
             )}
 
-            {sidebarTab !== "minor" && specializations.length > 0 && (
-              <select
-                value={selectedMajorId}
-                onChange={(e) => setSelectedMajorId(e.target.value)}
-                className="w-full bg-[#111] border border-[#2a2a2a] rounded px-2.5 py-1.5 text-[11px] text-[#f0f0f0] focus:outline-none focus:border-[#3b82f6]/60"
-              >
-                {specializations.map((spec) => (
-                  <option key={spec.major_id} value={spec.major_id}>
-                    {spec.specialization_name ?? spec.major_id}
-                  </option>
-                ))}
-              </select>
+            {sidebarTab !== "minor" && specializations.length > 1 && (
+              <SpecializationCombobox
+                options={specializations}
+                selectedMajorId={selectedMajorId}
+                onSelect={setSelectedMajorId}
+                loading={majorList.length === 0 && !majorListError}
+              />
             )}
 
             {sidebarTab === "minor" && (
@@ -2544,11 +3780,47 @@ export default function PlannerClient() {
               </p>
             )}
           </div>
+          )}
 
-          <div className="border-t border-[#2a2a2a] mt-1 shrink-0" />
+          {sidebarTab !== "help" && (
+            <div className="border-t border-[#2a2a2a] mt-1 shrink-0" />
+          )}
 
           {/* Scrollable list */}
           <div className="flex-1 overflow-y-auto py-1 min-h-0">
+            {sidebarTab === "help" && (
+              <div className="flex flex-col h-full px-3 py-3">
+                <div className="flex flex-col gap-4 flex-1">
+                  <section>
+                    <h3 className="text-[12px] font-bold text-[#e8e8e8] tracking-tight">How to use PlanUCI</h3>
+                    <p className="mt-1 text-[10px] text-[#555] leading-relaxed">Coming soon.</p>
+                  </section>
+                  <section>
+                    <h3 className="text-[12px] font-bold text-[#e8e8e8] tracking-tight">Features</h3>
+                    <p className="mt-1 text-[10px] text-[#555] leading-relaxed">Coming soon.</p>
+                  </section>
+                  <section>
+                    <h3 className="text-[12px] font-bold text-[#e8e8e8] tracking-tight">FAQ</h3>
+                    <p className="mt-1 text-[10px] text-[#555] leading-relaxed">Coming soon.</p>
+                  </section>
+                </div>
+
+                {/* Contact / feedback */}
+                <div className="mt-4 pt-3 border-t border-[#2a2a2a]">
+                  <p className="text-[9px] font-bold uppercase tracking-[0.12em] text-[#444]">Feedback</p>
+                  <a
+                    href="mailto:rtmcdani@uci.edu"
+                    className="mt-1 inline-flex items-center gap-1.5 text-[10px] text-[#888] hover:text-[#3b82f6] transition-colors"
+                  >
+                    <svg viewBox="0 0 16 16" className="w-3 h-3" fill="none">
+                      <rect x="2" y="3.5" width="12" height="9" rx="1.5" stroke="currentColor" strokeWidth="1.2" />
+                      <path d="M2.5 4.5L8 8.5l5.5-4" stroke="currentColor" strokeWidth="1.2" strokeLinecap="round" strokeLinejoin="round" />
+                    </svg>
+                    rtmcdani@uci.edu
+                  </a>
+                </div>
+              </div>
+            )}
             {sidebarTab === "major" && (
               <>
                 {loadingReqs && (
@@ -2588,7 +3860,7 @@ export default function PlannerClient() {
                         <p className="text-[8px] font-bold uppercase tracking-[0.15em] text-[#444] px-1 pb-1">
                           All Courses
                         </p>
-                        <div className="grid grid-cols-3 gap-1 p-1.5 bg-[#0f0f0f] rounded">
+                        <div className="grid [grid-template-columns:repeat(auto-fill,minmax(80px,1fr))] gap-1 p-1.5 bg-[#0f0f0f] rounded">
                           {globalResults.map((c) => (
                             <CoursePill
                               key={c.id}
@@ -2628,6 +3900,7 @@ export default function PlannerClient() {
                         key={r.id} req={r} placedSet={placedSet}
                         apCreditedSet={apCreditedSet}
                         apSatisfiedGEs={apSatisfiedGEs}
+                        extraSatisfied={languageReqSatisfied && r.requirement_group === LANGUAGE_GE_GROUP}
                         courseInfoMap={courseInfoMap} difficultyMap={difficultyMap}
                         searchQuery={searchQuery}
                         initialOpen={i === firstIncompleteGE}
@@ -2681,6 +3954,7 @@ export default function PlannerClient() {
           </div>
 
           {/* Auto-fill */}
+          {sidebarTab !== "help" && (
           <div className="px-2.5 py-2.5 border-t border-[#2a2a2a] shrink-0">
 
             {/* Unit load selector */}
@@ -2747,105 +4021,39 @@ export default function PlannerClient() {
               </div>
             )}
             <button
-              disabled={!selectedMajorId || autoFillLoading}
+              disabled={!selectedMajorId || autoFillLoading || (sidebarTab === "minor" && !selectedMinorId)}
               onClick={async () => {
                 if (!selectedMajorId || autoFillLoading) return;
+                if (sidebarTab === "minor" && !selectedMinorId) return;
                 setAutoFillLoading(true);
                 setToast(null);
                 try {
-                  // Build locked course→quarter map from the current plan
-                  const lockedMap: Record<string, string> = {};
-                  for (const [quarter, courses] of Object.entries(plannedCourses)) {
-                    for (const cid of courses) {
-                      if (lockedCourses.has(cid)) lockedMap[cid] = quarter;
-                    }
-                  }
-                  const hasLocks = Object.keys(lockedMap).length > 0;
-
-                  const res = await fetch(hasLocks ? "/api/whatif" : "/api/optimizer", {
-                    method: "POST",
-                    headers: { "Content-Type": "application/json" },
-                    body: hasLocks
-                      ? JSON.stringify({
-                          plan: {
-                            major_id: selectedMajorId,
-                            completed_courses: [],
-                            planned_courses: plannedCourses,
-                            graduation_year: parseInt(gradQuarter.split("_")[0]),
-                            units_per_quarter: maxUnits,
-                          },
-                          locked_courses: lockedMap,
-                          major_id: selectedMajorId,
-                          graduation_quarter: gradQuarter,
-                          units_per_quarter: maxUnits,
-                          waived_ges: [],
-                          ap_scores: apScores,
-                        })
-                      : JSON.stringify({
-                          major_id: selectedMajorId,
-                          completed_courses: [],
-                          graduation_quarter: gradQuarter,
-                          units_per_quarter: maxUnits,
-                          waived_ges: [],
-                          ap_scores: apScores,
-                          // Pin the optimizer window to the grid's first (Fall)
-                          // quarter so it never schedules into off-grid quarters.
-                          start_quarter: qkey(1, "fall"),
-                        }),
-                  });
-                  const data = await res.json();
-                  if (!res.ok) {
-                    if (
-                      data?.detail?.error === "lock_conflict" &&
-                      Array.isArray(data.detail.conflicts) &&
-                      data.detail.conflicts.length > 0
-                    ) {
-                      setLockConflictErrors(data.detail.conflicts as string[]);
-                    } else {
-                      const msg =
-                        typeof data?.detail === "object"
-                          ? (data.detail.message ?? JSON.stringify(data.detail))
-                          : (data?.detail ?? data?.error ?? "Optimizer error");
-                      setToast(String(msg));
-                    }
+                  if (sidebarTab === "ge") {
+                    await handleGEAutofill();   // local placement — never the optimizer
+                  } else if (sidebarTab === "minor") {
+                    await handleMinorAutofill(); // local placement — never the optimizer
                   } else {
-                    setLockConflictErrors(null);
-                    if (hasLocks) {
-                      // optimize_around_locks: { status, plans | conflicts }
-                      if (data?.status === "infeasible") {
-                        const reasons: string[] = Array.isArray(data.conflicts)
-                          ? data.conflicts.map(
-                              (c: { reason?: string }) => c?.reason ?? String(c),
-                            )
-                          : [];
-                        setToast(
-                          reasons.length
-                            ? `Can't rebalance with these locks — ${reasons.join(" · ")}`
-                            : "Can't rebalance with these locked courses.",
-                        );
-                      } else {
-                        const plan = data?.plans?.[0]?.planned_courses as
-                          | PlannedCourses
-                          | undefined;
-                        if (plan) {
-                          setPlannedCourses(plan);
-                          validatePlan(plan);
-                        } else {
-                          setToast("No plan returned from optimizer");
-                        }
-                      }
-                    } else {
-                      // generate(): { variants: [...] }
-                      const plan = data?.variants?.[0]?.planned_courses as
-                        | PlannedCourses
-                        | undefined;
-                      if (plan) {
-                        setPlannedCourses(plan);
-                        validatePlan(plan);
-                      } else {
-                        setToast("No plan returned from optimizer");
+                    // MAJOR: pick the remaining take-all required major courses
+                    // (choice/elective pools stay user-driven), then optimize the
+                    // unified pool via /api/whatif. whatif doesn't collect major
+                    // requirements, so the picks are computed here on the frontend.
+                    const exclude = new Set<string>([
+                      ...Object.values(plannedCourses).flat().map(normId),
+                      ...[...apCreditedSet].map(normId),
+                    ]);
+                    const seedExtra: string[] = [];
+                    const taken = new Set<string>();
+                    for (const r of requirements) {
+                      const isChoice = r.courses_needed < r.courses.length || r.requirement_type === "elective";
+                      if (isChoice) continue; // take-all required groups only
+                      for (const c of r.courses) {
+                        const nn = normId(c);
+                        if (exclude.has(nn) || taken.has(nn)) continue;
+                        taken.add(nn);
+                        seedExtra.push(c);
                       }
                     }
+                    await buildAndOptimizePool(seedExtra, {});
                   }
                 } catch (err) {
                   setToast(err instanceof Error ? err.message : "Optimizer unavailable");
@@ -2854,7 +4062,7 @@ export default function PlannerClient() {
                 }
               }}
               className={`w-full flex items-center justify-center gap-2 rounded py-2.5 text-[11px] font-bold tracking-wide transition-all
-                ${selectedMajorId && !autoFillLoading
+                ${selectedMajorId && !autoFillLoading && !(sidebarTab === "minor" && !selectedMinorId)
                   ? "bg-[#3b82f6] hover:bg-[#2563eb] text-white"
                   : "bg-[#1a1a1a] text-[#3a3a3a] cursor-not-allowed"}`}
             >
@@ -2866,7 +4074,14 @@ export default function PlannerClient() {
                   Generating…
                 </>
               ) : (
-                <><span>✦</span> Auto-fill Plan</>
+                <>
+                  <span>✦</span>{" "}
+                  {sidebarTab === "ge"
+                    ? "Auto-fill GE Requirements"
+                    : sidebarTab === "minor"
+                    ? "Auto-fill Minor Requirements"
+                    : "Auto-fill Major Requirements"}
+                </>
               )}
             </button>
 
@@ -2970,16 +4185,26 @@ export default function PlannerClient() {
 
             <button
               onClick={() => setShowClearConfirm(true)}
-              className="w-full mt-1.5 rounded py-2 text-[11px] font-medium tracking-wide border border-red-900/50 text-red-500 hover:bg-red-950/30 hover:border-red-700/60 transition-all"
+              className="block mx-auto mt-2 text-[10px] font-normal text-[#555] hover:text-[#888] underline-offset-2 hover:underline transition-colors"
             >
-              Clear Schedule
+              Clear schedule
             </button>
 
             {clearSuccess && (
               <p className="mt-1.5 text-center text-[10px] text-green-500">Schedule cleared</p>
             )}
           </div>
+          )}
         </aside>
+
+        {/* ── Sidebar resize handle ────────────────────────────────────────── */}
+        <div
+          onPointerDown={startSidebarResize}
+          role="separator"
+          aria-orientation="vertical"
+          aria-label="Resize sidebar"
+          className="w-1.5 shrink-0 cursor-col-resize bg-transparent hover:bg-[#3b82f6]/40 active:bg-[#3b82f6]/60 transition-colors"
+        />
 
         {/* ── Clear Schedule confirmation dialog ───────────────────────────── */}
         {pendingLock && (
@@ -3098,38 +4323,44 @@ export default function PlannerClient() {
         {/* ── Main ─────────────────────────────────────────────────────────── */}
         <main className="flex-1 flex flex-col overflow-hidden bg-[#111]">
 
+          {/* Page actions — rendered into the global navbar's right side. */}
+          {navActionsSlot && createPortal(
+            <>
+              <APCreditsMenu apScores={apScores} setApScores={setApScores} apExamNames={apExamNames} languageReqSatisfied={languageReqSatisfied} setLanguageReqSatisfied={setLanguageReqSatisfied} />
+
+              <PlansMenu
+                signedIn={signedIn}
+                savedPlans={savedPlans}
+                maxPlans={MAX_SAVED_PLANS}
+                onSave={handleSaveNamed}
+                onLoad={handleLoadNamed}
+                onDelete={handleDeleteNamed}
+                onSignIn={handleSignIn}
+              />
+
+              <button
+                onClick={handleDownloadPDF}
+                title="Download a PDF of this schedule"
+                className="flex items-center gap-1.5 rounded-md border border-white/[0.12] bg-white/[0.04] px-2.5 h-7 text-[11px] font-medium text-[#cfcfe0] hover:text-white hover:border-white/25 transition-colors"
+              >
+                <svg viewBox="0 0 16 16" className="w-3.5 h-3.5" fill="none">
+                  <path d="M8 2v8m0 0L5 7m3 3l3-3" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round" strokeLinejoin="round"/>
+                  <path d="M3 12.5h10" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round"/>
+                </svg>
+                PDF
+              </button>
+
+              <div className="w-px h-5 bg-white/15" />
+            </>,
+            navActionsSlot,
+          )}
+
           {/* Top bar */}
           <div className="h-12 shrink-0 flex items-center px-6 border-b border-[#2a2a2a] bg-[#141414] gap-3">
             <span className="text-[13px] font-medium text-[#bbb] truncate max-w-[240px]">
               {selectedLabel || <span className="text-[#555] font-normal">No major selected</span>}
             </span>
             <div className="flex-1" />
-
-            <APCreditsMenu apScores={apScores} setApScores={setApScores} apExamNames={apExamNames} />
-
-            <PlansMenu
-              signedIn={signedIn}
-              savedPlans={savedPlans}
-              maxPlans={MAX_SAVED_PLANS}
-              onSave={handleSaveNamed}
-              onLoad={handleLoadNamed}
-              onDelete={handleDeleteNamed}
-              onSignIn={handleSignIn}
-            />
-
-            <button
-              onClick={handleDownloadPDF}
-              title="Download a PDF of this schedule"
-              className="flex items-center gap-1.5 rounded-md border border-[#2a2a2a] bg-[#1a1a1a] px-2.5 h-7 text-[11px] font-medium text-[#999] hover:text-[#e8e8e8] hover:border-[#3a3a3a] transition-colors"
-            >
-              <svg viewBox="0 0 16 16" className="w-3.5 h-3.5" fill="none">
-                <path d="M8 2v8m0 0L5 7m3 3l3-3" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round" strokeLinejoin="round"/>
-                <path d="M3 12.5h10" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round"/>
-              </svg>
-              PDF
-            </button>
-
-            <div className="w-px h-5 bg-[#2a2a2a]" />
 
             <div className="flex items-baseline gap-1.5">
               <span className="text-[16px] font-bold text-[#e8e8e8] tabular-nums leading-none">{totalUnits}</span>
@@ -3147,90 +4378,150 @@ export default function PlannerClient() {
           )}
 
           {/* Grid */}
-          <div className="flex-1 overflow-auto p-4">
+          <div className="relative flex-1 overflow-auto p-4">
+            {/* Empty-state hint — only when nothing is selected or placed yet */}
+            {!selectedMajorId && !hasPlacedCourses && (
+              <div className="pointer-events-none absolute inset-0 z-10 flex items-center justify-center">
+                <div className="flex items-center gap-2 text-[#5a5a5a] select-none">
+                  <svg viewBox="0 0 24 24" className="w-5 h-5 shrink-0" fill="none">
+                    <path d="M20 12H4m0 0l5-5m-5 5l5 5" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
+                  </svg>
+                  <span className="text-[13px] font-normal">Select a major to get started</span>
+                </div>
+              </div>
+            )}
             <div className="border border-[#2a2a2a] rounded-lg overflow-hidden">
               {Array.from({ length: numYears }, (_, i) => i + 1).map((year) => {
                 const hasSummer = summerYears.has(year);
                 const summerQk = qkey(year, "summer");
+                const collapsed = collapsedYears.has(year);
+                const fallYear = START_YEAR + year - 1;
+
+                // Year totals across its quarters (+ summer when present).
+                const yearQks = [
+                  ...BASE_QUARTERS.map((q) => qkey(year, q.key)),
+                  ...(hasSummer ? [summerQk] : []),
+                ];
+                const yearCourseIds = yearQks.flatMap((qk) => plannedCourses[qk] ?? []);
+                const yearCourseCount = yearCourseIds.length;
+                const yearUnits = yearCourseIds.reduce(
+                  (sum, id) => sum + (courseInfoMap[normId(id)]?.min_units ?? 4),
+                  0,
+                );
 
                 return (
-                  <div key={year} className="flex border-b border-[#2a2a2a] last:border-b-0">
-                    {/* Year label + remove */}
-                    <div className="w-9 shrink-0 flex flex-col items-center justify-center gap-1.5 py-1.5 border-r border-[#2a2a2a] bg-gradient-to-b from-[#141414] to-[#0d0d0d]">
-                      <span
-                        className="flex-1 flex items-center text-[9px] font-bold uppercase tracking-[0.2em] text-[#6a6a6a] select-none"
-                        style={{ writingMode: "vertical-rl", transform: "rotate(180deg)" }}
+                  <div key={year} className="border-b border-[#2a2a2a] last:border-b-0">
+                    {/* Year header bar — full width, lighter than quarter cards */}
+                    <div className="flex items-center gap-2 h-9 px-3 bg-[#2a2a2e] border-b border-[#2a2a2a]">
+                      <button
+                        onClick={() => toggleYearCollapse(year)}
+                        title={collapsed ? "Expand year" : "Collapse year"}
+                        aria-expanded={!collapsed}
+                        className="flex items-center gap-2 min-w-0 text-left group/yr"
                       >
-                        {`Year ${year}`}
+                        <span className="text-[13px] font-bold text-[#e8e8e8] tracking-tight whitespace-nowrap">
+                          Year {year}
+                        </span>
+                        <span className="text-[11px] font-medium text-[#7a7a85] tabular-nums whitespace-nowrap">
+                          ({fallYear}–{fallYear + 1})
+                        </span>
+                      </button>
+
+                      <div className="flex-1" />
+
+                      <span className="text-[10px] font-medium text-[#8a8a95] tabular-nums whitespace-nowrap">
+                        {yearCourseCount} {yearCourseCount === 1 ? "course" : "courses"}
+                        <span className="mx-1 text-[#4a4a52]">·</span>
+                        {yearUnits} units
                       </span>
+
                       {year > 1 && (
                         <button
                           onClick={() => removeYear(year)}
                           title={`Remove Year ${year} — its courses return to the sidebar`}
-                          className="shrink-0 flex items-center justify-center w-5 h-5 rounded border border-dashed border-[#2a2a2a] text-[10px] leading-none text-[#5a5a5a] hover:text-red-400 hover:border-red-700/50 hover:bg-red-950/30 transition-colors"
+                          className="shrink-0 flex items-center justify-center w-5 h-5 rounded border border-[#3a3a3a] text-[10px] leading-none text-[#6a6a6a] hover:text-red-400 hover:border-red-700/50 hover:bg-red-950/30 transition-colors"
                         >
                           ✕
                         </button>
                       )}
+
+                      <button
+                        onClick={() => toggleYearCollapse(year)}
+                        title={collapsed ? "Expand year" : "Collapse year"}
+                        aria-expanded={!collapsed}
+                        className="shrink-0 flex items-center justify-center w-5 h-5 text-[#7a7a85] hover:text-[#e8e8e8] transition-colors"
+                      >
+                        <svg viewBox="0 0 12 12" className={`w-3 h-3 transition-transform ${collapsed ? "" : "rotate-180"}`} fill="none">
+                          <path d="M2 4l4 4 4-4" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" strokeLinejoin="round" />
+                        </svg>
+                      </button>
                     </div>
 
-                    {/* Quarter grid */}
-                    <div
-                      className="flex-1 grid"
-                      style={{ gridTemplateColumns: hasSummer ? "1fr 1fr 1fr 0.6fr" : "1fr 1fr 1fr" }}
-                    >
-                      {BASE_QUARTERS.map((q) => {
-                        const qk = qkey(year, q.key);
-                        return (
+                    {!collapsed && (
+                    <div className="flex">
+                      {/* Quarter grid */}
+                      <div
+                        className="flex-1 grid"
+                        style={{ gridTemplateColumns: hasSummer ? "1fr 1fr 1fr 0.6fr" : "1fr 1fr 1fr" }}
+                      >
+                        {BASE_QUARTERS.map((q) => {
+                          const qk = qkey(year, q.key);
+                          return (
+                            <QuarterCell
+                              key={qk} qKey={qk} label={q.label} dim={false}
+                              courseIds={plannedCourses[qk] ?? []}
+                              courseInfoMap={courseInfoMap}
+                              difficultyMap={difficultyMap}
+                              confidenceMap={confidenceMap}
+                              lockedCourses={lockedCourses}
+                              onToggleLock={toggleLock}
+                              onRemove={removeCourse}
+                              prereqWarnings={prereqWarnings}
+                              onDismissWarning={dismissWarning}
+                              maxUnitsPerQuarter={maxUnits}
+                              coverageTags={coverageTags}
+                            />
+                          );
+                        })}
+                        {hasSummer && (
                           <QuarterCell
-                            key={qk} qKey={qk} label={q.label} dim={false}
-                            courseIds={plannedCourses[qk] ?? []}
+                            key={summerQk} qKey={summerQk} label="Summer" dim
+                            courseIds={plannedCourses[summerQk] ?? []}
                             courseInfoMap={courseInfoMap}
                             difficultyMap={difficultyMap}
+                            confidenceMap={confidenceMap}
                             lockedCourses={lockedCourses}
                             onToggleLock={toggleLock}
                             onRemove={removeCourse}
                             prereqWarnings={prereqWarnings}
                             onDismissWarning={dismissWarning}
+                            coverageTags={coverageTags}
+                            removable onRemoveQuarter={() => toggleSummer(year)}
                             maxUnitsPerQuarter={maxUnits}
                           />
-                        );
-                      })}
-                      {hasSummer && (
-                        <QuarterCell
-                          key={summerQk} qKey={summerQk} label="Summer" dim
-                          courseIds={plannedCourses[summerQk] ?? []}
-                          courseInfoMap={courseInfoMap}
-                          difficultyMap={difficultyMap}
-                          lockedCourses={lockedCourses}
-                          onToggleLock={toggleLock}
-                          onRemove={removeCourse}
-                          prereqWarnings={prereqWarnings}
-                          onDismissWarning={dismissWarning}
-                          removable onRemoveQuarter={() => toggleSummer(year)}
-                          maxUnitsPerQuarter={maxUnits}
-                        />
-                      )}
-                    </div>
+                        )}
+                      </div>
 
-                    {/* + Summer */}
-                    <div className="w-6 shrink-0 flex items-center justify-center border-l border-[#2a2a2a] bg-[#0f0f0f]">
-                      {!hasSummer && (
-                        <button
-                          onClick={() => toggleSummer(year)}
-                          title="Add Summer"
-                          className="flex flex-col items-center gap-1 text-[#5a5a5a] hover:text-[#FFC72C]/70 transition-colors"
-                        >
-                          <span className="text-[11px] font-bold leading-none">+</span>
-                          <span
-                            className="text-[8px] font-semibold uppercase tracking-[0.15em] leading-none"
-                            style={{ writingMode: "vertical-rl" }}
+                      {/* + Summer */}
+                      <div className="w-6 shrink-0 flex items-center justify-center border-l border-[#2a2a2a] bg-[#0f0f0f]">
+                        {!hasSummer && (
+                          <button
+                            onClick={() => toggleSummer(year)}
+                            title="Add Summer"
+                            className="flex flex-col items-center gap-1 text-[#5a5a5a] hover:text-[#FFC72C]/70 transition-colors"
                           >
-                            Summer
-                          </span>
-                        </button>
-                      )}
+                            <span className="text-[11px] font-bold leading-none">+</span>
+                            <span
+                              className="text-[8px] font-semibold uppercase tracking-[0.15em] leading-none"
+                              style={{ writingMode: "vertical-rl" }}
+                            >
+                              Summer
+                            </span>
+                          </button>
+                        )}
+                      </div>
                     </div>
+                    )}
                   </div>
                 );
               })}
@@ -3246,14 +4537,6 @@ export default function PlannerClient() {
           </div>
         </main>
       </div>
-
-      {/* Feedback link — subtle, fixed bottom-right */}
-      <a
-        href="mailto:rtmcdani@uci.edu"
-        className="fixed bottom-3 right-4 z-40 text-[10px] text-[#444] hover:text-[#888] transition-colors"
-      >
-        Mail any feedback to rtmcdani@uci.edu
-      </a>
 
       {/* Drag overlay */}
       <DragOverlay dropAnimation={null}>

@@ -11,6 +11,7 @@ POST /optimizer/requirements_state — plan_generator.get_requirements_state()
 
 import sys
 import os
+import threading
 
 # Ensure backend/ is on sys.path so scripts.optimizer.* is importable
 _BACKEND = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -40,6 +41,18 @@ load_dotenv(_ENV)
 
 def _supabase_client():
     return create_client(os.getenv("SUPABASE_URL"), os.getenv("SUPABASE_SERVICE_KEY"))
+
+
+def _increment_stat(stat_key: str) -> None:
+    """Fire-and-forget app_stats counter bump — runs off-thread so it can never
+    block or raise into the request path."""
+    def _run():
+        try:
+            _supabase_client().rpc("increment_stat", {"stat_key": stat_key}).execute()
+        except Exception:
+            pass
+    threading.Thread(target=_run, daemon=True).start()
+
 
 router = APIRouter()
 
@@ -95,10 +108,15 @@ class GenerateRequest(BaseModel):
     waived_ges:         list[str] = []
     ap_scores:          dict[str, int] = {}  # {"AP Calculus AB": 4, "AP Statistics": 5}
     start_quarter:      str = ""   # grid's first quarter (e.g. "2026_fall"); pins the window
+    seed_courses:       list[str] = []  # current schedule + GE/Minor picks to keep in the plan
+    seed_only:          bool = False    # GE/Minor autofill: don't auto-add major requireds
 
 
 @router.post("/generate")
 def optimizer_generate(req: GenerateRequest):
+    # Seeded (additive autofill) requests are schedule-specific — bypass the
+    # shared cache so a seeded result never collides with a from-scratch one.
+    use_cache = not req.seed_courses and not req.seed_only
     cache_key = optimizer_cache.make_key(
         major_id           = req.major_id,
         completed_courses  = req.completed_courses,
@@ -108,11 +126,21 @@ def optimizer_generate(req: GenerateRequest):
         ap_scores          = req.ap_scores,
         start_quarter      = req.start_quarter or None,
     )
-    client = _supabase_client()
-    cached = optimizer_cache.get(client, cache_key)
-    if cached is not None:
-        cached["cached"] = True
-        return cached
+
+    if use_cache:
+        # L1: in-process memory — zero network cost for repeated identical requests.
+        l1_hit = optimizer_cache.get_l1(cache_key)
+        if l1_hit is not None:
+            return {**l1_hit, "cached": True}
+
+        # L2: Supabase — survives restarts, shared across instances.
+        client = _supabase_client()
+        l2_hit = optimizer_cache.get(client, cache_key)
+        if l2_hit is not None:
+            optimizer_cache.set_l1(cache_key, l2_hit)   # backfill L1
+            return {**l2_hit, "cached": True}
+    else:
+        client = _supabase_client()
 
     try:
         result = generate(
@@ -123,6 +151,8 @@ def optimizer_generate(req: GenerateRequest):
             waived_ges         = req.waived_ges,
             ap_scores          = req.ap_scores,
             start_quarter      = req.start_quarter or None,
+            seed_courses       = req.seed_courses,
+            seed_only          = req.seed_only,
         )
     except FeasibilityError as e:
         raise HTTPException(
@@ -153,7 +183,10 @@ def optimizer_generate(req: GenerateRequest):
         "choice_groups":        result.choice_groups,
         "cached":               False,
     }
-    optimizer_cache.set(client, cache_key, response)
+    if use_cache:
+        optimizer_cache.set_l1(cache_key, response)   # L1: in-process
+        optimizer_cache.set(client, cache_key, response)  # L2: Supabase
+    _increment_stat("schedules_saved")  # fire-and-forget; never blocks the response
     return response
 
 

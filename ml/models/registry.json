@@ -4,24 +4,26 @@
       "model_id": "difficulty_nlp_v2",
       "version": "v2",
       "path": "ml/models/difficulty_nlp_v2",
-      "created_at": "2026-05-24T22:59:02Z",
+      "created_at": "2026-07-14T04:13:32Z",
+      "produced_by": "ml/evals/eval_difficulty.py",
       "key_metrics": {
-        "val_macro_f1": 0.61,
-        "test_macro_f1": 0.6188,
-        "test_accuracy": 0.6587
+        "test_macro_f1": 0.5764,
+        "test_accuracy": 0.627
       }
     },
     {
       "model_id": "sentiment_v1",
       "version": "v1",
       "path": "ml/models/sentiment_v1",
-      "created_at": "2026-05-24T22:59:02Z",
+      "created_at": "2026-07-13T21:29:48Z",
+      "produced_by": "ml/models/train_sentiment.py",
       "key_metrics": {
-        "val_macro_f1": 0.8313,
-        "test_macro_f1": 0.8093,
-        "professors_labeled": 1291
+        "val_macro_f1": 0.5383,
+        "test_macro_f1": 0.5222,
+        "test_records": 60,
+        "rmp_records": 591
       }
     }
   ],
-  "updated_at": "2026-05-24T22:59:02Z"
+  "updated_at": "2026-07-14T04:13:32Z"
 }

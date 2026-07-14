@@ -76,7 +76,13 @@ def difficulty_course(req: CourseRequest):
         "course_id": req.course_id,
         "difficulty_score": difficulty_score,
         "tier": tier,
+        # NOTE: two different things are called "confidence" here, deliberately kept
+        # distinct. `confidence` is the classifier's softmax on THIS prediction.
+        # `signal_confidence` is how much the SERVED blended score (course_features)
+        # is worth trusting, keyed on which signals backed it — high = nlp+gpa+rmp,
+        # medium = two signals, low = NLP text alone.
         "confidence": confidence,
+        "signal_confidence": ml["course_confidence"].get(req.course_id),
         "probabilities": {l: round(p, 4) for l, p in zip(labels, probs)},
     }
 
@@ -109,5 +115,8 @@ def difficulty_professor(req: ProfRequest):
         "nlp_score": _val("nlp_score"),
         "gpa_score": _val("gpa_score"),
         "rmp_score": _val("rmp_score"),
+        # Which signals actually backed this row, and how far to trust it.
+        "signals_present": r["signals_present"] if pd.notna(r.get("signals_present")) else None,
+        "confidence": r["confidence"] if pd.notna(r.get("confidence")) else None,
         "sections_taught": int(r["sections_taught"]),
     }

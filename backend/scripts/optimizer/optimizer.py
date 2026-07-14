@@ -43,8 +43,10 @@ from .soft_constraints import (
     adjacent_smoothing,
     difficulty_balance,
     ge_distribution,
+    lower_div_earliness,
     major_clustering,
     min_units_load,
+    over_cap_penalty,
     workload_progression,
 )
 
@@ -116,8 +118,13 @@ def _soft_score(
     plan: CoursePlan,
     diff_scores: dict[str, float],
     meta: dict[str, dict],
+    locked_norm: frozenset[str] = frozenset(),
 ) -> tuple[float, dict[str, float]]:
-    """Soft score using pre-loaded data — no Supabase calls."""
+    """Soft score using pre-loaded data — no Supabase calls.
+
+    locked_norm: normalized ids of locked courses, excluded from the earliness
+    preferences (they can't move, so they'd only add a constant offset).
+    """
     breakdown = {
         "difficulty_balance":   difficulty_balance(plan, diff_scores),
         "ge_distribution":      ge_distribution(plan, meta),
@@ -125,6 +132,8 @@ def _soft_score(
         "major_clustering":     major_clustering(plan, meta),
         "adjacent_smoothing":   adjacent_smoothing(plan, diff_scores),
         "min_units_load":       min_units_load(plan, meta),
+        "over_cap_penalty":     over_cap_penalty(plan, plan.units_per_quarter, meta),
+        "lower_div_earliness":  lower_div_earliness(plan, locked_norm),
     }
     return sum(WEIGHTS[k] * v for k, v in breakdown.items()), breakdown
 
@@ -157,15 +166,26 @@ def optimize(
     plan: CoursePlan,
     max_iter: int = 200,
     seed: int | None = None,
+    ge_norms: set[str] | None = None,
+    ge_allowed_quarters: set[str] | None = None,
 ) -> OptimizationResult:
     """Improve soft score via hill-climbing while keeping hard constraints satisfied.
 
     On each iteration a random course is moved to a random other quarter.  The
     move is kept only if it (1) stays within the unit cap, (2) leaves all
-    prerequisite chains satisfied, and (3) lowers the soft penalty score.
+    prerequisite chains satisfied, (3) does not push a GE course past the Year-2
+    deadline, and (4) lowers the soft penalty score.
 
     major_requirements_met and no_duplicate_courses are invariant under simple
     moves (the course set doesn't change) so they are checked once upfront.
+
+    Hard GE earliness (optimizer layer): ``ge_norms`` is the set of
+    normalized GE course ids; ``ge_allowed_quarters`` is the set of quarter strings
+    (Year 1-2) in which a GE may legally sit.  A GE that is ALREADY past the
+    deadline in the starting plan (prereq-blocked) is exempt — it can't be pulled
+    earlier anyway — but a GE that starts within Y1-Y2 may never be moved out of
+    the allowed window.  When ``ge_allowed_quarters`` is None the guard is off
+    (preserves the old behaviour for callers that don't pass it).
     """
     client = create_client(os.getenv("SUPABASE_URL"), os.getenv("SUPABASE_SERVICE_KEY"))
     diff_scores = _load_difficulty_scores()
@@ -198,6 +218,18 @@ def optimize(
     quarters = sorted(plan.planned_courses.keys(), key=_qkey)
     improved = False
 
+    # Hard GE earliness guard.  Pre-compute the GE courses that are
+    # already past the Year-2 deadline in the starting plan; those are exempt
+    # (prereq-blocked).  Every other GE must stay inside ge_allowed_quarters.
+    ge_norms = ge_norms or set()
+    base_late_ge: set[str] = set()
+    if ge_norms and ge_allowed_quarters is not None:
+        for q, cs in plan.planned_courses.items():
+            if q not in ge_allowed_quarters:
+                for c in cs:
+                    if _norm(c) in ge_norms:
+                        base_late_ge.add(_norm(c))
+
     # Coreqs must stay in the same quarter.  Reject any move that introduces a
     # split not already present in the starting plan (the seed is coreq-valid, so
     # in practice this freezes coreq pairs together).  base-aware so a pre-split
@@ -212,6 +244,17 @@ def optimize(
         q_from = rng.choice(non_empty)
         course = rng.choice(best.planned_courses[q_from])
         q_to = rng.choice([q for q in quarters if q != q_from])
+
+        # Hard GE earliness deadline: never move a (non-exempt) GE course out of
+        # the Year-1-2 window.  Checked before building the candidate so the
+        # hill-climber can't relocate a pure-elective GE into Year 3/4.
+        if (
+            ge_allowed_quarters is not None
+            and _norm(course) in ge_norms
+            and _norm(course) not in base_late_ge
+            and q_to not in ge_allowed_quarters
+        ):
+            continue
 
         candidate = deepcopy(best)
         candidate.planned_courses[q_from].remove(course)

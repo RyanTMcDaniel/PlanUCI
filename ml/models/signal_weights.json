@@ -1,0 +1,18 @@
+{
+  "features": [
+    "nlp_score",
+    "gpa_score",
+    "rmp_score"
+  ],
+  "alpha": 1.0,
+  "coefficients": {
+    "nlp_score": 0.358210764215802,
+    "gpa_score": 0.2912496660731646,
+    "rmp_score": 0.4654549553833856
+  },
+  "intercept": 0.06481148826921324,
+  "status": "FROZEN PRIOR — NOT A VALIDATED MODEL",
+  "produced_by": "ml/models/fit_signal_weights.py (frozen — re-running will not overwrite without --write)",
+  "provenance": "A documented prior over the three difficulty signals, not an estimate. The target these were originally fit against (difficulty_score) is constructed in ml/data/build_features.py as a renormalized weighted mean of these same three features using these same weights, so the regression recovers what was put in: a closed-form weighted mean reconstructs the target with MAE ~2e-8 and r = 1.0. No error metric against that target is meaningful and none is reported anywhere in this repo. Re-fitting on features built from these weights drifts them (to roughly nlp 0.275 / gpa 0.249 / rmp 0.532), and feeding those back would move the target again — a fixed point that shifts every iteration. That is why the weights are frozen here rather than regenerated. These are the values the shipped feature CSVs were built from. To make this a real model, re-derive the weights against an exogenous label (student-reported difficulty, or next-term GPA held out in time) and only then attach an accuracy figure.",
+  "note_to_maintainers": "Changing these values changes every difficulty score in the product. If you do, rebuild ml/data/*.csv via `python -m ml.data.build_features` and reload Supabase via `scripts/load_features.py`."
+}

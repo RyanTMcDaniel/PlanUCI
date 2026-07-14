@@ -38,10 +38,9 @@ def upsert_batch(table: str, rows: list[dict], batch: int = 500) -> int:
 
 # ── course_features ────────────────────────────────────────────────────────
 print("Loading course_features …")
-df_cf = (
-    pd.read_csv("ml/data/course_features.csv")
-    .dropna(subset=["difficulty_score"])[["course_id", "difficulty_score"]]
-)
+df_cf = pd.read_csv("ml/data/course_features.csv").dropna(subset=["difficulty_score"])
+df_cf = df_cf[[c for c in ["course_id", "difficulty_score", "confidence"]
+               if c in df_cf.columns]]
 rows_cf = nan_to_none(df_cf.to_dict("records"))
 inserted_cf = upsert_batch("course_features", rows_cf)
 print(f"  Done — {inserted_cf} rows successfully inserted\n")
@@ -50,7 +49,8 @@ print(f"  Done — {inserted_cf} rows successfully inserted\n")
 print("Loading prof_course_features …")
 df_pcf = pd.read_csv("ml/data/prof_course_features.csv")
 keep = [c for c in ["course_id", "instructor_id", "nlp_score", "gpa_score",
-                     "rmp_score", "difficulty_score", "sections_taught"]
+                     "rmp_score", "difficulty_score", "confidence",
+                     "signals_present", "sections_taught"]
         if c in df_pcf.columns]
 df_pcf = df_pcf[keep].dropna(subset=["difficulty_score"])
 rows_pcf = nan_to_none(df_pcf.to_dict("records"))

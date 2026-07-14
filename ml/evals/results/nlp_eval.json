@@ -1,21 +1,15 @@
 {
-  "macro_f1": 0.6188085894615322,
-  "accuracy": 0.6587301587301587,
-  "per_tier": {
-    "easy": {
-      "precision": 0.6721311475409836,
-      "recall": 0.7192982456140351,
-      "f1": 0.6949152542372881
-    },
-    "medium": {
-      "precision": 0.7222222222222222,
-      "recall": 0.697986577181208,
-      "f1": 0.7098976109215017
-    },
-    "hard": {
-      "precision": 0.44680851063829785,
-      "recall": 0.45652173913043476,
-      "f1": 0.45161290322580644
-    }
-  }
+  "model": "difficulty_nlp_v2",
+  "produced_by": "ml/evals/eval_difficulty.py",
+  "macro_f1": 0.5764,
+  "accuracy": 0.627,
+  "f1_per_tier": {
+    "easy": 0.5849,
+    "medium": 0.6974,
+    "hard": 0.4468
+  },
+  "train_courses": 1171,
+  "test_courses": 252,
+  "input_format": "{title}: {description} \u2014 identical to training and serving",
+  "note": "Held out: tier cutoffs are computed on the training split only and the splits assert zero course_id overlap (ml/data/preprocess.py). The hard tier is a minority of the 252-course test set, so its F1 has a wide confidence interval."
 }

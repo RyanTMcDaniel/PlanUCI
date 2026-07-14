@@ -35,6 +35,21 @@ WEIGHTS = {
     "adjacent_smoothing":   0.40,
     # Discourage under-loaded quarters: non-empty quarters should carry >=12 units.
     "min_units_load":       0.30,
+    # Penalise quarters that exceed the unit cap. Weighted above difficulty_balance
+    # and adjacent_smoothing so the hill-climber actively moves courses OUT of
+    # over-cap quarters (e.g. into otherwise-empty later quarters) rather than
+    # leaving them packed.
+    "over_cap_penalty":     0.50,
+    # Earliness preference: nudge lower-division courses toward earlier quarters.
+    # Kept below difficulty_balance (0.40) and adjacent_smoothing (0.40) so it
+    # never overrides difficulty/feasibility, but raised enough that its per-move
+    # deltas (≈ weight × 1/n) actually register against difficulty_balance moves
+    # instead of being drowned out.
+    #
+    # GE earliness is NO LONGER a soft term: it is enforced as a HARD scheduling
+    # rule in plan_generator._asap_schedule (GE courses must land by the end of
+    # Year 2, quarter index 5, unless a prereq genuinely blocks them).
+    "lower_div_earliness":  0.60,
 }
 
 _DEFAULT_DIFFICULTY = 5.0   # used when a course has no entry in the CSV
@@ -56,13 +71,28 @@ def _load_difficulty_scores() -> dict[str, float]:
 
 
 def _load_course_meta(client, course_ids: list[str]) -> dict[str, dict]:
-    """Fetch ge_list, department and min_units for each course id from Supabase."""
+    """Fetch ge_list, department and min_units for each course id from Supabase.
+
+    The `courses.id` column stores ids with spaces stripped (catalog text like
+    "BIO SCI 93" / "I&C SCI 46" is stored as "BIOSCI93" / "I&CSCI46"), but plan
+    ids arrive in either form — injected prereqs keep the spaced catalog text.
+    A raw `.in_("id", course_ids)` therefore silently misses every spaced id, so
+    those courses' ge_list / min_units drop out of all meta-based soft
+    constraints (ge_distribution, major_clustering, …) — making those weights
+    effectively 0 for GE courses seeded with a spaced id. Query
+    both the raw id and a space-stripped, uppercased variant so both forms match;
+    the result stays keyed by _norm(id) so lookups via _norm(course) still hit.
+    """
     if not course_ids:
         return {}
+    query_ids = set()
+    for cid in course_ids:
+        query_ids.add(cid)
+        query_ids.add(cid.replace(" ", "").upper())
     rows = (
         client.table("courses")
         .select("id,department,ge_list,min_units")
-        .in_("id", course_ids)
+        .in_("id", list(query_ids))
         .execute()
         .data
     )
@@ -285,6 +315,61 @@ def min_units_load(plan: CoursePlan, course_meta: dict[str, dict]) -> float:
     if not shortfalls:
         return 0.0
     return sum(shortfalls) / len(shortfalls)
+
+
+def over_cap_penalty(
+    plan: CoursePlan, units_per_quarter: int, course_meta: dict[str, dict]
+) -> float:
+    """Penalty for quarters whose unit total exceeds the cap.
+
+    For every quarter the normalised excess ``max(0, units - cap) / cap`` is
+    computed (quarters at or under the cap contribute 0) and SUMMED across
+    quarters.  (Summing rather than averaging over all quarters is deliberate:
+    dividing by the full quarter count diluted the term ~Nx below min_units_load,
+    so the hill-climber wouldn't move courses out of over-cap quarters — the whole
+    point of this term.)  Real per-course units come from course_meta; missing
+    entries fall back to UNITS_PER_COURSE.  Lower is better, like every soft term.
+    """
+    if units_per_quarter <= 0:
+        return 0.0
+    total = 0.0
+    for courses in plan.planned_courses.values():
+        units = sum(
+            (course_meta.get(_norm(c), {}).get("min_units") or UNITS_PER_COURSE)
+            for c in courses
+        )
+        total += max(0.0, units - units_per_quarter) / units_per_quarter
+    return total
+
+
+def _course_number(course_id: str) -> int | None:
+    """Leading course number from a (normalized) id: 'MATH2D' → 2, 'ICS161' → 161."""
+    m = re.search(r"(\d+)", _norm(course_id))
+    return int(m.group(1)) if m else None
+
+
+def lower_div_earliness(plan: CoursePlan, locked_norm: frozenset[str] = frozenset()) -> float:
+    """Earliness preference for lower-division (course number < 100) courses.
+
+    Mean of (quarter_index / total_quarters) over UNLOCKED lower-div courses, so
+    a lower-div course placed late incurs a higher penalty. Soft only — never
+    blocks a late placement that prereqs/availability require. Locked courses are
+    excluded (they can't move, so they'd only add a constant offset). Returns
+    0.0 when there are no unlocked lower-div courses.
+    """
+    sorted_q = sorted(plan.planned_courses.keys(), key=_qkey)
+    n = len(sorted_q)
+    if n == 0:
+        return 0.0
+    penalties: list[float] = []
+    for i, q in enumerate(sorted_q):
+        for c in plan.planned_courses[q]:
+            if _norm(c) in locked_norm:
+                continue
+            num = _course_number(c)
+            if num is not None and num < 100:
+                penalties.append(i / n)
+    return sum(penalties) / len(penalties) if penalties else 0.0
 
 
 # ── Combined scorer ───────────────────────────────────────────────────────────

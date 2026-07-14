@@ -12,3 +12,9 @@ node_modules/
 dist/
 build/
 .pytest_cache/
+
+# RMP scrape artifacts — regenerable via `python -m backend.scripts.fetch_rmp`.
+# rmp_matches.json is ~11 MB of raw scrape output; rmp_dropped.log is the
+# per-instructor drop reasons for the run that produced it.
+ml/data/rmp_matches.json
+backend/scripts/rmp_dropped.log

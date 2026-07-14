@@ -63,12 +63,12 @@ export default function Navbar() {
     .toUpperCase();
 
   return (
-    <nav className="h-14 flex items-center px-4 bg-[#141414] border-b border-white/[0.08] shrink-0">
+    <nav className="h-14 flex items-center px-4 bg-[#1a1a2e] border-b border-black/40 shadow-[0_1px_0_rgba(255,255,255,0.04),0_2px_8px_rgba(0,0,0,0.45)] shrink-0">
       {/* Left — wordmark */}
       <div className="flex-1">
         <Link
           href="/planner"
-          className="text-[18px] font-bold tracking-tight text-white hover:text-white/80 transition-colors"
+          className="text-[22px] font-extrabold tracking-tight text-white hover:text-white/80 transition-colors"
         >
           Plan<span className="text-[#FFC72C]">UCI</span>
         </Link>
@@ -76,8 +76,10 @@ export default function Navbar() {
 
       {/* Center — tabs (hidden: only Planner remains, no switching needed) */}
 
-      {/* Right — auth */}
-      <div className="flex-1 flex justify-end">
+      {/* Right — page actions (portaled in by the active page) + auth */}
+      <div className="flex-1 flex justify-end items-center gap-3">
+        {/* Portal slot: pages render contextual actions here (e.g. AP Credits, Plans, PDF). */}
+        <div id="navbar-actions" className="flex items-center gap-2.5" />
         {user ? (
           <div className="relative" ref={dropdownRef}>
             <button

@@ -1,4 +1,6 @@
 ---
+base_model:
+  - nreimers/MiniLM-L6-H384-uncased
 language: en
 license: apache-2.0
 library_name: sentence-transformers

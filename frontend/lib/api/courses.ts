@@ -18,6 +18,11 @@ export interface CourseDetail {
   course_level: string | null;
   terms: string[] | null;
   avg_gpa: number | null;
+  // Authoritative per-course GE designations, e.g. ["GE III: Social & Behavioral Sciences"].
+  ge_list: string[] | null;
+  // Enrollment restriction text, e.g. "Anthropology majors only". Used to exclude
+  // major-specific writing seminars from the generic GE autofill candidate pool.
+  restriction: string | null;
 }
 
 // Extract course IDs embedded in group_name strings like "POLSCI 192A" or
@@ -210,7 +215,7 @@ export async function fetchCourseDetails(ids: string[]): Promise<CourseDetail[]>
   for (let i = 0; i < ids.length; i += BATCH) {
     const { data, error } = await supabase
       .from("courses")
-      .select("id, title, min_units, description, course_level, terms, avg_gpa")
+      .select("id, title, min_units, description, course_level, terms, avg_gpa, ge_list, restriction")
       .in("id", ids.slice(i, i + BATCH));
 
     if (error) throw new Error(error.message);
@@ -218,6 +223,64 @@ export async function fetchCourseDetails(ids: string[]): Promise<CourseDetail[]>
   }
 
   return results;
+}
+
+// AND/OR/NOT prerequisite tree (same shape the backend optimizer evaluates).
+// Leaves: { prereqType: "course", courseId, coreq? } | { prereqType: "exam", ... }.
+export type PrereqTree = Record<string, unknown>;
+
+/** Pull stored prerequisite_tree JSON for the given courses straight from the
+ *  `courses` table. Returns a map keyed by the raw course id (only courses that
+ *  actually have a tree are included). Used for frontend GE/Minor placement so
+ *  selected courses land in a prereq-valid quarter without the major optimizer. */
+export async function fetchPrereqTrees(ids: string[]): Promise<Record<string, PrereqTree>> {
+  if (ids.length === 0) return {};
+  const supabase = createClient();
+  const BATCH = 100;
+  const out: Record<string, PrereqTree> = {};
+
+  for (let i = 0; i < ids.length; i += BATCH) {
+    const { data, error } = await supabase
+      .from("courses")
+      .select("id, prerequisite_tree")
+      .in("id", ids.slice(i, i + BATCH));
+
+    if (error) throw new Error(error.message);
+    for (const r of data ?? []) {
+      const tree = (r as { id: string; prerequisite_tree: PrereqTree | null }).prerequisite_tree;
+      if (tree) out[(r as { id: string }).id] = tree;
+    }
+  }
+
+  return out;
+}
+
+/** Pull the raw `corequisites` text for the given courses straight from the
+ *  `courses` table. Returns a map keyed by raw course id (only courses with a
+ *  non-empty corequisites string are included). The corequisites field is the
+ *  authoritative store for true bidirectional coreqs (lecture↔lab); the
+ *  prerequisite_tree stores coreq edges one-directionally (and not at all for
+ *  lab rows), so the field is the only reliable source of mutual pairs. */
+export async function fetchCorequisites(ids: string[]): Promise<Record<string, string>> {
+  if (ids.length === 0) return {};
+  const supabase = createClient();
+  const BATCH = 100;
+  const out: Record<string, string> = {};
+
+  for (let i = 0; i < ids.length; i += BATCH) {
+    const { data, error } = await supabase
+      .from("courses")
+      .select("id, corequisites")
+      .in("id", ids.slice(i, i + BATCH));
+
+    if (error) throw new Error(error.message);
+    for (const r of data ?? []) {
+      const text = (r as { id: string; corequisites: string | null }).corequisites;
+      if (text && text.trim()) out[(r as { id: string }).id] = text;
+    }
+  }
+
+  return out;
 }
 
 /** Distinct AP exam names sorted alphabetically (for the AP scores input UI).

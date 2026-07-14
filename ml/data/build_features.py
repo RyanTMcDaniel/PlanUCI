@@ -16,14 +16,17 @@ load_dotenv(_ENV)
 
 DATA_DIR = os.path.dirname(os.path.abspath(__file__))
 MODEL_DIR = os.path.join(DATA_DIR, "..", "models", "difficulty_nlp_v2")
-ENSEMBLE_WEIGHTS_PATH = os.path.join(DATA_DIR, "..", "models", "ensemble_weights.json")
+SIGNAL_WEIGHTS_PATH = os.path.join(DATA_DIR, "..", "models", "signal_weights.json")
 EMBEDDING_DIM = 384
 BATCH_SIZE = 32
 MIN_GRADED = 15  # minimum graded students per section
 
-# Learned ensemble coefficients used to blend the nlp / gpa / rmp signals into a
-# single professor-level difficulty score (replaces the old equal-weight mean).
-ENSEMBLE_WEIGHTS = json.load(open(ENSEMBLE_WEIGHTS_PATH))["coefficients"]
+# Blend weights for the difficulty scoring heuristic — a documented PRIOR over the
+# three signals, not a validated model.  Note the circularity: difficulty_score below
+# is built FROM these weights, and ml/models/fit_signal_weights.py then re-derives the
+# weights from difficulty_score.  That loop is why no accuracy metric is claimed for
+# the blend anywhere.  See the docstring in fit_signal_weights.py and DECISIONS.md.
+SIGNAL_WEIGHTS = json.load(open(SIGNAL_WEIGHTS_PATH))["coefficients"]
 
 
 def get_client():
@@ -295,33 +298,133 @@ def main() -> None:
         .reset_index(name="rmp_difficulty")
     )
     base = base.merge(rmp_agg, on="ucinetid", how="left")
+    # avgDifficulty == 0 means "no ratings on record", not "trivially easy". Treating
+    # it as a real value produced rmp_score = -1.25 and dragged the blend below scale.
+    base.loc[base["rmp_difficulty"] <= 0, "rmp_difficulty"] = np.nan
     base["rmp_score"] = (base["rmp_difficulty"] - 1) / 4.0 * 9.0 + 1.0
 
     # ── Convert GPA → difficulty score 1-10 ─────────────────────────────────
     base["gpa_score"] = ((4.0 - base["weighted_gpa"]) / 3.0 * 10.0).clip(1.0, 10.0)
 
-    # ── Weighted combo: learned ensemble weights, renormalised for missing ────
-    # Each signal contributes its learned coefficient. When a signal is absent we
-    # DROP its weight and renormalise the remaining weights to sum to 1, keeping
-    # the blend on the same 1-10 scale regardless of which signals exist.
-    # Example (rmp missing): (nlp*0.358 + gpa*0.291) / (0.358 + 0.291).
     signal_cols = ["nlp_score", "gpa_score", "rmp_score"]
 
-    def combined_score(row):
+    # ── Put the three signals on a COMMON SCALE before blending ───────────────
+    # The weights are only meaningful if the signals are comparable, and raw they
+    # are not: nlp and rmp both centre near 5.6 on the nominal 1-10 scale, but
+    # gpa_score is crushed into the bottom (mean 1.9) because UCI GPAs cluster near
+    # 3.4 and gpa_score = (4 - gpa)/3 * 10.
+    #
+    # That mismatch made the missing-signal path biased. Renormalising the weights
+    # (below) is only scale-preserving if the dropped signal has the same
+    # distribution as the ones that remain. It didn't: dropping rmp (mean 5.57) and
+    # reweighting toward gpa (mean 1.9) pushed scores DOWN by 0.674 on average, so a
+    # course whose professors happened to lack an RMP match scored systematically
+    # EASIER — an artifact of name-matching luck, not of the course.
+    #
+    # Rank-normalising each signal to 1-10 over the rows where it is present gives
+    # all three the same marginal distribution, which makes weight renormalisation
+    # valid and the 2-signal path unbiased against the 3-signal path by construction.
+    # The blend weights themselves are untouched (signal_weights.json stays frozen);
+    # this fixes the scale, not the prior.
+    def _rank_to_1_10(s: pd.Series) -> pd.Series:
+        # float64 throughout: nlp_score arrives as float32 from torch and would
+        # otherwise reject the float64 ranks on assignment.
+        out = s.astype("float64")
+        present = out.notna()
+        n = int(present.sum())
+        if n <= 1:
+            return out
+        ranks = out[present].rank(method="average") - 1.0
+        out.loc[present] = 1.0 + 9.0 * (ranks / (n - 1))
+        return out
+
+    std_cols = []
+    for c in signal_cols:
+        base[c + "_std"] = _rank_to_1_10(base[c])
+        std_cols.append(c + "_std")
+
+    # ── Weighted blend over the standardised signals ──────────────────────────
+    # When a signal is absent we DROP its weight and renormalise the remainder to
+    # sum to 1. Example (rmp missing): (nlp*0.358 + gpa*0.291) / (0.358 + 0.291).
+    def blend(row, cols) -> float:
         num = denom = 0.0
-        for c in signal_cols:
-            v = row[c]
+        for c in cols:
+            v = row[c + "_std"]
             if pd.notna(v):
-                w = ENSEMBLE_WEIGHTS[c]
-                num += w * v
-                denom += w
+                num += SIGNAL_WEIGHTS[c] * v
+                denom += SIGNAL_WEIGHTS[c]
         return num / denom if denom > 0 else np.nan
 
-    # Clip to the 1-10 scale: a few rows carry an invalid rmp_score (-1.25 from
-    # rmp_difficulty=0, i.e. no real RMP rating) that can drag the blend slightly
-    # below 1. Clipping keeps every professor score on-scale (same convention as
-    # gpa_score above). NaN (no signals at all) is preserved.
-    base["difficulty_score"] = base.apply(combined_score, axis=1).clip(1.0, 10.0)
+    def present_cols(row) -> tuple[str, ...]:
+        return tuple(c for c in signal_cols if pd.notna(row[c + "_std"]))
+
+    base["_pattern"] = base.apply(present_cols, axis=1)
+    base["_blend"] = base.apply(lambda r: blend(r, signal_cols), axis=1)
+
+    # ── Missingness calibration ───────────────────────────────────────────────
+    # Standardising the signals is necessary but NOT sufficient. Each signal is
+    # rank-normalised over the rows where IT is present, and those populations are
+    # not the same: on rows carrying all three signals, nlp_score_std averages 6.80
+    # while rmp_score_std averages 5.44. So dropping rmp and reweighting toward nlp
+    # still drifted scores upward (+0.35) — a smaller, opposite-signed version of the
+    # original bias, but a bias all the same.
+    #
+    # Fix: on the reference population (rows that DO have all three signals), measure
+    # what each missingness pattern would score versus the full 3-signal blend, and
+    # subtract that offset. A 2-signal row is then an unbiased estimate of what the
+    # 3-signal blend would have said, by construction, so a course is not scored
+    # easier or harder merely because its professors happened to lack an RMP match.
+    ref = base[base["_pattern"].map(len) == len(signal_cols)]
+    full = ref.apply(lambda r: blend(r, signal_cols), axis=1)
+    offsets: dict[tuple[str, ...], float] = {}
+    for pat in base["_pattern"].unique():
+        if not pat:
+            continue
+        partial = ref.apply(lambda r: blend(r, pat), axis=1)
+        offsets[pat] = float((full - partial).mean()) if len(ref) else 0.0
+
+    print("\n  Missingness calibration (offset added to each pattern):")
+    for pat, off in sorted(offsets.items(), key=lambda kv: -len(kv[0])):
+        n = int((base["_pattern"] == pat).sum())
+        print(f"    {'+'.join(c.replace('_score','') for c in pat):<16} n={n:<6} offset {off:+.4f}")
+
+    base["difficulty_score"] = (
+        base["_blend"] + base["_pattern"].map(offsets).astype(float)
+    ).clip(1.0, 10.0)
+
+    # ── Confidence — keyed on WHICH signals are present, nothing more ──────────
+    # The calibration above makes a 2-signal row UNBIASED, but unbiased is not
+    # precise: a row scored from the NLP classifier alone rests entirely on a text
+    # model with a held-out macro F1 of 0.576, and carries far more variance than a
+    # row corroborated by grade history and professor ratings. Nothing else in the
+    # pipeline communicates that, so a course with no data looked exactly as
+    # authoritative as one with three independent signals.
+    #
+    # This is deliberately NOT a probabilistic confidence — we have no calibrated
+    # basis for one. It is a direct, auditable function of the missingness pattern.
+    CONFIDENCE = {
+        ("nlp_score", "gpa_score", "rmp_score"): "high",    # all three corroborate
+        ("nlp_score", "gpa_score"):              "medium",  # text + real grade history
+        ("nlp_score", "rmp_score"):              "medium",  # text + professor ratings
+        ("nlp_score",):                          "low",     # text alone — a guess
+    }
+    base["signals_present"] = base["_pattern"].map(
+        lambda p: "+".join(c.replace("_score", "") for c in p) if p else ""
+    )
+    base["confidence"] = base["_pattern"].map(lambda p: CONFIDENCE.get(p, "low"))
+    base.loc[base["difficulty_score"].isna(), "confidence"] = None
+
+    # Bias check on the reference population, scored both ways. This is the defect
+    # that motivated the calibration, so it is measured rather than trusted.
+    print("\n  Bias check — same rows, scored with vs without each signal:")
+    for pat in sorted(offsets, key=lambda p: -len(p)):
+        if len(pat) == len(signal_cols):
+            continue
+        shift = (ref.apply(lambda r: blend(r, pat), axis=1) + offsets[pat] - full).mean()
+        label = "+".join(c.replace("_score", "") for c in pat)
+        print(f"    {label:<16} residual shift vs full blend: {shift:+.4f}")
+
+    base = base.drop(columns=["_pattern", "_blend"])
 
     # ── Course-level difficulty: sections_taught-weighted avg ─────────────────
     def course_difficulty(g):
@@ -337,18 +440,33 @@ def main() -> None:
         .reset_index(name="difficulty_score")
     )
 
+    # Course-level confidence: the best-supported instructor row backing the course.
+    # A course counts as "high" if at least one of its instructors is corroborated by
+    # all three signals — that instructor's data is what the course score leans on.
+    _RANK = {"low": 1, "medium": 2, "high": 3}
+    _UNRANK = {v: k for k, v in _RANK.items()}
+    course_conf = (
+        base.dropna(subset=["difficulty_score"])
+        .assign(_r=lambda d: d["confidence"].map(_RANK))
+        .groupby("course_id")["_r"].max()
+        .map(_UNRANK)
+    )
+    course_df["confidence"] = course_df["course_id"].map(course_conf)
+
     # ── NLP-only fallback for instructorless courses ──────────────────────────
     # Courses with a description (hence an NLP score) but no course_instructors
     # rows never enter the instructor-centric blend above, so they'd be dropped.
     # Give each one a course-level raw score equal to its NLP score so the whole
     # catalogue is covered, then everyone is normalized together below. (The NLP
     # score is already on the same 1-10 difficulty scale as the blend.)
+    # These are text-only by definition, so they are the lowest-confidence tier.
     scored_ids = set(course_df["course_id"])
     fallback = nlp_series[~nlp_series.index.isin(scored_ids)]
     if len(fallback):
         fb_df = pd.DataFrame({
             "course_id": fallback.index,
             "difficulty_score": fallback.values,
+            "confidence": "low",
         })
         course_df = pd.concat([course_df, fb_df], ignore_index=True)
         print(f"  NLP-only fallback: added {len(fallback)} instructorless courses")
@@ -366,8 +484,14 @@ def main() -> None:
         course_df.loc[valid, "difficulty_score"] = 1.0 + 9.0 * (avg_rank / (n_valid - 1))
 
     # ── Save CSVs ─────────────────────────────────────────────────────────────
+    # Raw signals are kept for the API's per-signal breakdown; the *_std columns are
+    # what difficulty_score is actually a weighted mean of, so the blend stays
+    # auditable from the CSV alone. scripts/load_features.py pushes only the
+    # whitelisted Supabase columns, so the extra ones are local-only.
     prof_out = base[["course_id", "ucinetid", "nlp_score", "gpa_score",
-                      "rmp_score", "difficulty_score", "sections_taught"]].rename(
+                      "rmp_score", "nlp_score_std", "gpa_score_std", "rmp_score_std",
+                      "difficulty_score", "confidence", "signals_present",
+                      "sections_taught"]].rename(
         columns={"ucinetid": "instructor_id"}
     )
     prof_path = os.path.join(DATA_DIR, "prof_course_features.csv")
@@ -388,6 +512,16 @@ def main() -> None:
     for n in [3, 2, 1, 0]:
         count = (course_signals == n).sum()
         print(f"  Courses with {n} signal{'s' if n != 1 else ''}: {count}")
+
+    # ── Confidence distribution AS SERVED (courses, not feature rows) ──────────
+    print("\n  Confidence of the difficulty score AS SERVED (per course):")
+    total = len(course_df)
+    for tier in ("high", "medium", "low"):
+        n = int((course_df["confidence"] == tier).sum())
+        print(f"    {tier:<7} {n:>5} courses  ({n / total * 100:5.1f}%)")
+    unk = int(course_df["confidence"].isna().sum())
+    if unk:
+        print(f"    {'none':<7} {unk:>5} courses  ({unk / total * 100:5.1f}%)")
 
 
 if __name__ == "__main__":
