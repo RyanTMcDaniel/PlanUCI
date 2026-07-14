@@ -18,7 +18,7 @@
 
 ## The problem
 
-Planning a degree at UCI means holding four disconnected sources in your head at once: the catalogue (what your major requires), the prerequisite tree (what unlocks what), ZotGrades (which sections actually curve), and RateMyProfessor (who can teach). Students reconcile these by hand in a spreadsheet, and the failure mode is expensive — you discover in your third year that a required course only runs in Fall, its prereq chain is three quarters deep, and you have just added a quarter to your degree.
+Planning a degree at UCI means holding four disconnected sources in your head at once: the catalogue (what your major requires), the prerequisite tree (what unlocks what), Zotistics (which sections actually curve), and RateMyProfessor (who can teach). Students reconcile these by hand in a spreadsheet, and the failure mode is expensive — you discover in your third year that a required course only runs in Fall, its prereq chain is three quarters deep, and you have just added a quarter to your degree.
 
 PlanUCI collapses that into one pass: pick a major and a graduation target, and get a quarter-by-quarter schedule that is prerequisite-valid, unit-legal, and deliberately smoothed so you are not carrying three of the hardest courses in the catalogue at once.
 
