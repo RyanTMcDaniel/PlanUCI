@@ -434,8 +434,6 @@ What would change the decision: substantially more review data; collapsing the t
 - Seed/optimizer benchmark harness with published before/after soft scores
 - Split pure-logic tests from Supabase integration tests; add GitHub Actions
 - Humanities majors (STEM + Business requirement sets are currently the most complete)
-- Schedule-conflict awareness (meeting times, not just quarters)
-
 ---
 
 ## License
