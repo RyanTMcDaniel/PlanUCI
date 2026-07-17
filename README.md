@@ -258,6 +258,8 @@ The quarter-level formula is deliberately **not** a plain mean. A quarter with o
 
 **Lock-aware rebalance.** `whatif.optimize_around_locks` treats user-pinned courses as immovable, validates that the locks are mutually satisfiable, and reflows only the unlocked remainder.
 
+**Performance and scaling.** The optimizer sits behind a two-tier cache — an in-process L1 in front of a Supabase L2. A warm cache hit returns in ~11 ms against ~5 s for a cold solve, roughly **470× faster**, measured on a local instance — a cache-hit-vs-cold-solve latency figure, *not* a Railway/Supabase throughput claim. Under concurrent load (Locust), warm hits sustain ~**20×** the throughput of cold solves at equal concurrency, and cold-solve throughput saturates at **~6 req/s** on a single process, degrading gracefully — rising latency, no failures — past the knee at ~50 concurrent users. Profiling under load flagged per-request disk I/O as a real cost: memoizing a ~7,700-row reference table that had been re-parsed on every call lifted sustained throughput ~20% (5.1 → 6.1 req/s at 50 users) with byte-for-byte identical output. Methodology, the runbook, and the raw CSVs live in `backend/loadtest/`.
+
 ---
 
 ## Tech stack
@@ -420,6 +422,10 @@ What would change the decision: substantially more review data; collapsing the t
 **The sentiment model is weakly supervised, and its test set is smaller still.** Labels are deterministic rules over RMP numeric ratings, so the model's ceiling is "recover a 4-branch rule from text." Its actual value is labeling professors whose numeric ratings are missing — and nothing in the repo yet measures coverage on exactly that population. 60 test records; `harsh_grader` F1 rests on 8.
 
 **The hill-climber has never been benchmarked against its own seed.** `optimize()` returns an `improved` boolean but no measurement of *how much* better than the ASAP seed it is, and `iterations_run` is hardcoded to `max_iter` (`optimizer.py:287`) rather than counting real iterations. Until there is a "mean soft score: seed X → optimized Y across N majors" number, the search is unproven.
+
+**The hill-climb loop deepcopies the whole plan on every iteration.** Profiling under concurrent load shows this per-iteration object copying — together with a Supabase client constructed per `evaluate()` / `optimize()` call — is the dominant remaining throughput ceiling after the disk-I/O fix above. It is a known cost, not yet addressed; the harness in `backend/loadtest/` is the baseline a future fix would be measured against.
+
+**The cold-path Supabase reads have no retry or connection pooling.** Each cold solve opens a fresh client and issues its reference-data reads directly; under load one request in ~440 (**0.23%**) surfaced as a transient HTTP 500 from a single failed read. This points at the same un-pooled per-call-client path as the item above — a retry or a shared pooled client would absorb it.
 
 **Seed generation can emit multiple late GEs the hill-climber cannot unwind.** Single-course moves cannot escape a local optimum where several GEs are jointly stranded past the Year-2 deadline: each individual corrective move is rejected because it breaks another constraint. A swap neighborhood or an explicit repair operator would help.
 
