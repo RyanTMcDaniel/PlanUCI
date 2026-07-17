@@ -4,24 +4,30 @@ Cache benchmark for POST /optimizer/generate.
 Phases
 ------
   COLD   — L1 and L2 both empty; optimizer runs end-to-end (3-8 s typical).
-  WARM-1 — Same payload, second request; hits the in-memory L1 cache.
-  WARM-2 — Same payload, third request; hits L1 again.
+           Each cold rep uses a FRESH nonce so it is a genuine miss.
+  WARM   — Same payload repeated; hits the in-memory L1 cache (cached=True).
 
 Guaranteeing a cold start
 -------------------------
-  A timestamp-derived nonce is embedded in `ap_scores` (harmless — the server
-  looks it up in the DB, finds nothing, and skips it).  This gives a unique
-  SHA-256 cache key that cannot already exist in either L1 or L2.  The script
-  also proactively deletes any matching L2 (Supabase) row before the first call.
+  A timestamp+counter-derived nonce is embedded in `ap_scores` (harmless — the
+  server looks it up in the DB, finds nothing, and skips it).  This gives a
+  unique SHA-256 cache key that cannot already exist in either L1 or L2.  The
+  script also proactively deletes any matching L2 (Supabase) row before each
+  cold call, and (with --cleanup) deletes every nonce row it created afterward.
+
+Statistics
+----------
+  Reports n, p50 (median), and p95 for both cold and warm — not a single
+  sample — and the measured speedup = cold_p50 / warm_p50.
 
 Usage
 -----
   # From backend/:
-  python3 scripts/benchmark_cache.py [--url http://localhost:8001]
+  python3 scripts/benchmark_cache.py [--url http://localhost:8001] \
+      [--reps 15] [--warm-reps 30] [--cleanup]
 """
 
 import argparse
-import json
 import os
 import sys
 import time
@@ -42,114 +48,195 @@ from scripts.optimizer import cache as optimizer_cache
 parser = argparse.ArgumentParser()
 parser.add_argument("--url", default="http://localhost:8001",
                     help="Base URL of the running FastAPI server")
+parser.add_argument("--reps", type=int, default=15,
+                    help="Number of COLD reps (each a fresh nonce → real solve)")
+parser.add_argument("--warm-reps", type=int, default=30,
+                    help="Number of WARM reps (repeated identical → L1 hit)")
+parser.add_argument("--cleanup", action="store_true",
+                    help="Delete every nonce optimizer_cache row created by this run")
 args = parser.parse_args()
 BASE = args.url.rstrip("/")
 ENDPOINT = f"{BASE}/optimizer/generate"
 
-# ── Payload ───────────────────────────────────────────────────────────────────
+# ── Payload template ──────────────────────────────────────────────────────────
 # Real ICS major (BS-201G = B.S. Informatics) with a handful of completed lower-div
-# courses.  The nonce in ap_scores guarantees this exact combination has never been
-# cached before, making the first call genuinely cold.
+# courses.  A unique nonce in ap_scores guarantees this exact combination has never
+# been cached before, making each cold call genuinely cold.
 
-NONCE_KEY = f"_benchmark_nonce_{int(time.time())}"
+_RUN_TAG = int(time.time())
 
-PAYLOAD = {
-    "major_id":           "BS-201G",
-    "completed_courses":  ["I&CSCI31", "I&CSCI32", "I&CSCI33", "MATH2A"],
-    "graduation_quarter": "2029_spring",
-    "units_per_quarter":  16,
-    "waived_ges":         [],
-    "ap_scores":          {NONCE_KEY: 0},   # unique nonce → unique cache key
-    "start_quarter":      "2026_fall",
-    "seed_courses":       [],
-    "seed_only":          False,
-}
 
-# ── Compute cache key and evict L2 proactively ────────────────────────────────
+def make_payload(nonce_key: str) -> dict:
+    return {
+        "major_id":           "BS-201G",
+        "completed_courses":  ["I&CSCI31", "I&CSCI32", "I&CSCI33", "MATH2A"],
+        "graduation_quarter": "2029_spring",
+        "units_per_quarter":  16,
+        "waived_ges":         [],
+        "ap_scores":          {nonce_key: 0},   # unique nonce → unique cache key
+        "start_quarter":      "2026_fall",
+        "seed_courses":       [],
+        "seed_only":          False,
+    }
 
-cache_key = optimizer_cache.make_key(
-    major_id           = PAYLOAD["major_id"],
-    completed_courses  = PAYLOAD["completed_courses"],
-    graduation_quarter = PAYLOAD["graduation_quarter"],
-    units_per_quarter  = PAYLOAD["units_per_quarter"],
-    waived_ges         = PAYLOAD["waived_ges"],
-    ap_scores          = PAYLOAD["ap_scores"],
-    start_quarter      = PAYLOAD["start_quarter"],
-)
 
-print("=" * 64)
-print("PlanUCI /optimizer/generate cache benchmark")
-print("=" * 64)
-print(f"  endpoint : {ENDPOINT}")
-print(f"  major    : {PAYLOAD['major_id']}")
-print(f"  grad     : {PAYLOAD['graduation_quarter']}")
-print(f"  nonce    : {NONCE_KEY}")
-print(f"  key      : {cache_key[:24]}…")
-print()
+def key_for(payload: dict) -> str:
+    return optimizer_cache.make_key(
+        major_id           = payload["major_id"],
+        completed_courses  = payload["completed_courses"],
+        graduation_quarter = payload["graduation_quarter"],
+        units_per_quarter  = payload["units_per_quarter"],
+        waived_ges         = payload["waived_ges"],
+        ap_scores          = payload["ap_scores"],
+        start_quarter      = payload["start_quarter"],
+    )
 
-# Evict from Supabase L2 (no-op if not present) so the cold call is truly cold.
-try:
-    supabase_url = os.getenv("SUPABASE_URL")
-    supabase_key = os.getenv("SUPABASE_SERVICE_KEY")
-    if supabase_url and supabase_key:
-        sb = create_client(supabase_url, supabase_key)
-        sb.table("optimizer_cache").delete().eq("cache_key", cache_key).execute()
-        print("[setup] L2 Supabase entry evicted (or was absent)")
-    else:
-        print("[setup] Warning: SUPABASE_SERVICE_KEY not set — skipping L2 eviction")
-except Exception as exc:
-    print(f"[setup] Warning: could not clear L2 cache: {exc}")
 
-# ── Helper ────────────────────────────────────────────────────────────────────
+# ── Supabase (for L2 eviction + cleanup) ──────────────────────────────────────
 
-def call(label: str) -> float:
+_sb = None
+_supabase_url = os.getenv("SUPABASE_URL")
+_supabase_key = os.getenv("SUPABASE_SERVICE_KEY")
+if _supabase_url and _supabase_key:
+    _sb = create_client(_supabase_url, _supabase_key)
+
+
+def evict_l2(cache_key: str) -> None:
+    if _sb is None:
+        return
+    try:
+        _sb.table("optimizer_cache").delete().eq("cache_key", cache_key).execute()
+    except Exception as exc:
+        print(f"[setup] Warning: could not evict L2 {cache_key[:12]}…: {exc}")
+
+
+# ── HTTP helper ───────────────────────────────────────────────────────────────
+
+def call(payload: dict) -> tuple[float, bool, int]:
+    """Return (elapsed_seconds, cached_flag, n_variants).  Raises on non-200."""
     t0 = time.perf_counter()
-    resp = requests.post(ENDPOINT, json=PAYLOAD, timeout=120)
+    resp = requests.post(ENDPOINT, json=payload, timeout=120)
     elapsed = time.perf_counter() - t0
-
     if resp.status_code != 200:
-        print(f"  [{label}] ERROR {resp.status_code}: {resp.text[:200]}")
-        return float("nan")
-
+        raise RuntimeError(f"HTTP {resp.status_code}: {resp.text[:200]}")
     body = resp.json()
-    cached_flag = body.get("cached", "?")
-    n_variants  = len(body.get("variants", []))
-    print(f"  [{label}]  {elapsed*1000:>9.1f} ms   cached={cached_flag}   variants={n_variants}")
-    return elapsed
+    return elapsed, bool(body.get("cached", False)), len(body.get("variants", []))
 
 
-def stats(times: list[float], label: str):
-    ms = [t * 1000 for t in times]
-    print(f"  {label:8s}  min={min(ms):>8.1f} ms   max={max(ms):>8.1f} ms   avg={sum(ms)/len(ms):>8.1f} ms")
+# ── Stats ─────────────────────────────────────────────────────────────────────
+
+def percentile(sorted_ms: list[float], pct: float) -> float:
+    """Nearest-rank percentile on an already-sorted list (ms)."""
+    if not sorted_ms:
+        return float("nan")
+    k = max(0, min(len(sorted_ms) - 1, int(round((pct / 100.0) * len(sorted_ms) + 0.5)) - 1))
+    return sorted_ms[k]
 
 
-# ── Phase: COLD ───────────────────────────────────────────────────────────────
+def report(label: str, times_s: list[float]) -> dict:
+    ms = sorted(t * 1000 for t in times_s)
+    stats = {
+        "n":   len(ms),
+        "p50": percentile(ms, 50),
+        "p95": percentile(ms, 95),
+        "min": ms[0] if ms else float("nan"),
+        "max": ms[-1] if ms else float("nan"),
+    }
+    print(f"  {label:6s}  n={stats['n']:<3d}  "
+          f"p50={stats['p50']:>9.1f} ms   p95={stats['p95']:>9.1f} ms   "
+          f"min={stats['min']:>8.1f}   max={stats['max']:>8.1f}")
+    return stats
 
+
+# ── Main ──────────────────────────────────────────────────────────────────────
+
+print("=" * 72)
+print("PlanUCI /optimizer/generate cache benchmark  (reps + p50/p95)")
+print("=" * 72)
+print(f"  endpoint  : {ENDPOINT}")
+print(f"  cold reps : {args.reps}    warm reps : {args.warm_reps}")
+print(f"  L2 evict  : {'enabled' if _sb else 'DISABLED (no SUPABASE_SERVICE_KEY)'}")
 print()
-print("Phase 1 — COLD (L1 miss + L2 miss → optimizer runs from scratch)")
-print("-" * 64)
-cold_times = [call("cold-1")]
 
-# ── Phase: WARM (L1 hits) ─────────────────────────────────────────────────────
+created_keys: list[str] = []
 
+# ── Phase COLD ────────────────────────────────────────────────────────────────
+print("Phase 1 — COLD (fresh nonce each rep → L1 miss + L2 miss → real solve)")
+print("-" * 72)
+cold_times: list[float] = []
+for i in range(args.reps):
+    nonce = f"_bench_{_RUN_TAG}_{i}"
+    payload = make_payload(nonce)
+    ck = key_for(payload)
+    created_keys.append(ck)
+    evict_l2(ck)  # defensive: guarantee truly cold even if key somehow existed
+    try:
+        elapsed, cached, nv = call(payload)
+    except Exception as exc:
+        print(f"  cold-{i:<2d}  ERROR: {exc}")
+        continue
+    tag = "" if not cached else "  !! UNEXPECTED cached=True on cold"
+    print(f"  cold-{i:<2d}  {elapsed*1000:>9.1f} ms   cached={cached}   variants={nv}{tag}")
+    cold_times.append(elapsed)
+
+# ── Phase WARM ────────────────────────────────────────────────────────────────
 print()
-print("Phase 2 — WARM (L1 in-memory cache hits)")
-print("-" * 64)
-warm_times = [
-    call("warm-1"),
-    call("warm-2"),
-]
+print("Phase 2 — WARM (one payload, repeated → L1 in-memory cache hits)")
+print("-" * 72)
+warm_nonce = f"_bench_{_RUN_TAG}_warm"
+warm_payload = make_payload(warm_nonce)
+warm_key = key_for(warm_payload)
+created_keys.append(warm_key)
+evict_l2(warm_key)
+
+# Prime: first call is cold (populates L1 + L2); not counted in warm stats.
+try:
+    prime_elapsed, prime_cached, _ = call(warm_payload)
+    print(f"  prime   {prime_elapsed*1000:>9.1f} ms   cached={prime_cached}  (not counted)")
+except Exception as exc:
+    print(f"  prime   ERROR: {exc}")
+
+warm_times: list[float] = []
+for i in range(args.warm_reps):
+    try:
+        elapsed, cached, nv = call(warm_payload)
+    except Exception as exc:
+        print(f"  warm-{i:<2d}  ERROR: {exc}")
+        continue
+    if not cached:
+        print(f"  warm-{i:<2d}  {elapsed*1000:>9.1f} ms   cached=False  !! expected a cache hit")
+    warm_times.append(elapsed)
+print(f"  (ran {len(warm_times)} warm reps; all cached=True unless flagged above)")
 
 # ── Summary ───────────────────────────────────────────────────────────────────
-
 print()
-print("=" * 64)
+print("=" * 72)
 print("Summary")
-print("=" * 64)
-stats(cold_times,  "COLD")
-stats(warm_times,  "WARM")
+print("=" * 72)
+cold_stats = report("COLD", cold_times)
+warm_stats = report("WARM", warm_times)
 print()
-if cold_times[0] and warm_times:
-    avg_warm = sum(warm_times) / len(warm_times)
-    print(f"  Speedup (cold avg / warm avg): {cold_times[0] / avg_warm:,.0f}×")
+if cold_stats["n"] and warm_stats["n"] and warm_stats["p50"] > 0:
+    speedup = cold_stats["p50"] / warm_stats["p50"]
+    print(f"  Measured speedup (cold p50 / warm p50): {speedup:,.0f}×")
+    print(f"  Claimed on resume:                      460×  (7.4 s → ~16 ms)")
 print()
+print("  What this measures: L1 cache-hit latency vs a cold optimizer solve on a")
+print("  LOCAL server instance. NOT a Railway/Supabase throughput figure.")
+print()
+
+# ── Cleanup ───────────────────────────────────────────────────────────────────
+if args.cleanup and _sb is not None:
+    deleted = 0
+    for ck in created_keys:
+        try:
+            _sb.table("optimizer_cache").delete().eq("cache_key", ck).execute()
+            deleted += 1
+        except Exception as exc:
+            print(f"  [cleanup] Warning: could not delete {ck[:12]}…: {exc}")
+    print(f"  [cleanup] Deleted {deleted}/{len(created_keys)} nonce optimizer_cache rows.")
+elif args.cleanup:
+    print("  [cleanup] Skipped — no Supabase client (SUPABASE_SERVICE_KEY unset).")
+else:
+    print(f"  [note] {len(created_keys)} nonce rows left in optimizer_cache "
+          f"(re-run with --cleanup to remove).")

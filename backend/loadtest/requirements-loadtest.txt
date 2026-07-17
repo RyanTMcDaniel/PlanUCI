@@ -1,0 +1,3 @@
+# Load-test-only dependency (kept out of the app's runtime requirements).
+#   venv/bin/pip install -r loadtest/requirements-loadtest.txt
+locust==2.45.0

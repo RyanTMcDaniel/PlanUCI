@@ -155,8 +155,17 @@ def get(client, cache_key: str) -> dict | None:
 
 # ── Write ─────────────────────────────────────────────────────────────────────
 
+def _load_test_mode() -> bool:
+    """True when LOAD_TEST_MODE is set — suppresses the L2 (Supabase) write so a
+    load test never pollutes the optimizer_cache table with thousands of rows.
+    L1 (in-process) caching is left untouched so warm-path behavior still works."""
+    return os.getenv("LOAD_TEST_MODE", "").strip().lower() in ("1", "true", "yes", "on")
+
+
 def set(client, cache_key: str, result: dict) -> None:
     """Upsert result into the cache.  Silently swallows errors."""
+    if _load_test_mode():
+        return  # load test: skip the L2 upsert (junk-row pollution guard)
     try:
         client.table(_TABLE).upsert(
             {

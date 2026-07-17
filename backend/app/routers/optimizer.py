@@ -43,9 +43,23 @@ def _supabase_client():
     return create_client(os.getenv("SUPABASE_URL"), os.getenv("SUPABASE_SERVICE_KEY"))
 
 
+def _load_test_mode() -> bool:
+    """True when LOAD_TEST_MODE is set — disables analytics/cache WRITES so a load
+    test never pollutes app_stats or the optimizer_cache table. Read at call time
+    (not import) so it can be toggled per-process without code changes."""
+    return os.getenv("LOAD_TEST_MODE", "").strip().lower() in ("1", "true", "yes", "on")
+
+
+if _load_test_mode():
+    print("⚠️  LOAD_TEST_MODE active — schedules_saved counter and optimizer_cache "
+          "L2 writes are DISABLED for this process.")
+
+
 def _increment_stat(stat_key: str) -> None:
     """Fire-and-forget app_stats counter bump — runs off-thread so it can never
     block or raise into the request path."""
+    if _load_test_mode():
+        return  # load test: don't touch the real schedules_saved counter
     def _run():
         try:
             _supabase_client().rpc("increment_stat", {"stat_key": stat_key}).execute()
