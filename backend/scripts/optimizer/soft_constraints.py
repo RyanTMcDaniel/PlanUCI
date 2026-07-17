@@ -58,8 +58,22 @@ _MAX_VARIANCE       = 16.0  # variance of [1.0, 9.0] with n=2, used for normaliz
 
 # ── Data helpers ──────────────────────────────────────────────────────────────
 
+_difficulty_scores_cache: dict[str, float] | None = None
+
+
 def _load_difficulty_scores() -> dict[str, float]:
-    """Load normalized course_id → difficulty_score from course_features.csv."""
+    """Load normalized course_id → difficulty_score from course_features.csv.
+
+    Parsed once and memoized at module level (mirrors the load-once-at-startup
+    pattern in app/main.py for the sibling CSVs).  course_features.csv is read-only
+    reference data that never changes at runtime, and every call site consumes the
+    result via ``.get()`` only — nothing mutates it — so a single shared dict is
+    safe.  This removes a per-call disk read+parse from optimize(), evaluate(),
+    _collect_courses(), collect_requirements(), and the swap/whatif paths.
+    """
+    global _difficulty_scores_cache
+    if _difficulty_scores_cache is not None:
+        return _difficulty_scores_cache
     out: dict[str, float] = {}
     try:
         with open(_DIFFICULTY_CSV, newline="") as fh:
@@ -67,7 +81,11 @@ def _load_difficulty_scores() -> dict[str, float]:
                 out[_norm(row["course_id"])] = float(row["difficulty_score"])
     except FileNotFoundError:
         pass
-    return out
+    # Assigning the fully-built local to the global is atomic in CPython, so a
+    # concurrent caller sees either None (and rebuilds an identical dict) or the
+    # complete dict — never a partially populated one.
+    _difficulty_scores_cache = out
+    return _difficulty_scores_cache
 
 
 def _load_course_meta(client, course_ids: list[str]) -> dict[str, dict]:

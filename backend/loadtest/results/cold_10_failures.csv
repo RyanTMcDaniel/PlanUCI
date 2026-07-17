@@ -1,1 +1,2 @@
 Method,Name,Error,Occurrences,First Seen,Last Seen
+POST,POST /generate [cold],CatchResponseError('HTTP 500'),1,2026-07-17T19:34:07Z,2026-07-17T19:34:07Z
