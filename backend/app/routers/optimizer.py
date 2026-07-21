@@ -3,8 +3,6 @@ Optimizer API endpoints.
 
 POST /optimizer/generate      — plan_generator.generate()
 POST /optimizer/whatif        — whatif.optimize_around_locks()  (rebalance around locks)
-POST /optimizer/swap          — swap_suggester.suggest_swaps()
-POST /optimizer/move          — swap_suggester.suggest_move()
 POST /optimizer/validate_locks — whatif.validate_locks()
 POST /optimizer/requirements_state — plan_generator.get_requirements_state()
 """
@@ -27,7 +25,6 @@ from supabase import create_client
 
 from scripts.optimizer.hard_constraints import CoursePlan
 from scripts.optimizer.plan_generator import generate, FeasibilityError, get_requirements_state
-from scripts.optimizer.swap_suggester import suggest_swaps, suggest_move
 from scripts.optimizer.whatif import (
     validate_locks,
     optimize_around_locks,
@@ -100,18 +97,6 @@ def _variant_dict(v) -> dict:
     }
 
 
-def _suggestion_dict(s) -> dict:
-    return {
-        "course_id":        s.course_id,
-        "current_quarter":  s.current_quarter,
-        "proposed_quarter": s.proposed_quarter,
-        "score_before":     round(s.score_before, 6),
-        "score_after":      round(s.score_after, 6),
-        "score_delta":      round(s.score_delta, 6),
-        "reason":           s.reason,
-    }
-
-
 # ── /optimizer/generate ───────────────────────────────────────────────────────
 
 class GenerateRequest(BaseModel):
@@ -128,6 +113,12 @@ class GenerateRequest(BaseModel):
 
 @router.post("/generate")
 def optimizer_generate(req: GenerateRequest):
+    # UNREACHABLE FROM THE UI.  The frontend's last caller of this endpoint was
+    # removed in 1d996b5 ("autofill: unified buildAndOptimizePool via /api/whatif;
+    # remove dead code"), which deleted frontend/app/api/optimizer/route.ts and
+    # rewired the planner onto /optimizer/whatif.  Nothing in frontend/ has
+    # referenced it since.  Kept for the historical load-test baseline and as a
+    # standalone API; do not treat it as the hot path.
     # Seeded (additive autofill) requests are schedule-specific — bypass the
     # shared cache so a seeded result never collides with a from-scratch one.
     use_cache = not req.seed_courses and not req.seed_only
@@ -224,17 +215,74 @@ def optimizer_whatif(req: WhatIfRequest):
     repositioned.  The course set is the plan itself (the editor model) — this no
     longer regenerates from major requirements.  Returns the optimize_around_locks
     shape: {"status":"ok","plans":[...]} or {"status":"infeasible","conflicts":[...]}.
+
+    Caching is admitted selectively, because the key embeds the whole grid and so
+    most entries would be single-use:
+
+      zero locks (the autofill/buildAndOptimizePool shape) → L1 + L2
+          Built deterministically from major requirements, so two users with the
+          same major/picks/years/cap send a byte-identical payload.  This is the
+          only genuinely cross-user-shareable whatif traffic.
+
+      locks + "infeasible" → L1 only
+          The most expensive path in the function: it returns only after
+          exhausting every unit_cap_tier x all 5 seed configs (up to 15 full
+          hill-climbs, vs 5 for a success that breaks at the first tier).  It is
+          also the most likely to be re-clicked unedited, since an infeasible
+          response leaves the grid untouched — the frontend only shows a toast.
+          Kept out of L2: a prereq fix in the DB should not stay masked by a
+          shared "can't optimize" row.
+
+      locks + "ok" → not cached
+          Each click's input is the previous click's output (setPlannedCourses),
+          so reuse is near zero while the payload is the largest of the three.
+          Not worth the eviction pressure.
     """
+    plan       = req.plan.to_domain()
+    locked_ids = list(req.locked_courses.keys())
+    zero_lock  = not locked_ids
+
+    cache_key = optimizer_cache.make_whatif_key(
+        planned_courses   = plan.planned_courses,
+        completed_courses = plan.completed_courses,
+        graduation_year   = plan.graduation_year,
+        units_per_quarter = plan.units_per_quarter,
+        locked_course_ids = locked_ids,
+        ap_scores         = req.ap_scores,
+    )
+
+    # L1: in-process, whatif-only pool — never evicts generate entries.
+    l1_hit = optimizer_cache.get_l1_whatif(cache_key)
+    if l1_hit is not None:
+        return {**l1_hit, "cached": True}
+
+    # L2 is consulted only for the shape that can actually be shared.
+    client = None
+    if zero_lock:
+        client = _supabase_client()
+        l2_hit = optimizer_cache.get(client, cache_key, ttl=optimizer_cache.WHATIF_TTL)
+        if l2_hit is not None:
+            optimizer_cache.set_l1_whatif(cache_key, l2_hit)   # backfill L1
+            return {**l2_hit, "cached": True}
+
     try:
         result = optimize_around_locks(
-            req.plan.to_domain(),
-            list(req.locked_courses.keys()),
+            plan,
+            locked_ids,
             ap_scores=req.ap_scores or None,
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-    return result
+    response = {**result, "cached": False}
+
+    if zero_lock:
+        optimizer_cache.set_l1_whatif(cache_key, response)   # L1: in-process
+        optimizer_cache.set(client, cache_key, response)     # L2: Supabase
+    elif result.get("status") == "infeasible":
+        optimizer_cache.set_l1_whatif(cache_key, response)   # L1 only
+
+    return response
 
 
 # ── /optimizer/propose_prereqs — detect a course's missing prereq chain ───────
@@ -272,48 +320,6 @@ def optimizer_apply_prereqs(req: ApplyPrereqsRequest):
         return {"planned_courses": updated.planned_courses}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-
-
-# ── /optimizer/swap ───────────────────────────────────────────────────────────
-
-class SwapRequest(BaseModel):
-    plan:      CoursePlanIn
-    course_id: str
-    major_id:  str
-
-
-@router.post("/swap")
-def optimizer_swap(req: SwapRequest):
-    try:
-        suggestions = suggest_swaps(
-            plan      = req.plan.to_domain(),
-            course_id = req.course_id,
-            major_id  = req.major_id,
-        )
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-    return {"suggestions": [_suggestion_dict(s) for s in suggestions]}
-
-
-# ── /optimizer/move ───────────────────────────────────────────────────────────
-
-class MoveRequest(BaseModel):
-    plan:      CoursePlanIn
-    course_id: str
-
-
-@router.post("/move")
-def optimizer_move(req: MoveRequest):
-    try:
-        suggestions = suggest_move(
-            plan      = req.plan.to_domain(),
-            course_id = req.course_id,
-        )
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-    return {"suggestions": [_suggestion_dict(s) for s in suggestions]}
 
 
 # ── /optimizer/validate_locks ─────────────────────────────────────────────────

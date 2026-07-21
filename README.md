@@ -258,7 +258,22 @@ The quarter-level formula is deliberately **not** a plain mean. A quarter with o
 
 **Lock-aware rebalance.** `whatif.optimize_around_locks` treats user-pinned courses as immovable, validates that the locks are mutually satisfiable, and reflows only the unlocked remainder.
 
-**Performance and scaling.** The optimizer sits behind a two-tier cache — an in-process L1 in front of a Supabase L2. A warm cache hit returns in ~11 ms against ~5 s for a cold solve, roughly **470× faster**, measured on a local instance — a cache-hit-vs-cold-solve latency figure, *not* a Railway/Supabase throughput claim. Under concurrent load (Locust), warm hits sustain ~**20×** the throughput of cold solves at equal concurrency, and cold-solve throughput saturates at **~6 req/s** on a single process, degrading gracefully — rising latency, no failures — past the knee at ~50 concurrent users. Profiling under load flagged per-request disk I/O as a real cost: memoizing a ~7,700-row reference table that had been re-parsed on every call lifted sustained throughput ~20% (5.1 → 6.1 req/s at 50 users) with byte-for-byte identical output. Methodology, the runbook, and the raw CSVs live in `backend/loadtest/`.
+**Performance and scaling.** The hot path is `/optimizer/whatif` — every optimizer run the UI triggers goes there, from both the "Optimize Schedule" button and GE/minor autofill. It sits behind a two-tier cache (in-process L1 in front of a Supabase L2) with a deliberately selective admission policy, because the cache key must embed the entire course grid and so most entries would be single-use. Zero-lock requests (the autofill shape, identical across users with the same major/picks/years/cap) are cached in both tiers; lock-bearing requests are admitted to L1 only when the result is `infeasible` — the most expensive path and the one most likely to be retried unedited — and lock-bearing successes are not cached at all, since each click's input is the previous click's output.
+
+Measured on a local instance (Locust, single uvicorn process, 90 s per shape, zero failures):
+
+| shape | users | p50 | p95 | p99 | req/s |
+|---|---|---|---|---|---|
+| whatif autofill, cold | 10 | 610 ms | 1.1 s | 2.4 s | 14.4 |
+| whatif autofill, warm | 50 | **13 ms** | 15 ms | 18 ms | **3,659** |
+| whatif locked, cold | 10 | 540 ms | 880 ms | 2.0 s | 16.8 |
+| whatif locked, warm | 50 | 1.0 s | 1.5 s | 2.3 s | 44.3 |
+
+The autofill warm/locked warm gap — 47× on p50, 83× on throughput — is the admission policy working as designed rather than a general cache win: the locked-warm row repeats an identical payload and gets no benefit, because that shape is intentionally not admitted. Warm figures here are L1-only; the load-test kill-switch (`LOAD_TEST_MODE=1`) disables L2 writes, so L2's cross-instance contribution is not included.
+
+Profiling under load flagged per-request disk I/O as a real cost: memoizing a ~7,700-row reference table that had been re-parsed on every call lifted sustained throughput ~20% (5.1 → 6.1 req/s at 50 users) with byte-for-byte identical output. Methodology, the runbook, and the raw CSVs live in `backend/loadtest/`.
+
+`/optimizer/generate` is a separate, heavier endpoint (~4.4 s p50 cold) that the frontend no longer calls — its last caller was removed in `1d996b5`. It is retained as a standalone API and as the historical load-test baseline, and is no longer the path to optimize against.
 
 ---
 
@@ -386,9 +401,8 @@ DECISIONS.md               running engineering log
 | `POST` | `/difficulty/course` | course-level difficulty score |
 | `POST` | `/difficulty/professor` | per-professor score with signal breakdown |
 | `POST` | `/sentiment/professor` | sentiment label + confidence |
-| `POST` | `/optimizer/generate` | generate schedule variants for a major |
+| `POST` | `/optimizer/generate` | generate schedule variants for a major (no frontend caller since `1d996b5`) |
 | `POST` | `/optimizer/whatif` | re-optimize around locks |
-| `POST` | `/optimizer/swap`, `/optimizer/move` | single-course edits, revalidated |
 | `POST` | `/optimizer/requirements_state` | outstanding requirement decisions |
 | `POST` | `/optimizer/validate_locks` | are the user's pins mutually satisfiable |
 | `POST` | `/optimizer/propose_prereqs`, `/apply_prereqs` | surface + inject missing prereq chains |
