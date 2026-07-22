@@ -11,8 +11,12 @@
 
 **Live demo:** https://plan-uci-three.vercel.app
 
-<!-- SCREENSHOT PLACEHOLDER: planner grid with a generated 4-year schedule, difficulty bars per quarter -->
+<!-- SCREENSHOT PLACEHOLDER: planner grid with a generated 4-year schedule, difficulty bars per quarter.
+     Drop the image at docs/screenshot-planner.png and uncomment the line below.
 ![PlanUCI planner](docs/screenshot-planner.png)
+-->
+
+
 
 ---
 
@@ -283,7 +287,7 @@ Profiling under load flagged per-request disk I/O as a real cost: memoizing a ~7
 |---|---|
 | **Frontend** | Next.js 16 (App Router), React 19, TypeScript 5, Tailwind 4, `@dnd-kit` (drag & drop), `jspdf` (export) |
 | **API** | Next.js route handlers (BFF) → FastAPI (Python 3.13), Pydantic v2, Uvicorn |
-| **ML** | PyTorch 2.12, sentence-transformers 5.5 (`all-MiniLM-L6-v2`), scikit-learn 1.8 (Ridge), pandas, rapidfuzz (instructor name matching) |
+| **ML** | PyTorch 2.12, sentence-transformers 5.5 (`all-MiniLM-L6-v2`), scikit-learn 1.8 (Ridge), pandas; instructor name matching is exact-normalized (stdlib `re` + `unicodedata`) |
 | **Optimizer** | NetworkX (DAG validation), custom hill-climber |
 | **Data** | Supabase (Postgres + Auth + Row Level Security), CSV feature artifacts |
 | **Deploy** | Vercel (frontend), Railway via Dockerfile (backend), Supabase (managed) |
@@ -346,7 +350,7 @@ npm run dev          # http://localhost:3000
 ### 4. Tests
 
 ```bash
-cd backend && venv/bin/python3 -m pytest tests/ -v    # 22 tests
+cd backend && venv/bin/python3 -m pytest tests/ -v    # 28 tests
 ```
 
 > The suite talks to a live Supabase instance — `backend/.env` must be populated for it to run.
@@ -378,7 +382,7 @@ backend/
     optimizer/             seed generator, hill-climber, hard + soft constraints, what-if, cache
     fetch_*.py             AnteaterAPI / ZotGrades / RMP ingestion
     validate_prereq_dag.py DAG acyclicity check
-  tests/                   22 pytest tests (require live Supabase)
+  tests/                   28 pytest tests (require live Supabase)
 frontend/
   app/planner/             the planner UI (PlannerClient.tsx)
   app/api/                 route handlers proxying to FastAPI + Supabase
@@ -429,7 +433,7 @@ What would change the decision: substantially more review data; collapsing the t
 
 **RMP recall is the flip side of the precision fix.** 1,741 instructors were dropped for `no_full_name_match` — some genuinely aren't on RateMyProfessor, but others are there under a nickname ("Mike" vs "Michael"), a maiden name, or a differently-spelled surname. A safe recall pass (nickname table, or high-threshold fuzzy match on the surname *plus* mandatory department agreement) could recover a meaningful share without reopening the collision.
 
-**`match_professors.py` is now dead and dangerous.** It fuzzy-matches on `WRatio >= 88` and *reassigns* `rmp_reviews.ucinetid`, which would happily undo the verified 1:1 mapping the new scraper produces. It is no longer called by anything and should be deleted.
+**`match_professors.py` was dead and dangerous — now removed.** It fuzzy-matched on `WRatio >= 88` and *reassigned* `rmp_reviews.ucinetid`, which would have happily undone the verified 1:1 mapping the new scraper produces. It was no longer called by anything and was deleted in `08e0262`.
 
 **The difficulty classifier's test set is small.** 252 courses, with the hard tier at ~18% of it — roughly 46 examples behind `hard` F1 = 0.447. There are no confidence intervals and no seed-variance runs anywhere in the repo, so treat 0.576 as directional.
 
@@ -445,7 +449,7 @@ What would change the decision: substantially more review data; collapsing the t
 
 **Community difficulty ratings are not blended in.** All three current signals are proxies. Real student-reported per-course difficulty is the missing fourth signal, and adding it would also break the circular-target problem above.
 
-**No CI.** The 22 tests pass locally but require live Supabase credentials, so they cannot run in a GitHub Action as written. The pure-logic core (`_eval_tree`, the soft scorers, `_asap_schedule`) should be separated from the Supabase-dependent integration tests and gated on every push.
+**No CI.** The 28 tests pass locally but require live Supabase credentials, so they cannot run in a GitHub Action as written. The pure-logic core (`_eval_tree`, the soft scorers, `_asap_schedule`) should be separated from the Supabase-dependent integration tests and gated on every push.
 
 ## Roadmap
 
